@@ -38,10 +38,10 @@ def populated_db(db: Database) -> Database:
 
     # Users
     users = [
-        (1, "test@example.com", 1, None, 1000000),  # Primary user with RUB currency
+        (1, "test@example.com", 1, None, None, 1000000),  # Primary user with RUB currency
     ]
     conn.executemany(
-        "INSERT INTO users (id, login, currency, parent, changed) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, login, currency, parent, month_start_day, changed) VALUES (?, ?, ?, ?, ?, ?)",
         users,
     )
 

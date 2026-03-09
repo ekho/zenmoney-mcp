@@ -1,11 +1,12 @@
 """Tests for MCP tools (T0, T1, T3, T13) and resources (R1-R3)."""
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from zenmoney_mcp.sync_engine import SyncEngine
 from zenmoney_mcp.analytics import (
     analyze_income,
     analyze_merchants,
@@ -97,7 +98,7 @@ class TestT1GetNetWorth:
         all_account_ids = []
         for section in result["breakdown"].values():
             all_account_ids.extend(acc["id"] for acc in section["accounts"])
-        all_account_ids.extend(acc["id"] for acc in result["out_of_balance"])
+        all_account_ids.extend(acc["id"] for acc in result["out_of_balance"]["accounts"])
 
         assert "acc-arch" not in all_account_ids
 
@@ -105,7 +106,7 @@ class TestT1GetNetWorth:
         """Test that debt account (in_balance=0) is in out_of_balance."""
         result = get_net_worth(populated_db)
 
-        out_of_balance_ids = [acc["id"] for acc in result["out_of_balance"]]
+        out_of_balance_ids = [acc["id"] for acc in result["out_of_balance"]["accounts"]]
         assert "acc-debt" in out_of_balance_ids
 
     def test_net_worth_currency_conversion(self, populated_db: Database):
@@ -124,17 +125,19 @@ class TestT1GetNetWorth:
     def test_net_worth_calculation(self, populated_db: Database):
         """Test total calculation.
 
-        Expected: acc-rub (50000) + acc-usd (1000*90=90000) + acc-save (500000) = 640000
-        acc-debt (in_balance=0) and acc-arch (archived) excluded
+        Expected: acc-rub (50000) + acc-usd (1000*90=90000) + acc-save (500000) + acc-debt (5000, out_of_balance) = 645000
+        acc-arch (archived) excluded
         """
         result = get_net_worth(populated_db)
 
         # Current: acc-rub (50000) + acc-usd (90000) = 140000
         # Savings: acc-save (500000)
-        # Total: 640000
+        # Out of balance: acc-debt (5000)
+        # Total: 645000
         assert result["breakdown"]["current"]["total"] == 140000.0
         assert result["breakdown"]["savings"]["total"] == 500000.0
-        assert result["net_worth"] == 640000.0
+        assert result["out_of_balance"]["total"] == 5000.0
+        assert result["net_worth"] == 645000.0
 
 
 class TestT2GetLiquidity:
@@ -1124,7 +1127,7 @@ class TestT10DetectAnomalies:
 
     def test_detect_anomalies_z_threshold(self, populated_db: Database):
         """Test that higher z_threshold reduces outliers."""
-        result_low = detect_anomalies(populated_db, period="this_month", z_threshold=1.0)
+        result_low = detect_anomalies(populated_db, period="this_month", z_threshold=1.5)
         result_high = detect_anomalies(populated_db, period="this_month", z_threshold=3.0)
 
         # Higher threshold should have fewer or equal outliers
@@ -1626,3 +1629,535 @@ class TestT17GetExchangeRates:
         result = get_exchange_rates(populated_db, currencies=["XYZ"])
         # No valid currencies found
         assert result["currencies"] == []
+
+    def test_rates_has_source_info(self, populated_db: Database):
+        """FR-007: Exchange rate source info."""
+        result = get_exchange_rates(populated_db)
+        assert result["rate_source"] == "cbr"
+        assert "Central Bank of Russia" in result["note"]
+
+
+# ============================================================================
+# BUG-001: sync_data force_full retry + timeout
+# ============================================================================
+
+
+class TestSyncRetry:
+    """Test sync retry and timeout behavior."""
+
+    @pytest.mark.asyncio
+    async def test_sync_force_full_retries_on_remote_protocol_error(self, db: Database):
+        """BUG-001: force_full=True should retry on RemoteProtocolError."""
+        import httpx
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        engine = SyncEngine(db, "test_token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"serverTimestamp": 100}
+
+        call_count = 0
+
+        async def mock_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            return mock_response
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = mock_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = await engine.sync(force_full=True)
+
+        assert call_count == 2
+        assert result["status"] == "synced"
+
+    @pytest.mark.asyncio
+    async def test_sync_force_full_uses_300s_timeout(self, db: Database):
+        """BUG-001: force_full=True should use 300s timeout."""
+        import httpx
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        engine = SyncEngine(db, "test_token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"serverTimestamp": 100}
+
+        captured_timeout = None
+
+        async def mock_post(*args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = kwargs.get("timeout")
+            return mock_response
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = mock_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await engine.sync(force_full=True)
+
+        assert captured_timeout == 300.0
+
+    @pytest.mark.asyncio
+    async def test_sync_incremental_uses_60s_timeout(self, db: Database):
+        """BUG-001: Incremental sync should use 60s timeout."""
+        import httpx
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        engine = SyncEngine(db, "test_token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"serverTimestamp": 100}
+
+        captured_timeout = None
+
+        async def mock_post(*args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = kwargs.get("timeout")
+            return mock_response
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = mock_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await engine.sync(force_full=False)
+
+        assert captured_timeout == 60.0
+
+
+# ============================================================================
+# ISSUE-002: check_budget_health days_elapsed for past/future months
+# ============================================================================
+
+
+class TestBudgetHealthPastFuture:
+    """Test budget health for past and future months."""
+
+    def test_past_month_days_elapsed_equals_total(self, populated_db: Database):
+        """ISSUE-002: Past month should have days_elapsed = days_total."""
+        conn = populated_db.connect()
+        # Insert budget for 2026-01
+        conn.execute(
+            """INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed)
+            VALUES (1, 'tag-food', '2026-01-01', 0.0, 0, 10000.0, 1, 1000000)"""
+        )
+        conn.commit()
+
+        result = check_budget_health(populated_db, month="2026-01")
+        assert result["status"] == "completed"
+        assert result["days_elapsed"] == result["days_total"]
+        assert result["days_elapsed"] == 31
+
+    def test_future_month_days_elapsed_zero(self, populated_db: Database):
+        """ISSUE-002: Future month should have days_elapsed = 0."""
+        conn = populated_db.connect()
+        conn.execute(
+            """INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed)
+            VALUES (1, 'tag-food', '2027-06-01', 0.0, 0, 10000.0, 1, 1000000)"""
+        )
+        conn.commit()
+
+        result = check_budget_health(populated_db, month="2027-06")
+        assert result["status"] == "future"
+        assert result["days_elapsed"] == 0
+
+    def test_current_month_status(self, populated_db: Database):
+        """ISSUE-002: Current month should have status 'current'."""
+        result = check_budget_health(populated_db)
+        assert result["status"] == "current"
+
+
+# ============================================================================
+# ISSUE-003: Negative planned budget
+# ============================================================================
+
+
+class TestNegativePlannedBudget:
+    """Test clamping of negative planned budget."""
+
+    def test_negative_planned_clamped_to_zero(self, populated_db: Database):
+        """ISSUE-003: Negative planned should be clamped to 0 with warning."""
+        conn = populated_db.connect()
+        # Insert budget with negative outcome (which makes planned negative)
+        conn.execute(
+            """INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed)
+            VALUES (1, 'tag-salary', '2026-03-01', 0.0, 0, -5000.0, 1, 1000000)"""
+        )
+        conn.commit()
+
+        result = check_budget_health(populated_db, month="2026-03")
+
+        # Find the salary category
+        salary_cat = next((c for c in result["categories"] if c["tag_id"] == "tag-salary"), None)
+        if salary_cat:
+            assert salary_cat["planned"] == 0
+            assert "warning" in salary_cat
+
+
+# ============================================================================
+# FR-006: Overall budget totals
+# ============================================================================
+
+
+class TestOverallBudgetTotals:
+    """Test that overall budget totals are computed from category sums."""
+
+    def test_overall_totals_from_categories(self, populated_db: Database):
+        """FR-006: Overall should be accumulated from categories, not from '000...' row."""
+        result = check_budget_health(populated_db)
+
+        if "overall" in result:
+            overall = result["overall"]
+            # Overall planned should be sum of category planned amounts
+            category_planned = sum(c["planned"] for c in result["categories"])
+            category_actual = sum(c["actual"] for c in result["categories"])
+            assert overall["planned"] == pytest.approx(category_planned, abs=0.01)
+            assert overall["actual"] == pytest.approx(category_actual, abs=0.01)
+            assert "status" in overall
+            assert "pace" in overall
+
+
+# ============================================================================
+# Budget period with monthStartDay
+# ============================================================================
+
+
+class TestBudgetMonthStartDay:
+    """Test check_budget_health with custom month_start_day."""
+
+    def _set_month_start_day(self, db: Database, day: int):
+        conn = db.connect()
+        conn.execute("UPDATE users SET month_start_day = ? WHERE id = 1", (day,))
+        conn.commit()
+
+    def test_month_start_day_8_period(self, populated_db: Database):
+        """monthStartDay=8: period is 8th to 7th of next month."""
+        self._set_month_start_day(populated_db, 8)
+        result = check_budget_health(populated_db, month="2026-03")
+        assert result["period_start"] == "2026-03-08"
+        assert result["period_end"] == "2026-04-07"
+        assert result["month"] == "2026-03"
+
+    def test_month_start_day_1_calendar_month(self, populated_db: Database):
+        """monthStartDay=1: identical to calendar month behavior."""
+        self._set_month_start_day(populated_db, 1)
+        result = check_budget_health(populated_db, month="2026-03")
+        assert result["period_start"] == "2026-03-01"
+        assert result["period_end"] == "2026-03-31"
+        assert result["month"] == "2026-03"
+
+    def test_month_start_day_none_defaults_to_1(self, populated_db: Database):
+        """No monthStartDay set: defaults to 1 (calendar month)."""
+        conn = populated_db.connect()
+        conn.execute("UPDATE users SET month_start_day = NULL WHERE id = 1")
+        conn.commit()
+        result = check_budget_health(populated_db, month="2026-03")
+        assert result["period_start"] == "2026-03-01"
+        assert result["period_end"] == "2026-03-31"
+
+    def test_budget_lookup_uses_calendar_month(self, populated_db: Database):
+        """Budget records are always keyed by YYYY-MM-01 regardless of monthStartDay."""
+        self._set_month_start_day(populated_db, 8)
+        # Insert budget for 2026-02
+        conn = populated_db.connect()
+        conn.execute(
+            """INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed)
+            VALUES (1, 'tag-food', '2026-02-01', 0.0, 0, 20000.0, 1, 1000000)"""
+        )
+        conn.commit()
+        result = check_budget_health(populated_db, month="2026-02")
+        # Should find the budget even though period is Feb 8 - Mar 7
+        food = next((c for c in result["categories"] if "Еда" in c["name"]), None)
+        assert food is not None
+        assert food["planned"] == 20000.0
+
+    def test_days_elapsed_shifted_period(self, populated_db: Database):
+        """Days elapsed should be relative to shifted period start."""
+        self._set_month_start_day(populated_db, 8)
+        today = date.today()
+        # Determine which budget month today is in
+        if today.day >= 8:
+            budget_year, budget_month = today.year, today.month
+        else:
+            if today.month == 1:
+                budget_year, budget_month = today.year - 1, 12
+            else:
+                budget_year, budget_month = today.year, today.month - 1
+
+        result = check_budget_health(populated_db, month=f"{budget_year:04d}-{budget_month:02d}")
+        period_start = date.fromisoformat(result["period_start"])
+        expected_elapsed = (today - period_start).days + 1
+        assert result["days_elapsed"] == expected_elapsed
+        assert result["status"] == "current"
+
+    def test_current_month_detection_shifted(self, populated_db: Database):
+        """Today before monthStartDay means we're in previous budget month."""
+        self._set_month_start_day(populated_db, 28)
+        today = date.today()
+
+        # No explicit month → auto-detect
+        result = check_budget_health(populated_db)
+
+        if today.day >= 28:
+            assert result["month"] == today.strftime("%Y-%m")
+        else:
+            # Previous budget month
+            if today.month == 1:
+                expected = f"{today.year - 1:04d}-12"
+            else:
+                expected = f"{today.year:04d}-{today.month - 1:02d}"
+            assert result["month"] == expected
+
+    def test_period_start_end_in_response(self, populated_db: Database):
+        """Response always includes period_start and period_end."""
+        result = check_budget_health(populated_db)
+        assert "period_start" in result
+        assert "period_end" in result
+
+    def test_december_boundary(self, populated_db: Database):
+        """monthStartDay=8, month=2026-12: period Dec 8 - Jan 7 2027."""
+        self._set_month_start_day(populated_db, 8)
+        conn = populated_db.connect()
+        conn.execute(
+            """INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed)
+            VALUES (1, 'tag-food', '2026-12-01', 0.0, 0, 15000.0, 1, 1000000)"""
+        )
+        conn.commit()
+        result = check_budget_health(populated_db, month="2026-12")
+        assert result["period_start"] == "2026-12-08"
+        assert result["period_end"] == "2027-01-07"
+        assert result["days_total"] == 31
+
+
+# ============================================================================
+# ISSUE-004: Anomaly severity mapping
+# ============================================================================
+
+
+class TestAnomalySeverity:
+    """Test anomaly severity uses absolute thresholds."""
+
+    def test_z_threshold_minimum_enforced(self, populated_db: Database):
+        """ISSUE-004: z_threshold below 1.5 should be clamped."""
+        # With z_threshold=0.5, should behave as z_threshold=1.5
+        result_low = detect_anomalies(populated_db, period="this_month", z_threshold=0.5)
+        result_min = detect_anomalies(populated_db, period="this_month", z_threshold=1.5)
+
+        assert result_low["summary"]["outliers_count"] == result_min["summary"]["outliers_count"]
+
+    def test_severity_absolute_thresholds(self, populated_db: Database):
+        """ISSUE-004: Severity should be based on absolute z-score values."""
+        conn = populated_db.connect()
+        today = date.today()
+        current_month_start = today.replace(day=1)
+
+        # Insert many similar transactions + one huge outlier
+        for i in range(6):
+            conn.execute(
+                """INSERT INTO transactions
+                (id, date, user, deleted, hold, income, income_instrument, income_account,
+                 outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+                 original_payee, comment, mcc, op_income, op_income_instrument,
+                 op_outcome, op_outcome_instrument, latitude, longitude,
+                 reminder_marker, created, changed)
+                VALUES (?, ?, 1, 0, 0, 0.0, 1, 'acc-rub', ?, 1, 'acc-rub',
+                        ?, NULL, 'TestPayee', NULL, NULL, NULL, NULL, NULL,
+                        NULL, NULL, NULL, NULL, NULL, 1000000, ?)""",
+                (
+                    f"tx-sev-{i}",
+                    (current_month_start + timedelta(days=i)).isoformat(),
+                    100.0 if i < 5 else 10000.0,  # Last one is huge outlier
+                    json.dumps(["tag-transport"]),
+                    2000000 + i,
+                ),
+            )
+        conn.commit()
+
+        result = detect_anomalies(populated_db, period="this_month", z_threshold=1.5)
+
+        for outlier in result["outliers"]:
+            if outlier["z_score"] >= 3.0:
+                assert outlier["severity"] == "high"
+            elif outlier["z_score"] >= 2.0:
+                assert outlier["severity"] == "medium"
+            else:
+                assert outlier["severity"] == "low"
+
+
+# ============================================================================
+# ISSUE-001: out_of_balance in net_worth
+# ============================================================================
+
+
+class TestOutOfBalanceInNetWorth:
+    """Test out_of_balance accounts included in net_worth."""
+
+    def test_out_of_balance_has_total(self, populated_db: Database):
+        """ISSUE-001: out_of_balance should be a dict with total and accounts."""
+        result = get_net_worth(populated_db)
+        assert isinstance(result["out_of_balance"], dict)
+        assert "total" in result["out_of_balance"]
+        assert "accounts" in result["out_of_balance"]
+
+    def test_out_of_balance_included_in_net_worth(self, populated_db: Database):
+        """ISSUE-001: out_of_balance total should be included in net_worth."""
+        result = get_net_worth(populated_db)
+        breakdown = result["breakdown"]
+        expected = (
+            breakdown["current"]["total"]
+            + breakdown["savings"]["total"]
+            + breakdown["loans"]["total"]
+            + breakdown["debts"]["total"]
+            + result["out_of_balance"]["total"]
+        )
+        assert result["net_worth"] == pytest.approx(expected, abs=0.01)
+
+
+# ============================================================================
+# ISSUE-005: Recurring dedup + yearly_cost for reminders
+# ============================================================================
+
+
+class TestRecurringDedup:
+    """Test recurring payment deduplication and yearly_cost for reminders."""
+
+    def test_reminder_has_yearly_cost(self, populated_db: Database):
+        """ISSUE-005: Reminder entries should have yearly_cost."""
+        conn = populated_db.connect()
+        conn.execute(
+            """INSERT INTO reminders
+            (id, interval, step, outcome, payee, tag, outcome_account, user, changed)
+            VALUES ('rem-1', 'month', 1, 500.0, 'Netflix', NULL, 'acc-rub', 1, 1000000)"""
+        )
+        conn.commit()
+
+        result = detect_recurring(populated_db, lookback_months=3)
+        reminder_items = [r for r in result["recurring"] if r["source"] == "reminder"]
+        assert len(reminder_items) >= 1
+
+        netflix = next((r for r in reminder_items if r["name"] == "Netflix"), None)
+        assert netflix is not None
+        assert "yearly_cost" in netflix
+        # monthly: 500 * (365/30) ≈ 6083.33
+        assert netflix["yearly_cost"] == pytest.approx(500 * 365 / 30, abs=1.0)
+
+    def test_dedup_skips_detected_names(self, populated_db: Database):
+        """ISSUE-005: Reminders with names already detected should be skipped."""
+        conn = populated_db.connect()
+        today = date.today()
+        current_month_start = today.replace(day=1)
+
+        # Insert repeated transactions to be detected as recurring
+        for i in range(3):
+            month_start = date(today.year, today.month - 2 + i, 1) if today.month > 2 else date(today.year - 1, today.month + 10 + i, 1)
+            conn.execute(
+                """INSERT INTO transactions
+                (id, date, user, deleted, hold, income, income_instrument, income_account,
+                 outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+                 original_payee, comment, mcc, op_income, op_income_instrument,
+                 op_outcome, op_outcome_instrument, latitude, longitude,
+                 reminder_marker, created, changed)
+                VALUES (?, ?, 1, 0, 0, 0.0, 1, 'acc-rub', 500.0, 1, 'acc-rub',
+                        NULL, NULL, 'DupService', NULL, NULL, NULL, NULL, NULL,
+                        NULL, NULL, NULL, NULL, NULL, 1000000, ?)""",
+                (f"tx-dup-rec-{i}", month_start.isoformat(), 3000000 + i),
+            )
+
+        # Insert reminder with same name
+        conn.execute(
+            """INSERT INTO reminders
+            (id, interval, step, outcome, payee, tag, outcome_account, user, changed)
+            VALUES ('rem-dup', 'month', 1, 500.0, 'DupService', NULL, 'acc-rub', 1, 1000000)"""
+        )
+        conn.commit()
+
+        result = detect_recurring(populated_db, lookback_months=3)
+
+        # Count how many DupService entries we have
+        dup_entries = [r for r in result["recurring"] if r["name"].lower().strip() == "dupservice"]
+        # Should not have both detected and reminder
+        sources = {r["source"] for r in dup_entries}
+        assert len(sources) <= 1, f"Expected at most one source for DupService, got {sources}"
+
+
+# ============================================================================
+# FR-001: Custom date ranges
+# ============================================================================
+
+
+class TestCustomDateRanges:
+    """Test custom start_date/end_date parameters."""
+
+    def test_get_period_dates_custom_range(self):
+        """FR-001: Custom start_date and end_date should override period."""
+        start, end = get_period_dates("this_month", start_date="2025-06-15", end_date="2025-07-15")
+        assert start == "2025-06-15"
+        assert end == "2025-07-15"
+
+    def test_get_period_dates_start_only(self):
+        """FR-001: start_date without end_date should use today."""
+        start, end = get_period_dates("this_month", start_date="2025-01-01")
+        assert start == "2025-01-01"
+        assert end == date.today().isoformat()
+
+    def test_analyze_spending_custom_dates(self, populated_db: Database):
+        """FR-001: analyze_spending with custom dates."""
+        today = date.today()
+        start = today.replace(day=1).isoformat()
+        end = today.isoformat()
+        result = analyze_spending(populated_db, start_date=start, end_date=end)
+        assert result["period"]["start"] == start
+        assert result["period"]["end"] == end
+
+    def test_search_transactions_custom_dates(self, populated_db: Database):
+        """FR-001: search_transactions with custom dates."""
+        today = date.today()
+        start = today.replace(day=1).isoformat()
+        end = today.isoformat()
+        result = search_transactions(populated_db, start_date=start, end_date=end)
+        assert "transactions" in result
+
+
+# ============================================================================
+# FR-003: Spending drill-down by merchant
+# ============================================================================
+
+
+class TestSpendingDrillDown:
+    """Test spending drill-down and group_by merchant."""
+
+    def test_drill_down_has_top_merchants(self, populated_db: Database):
+        """FR-003: Drill-down by category should include top_merchants."""
+        result = analyze_spending(populated_db, category_id="tag-food")
+        if result["total_outcome"] > 0:
+            assert "top_merchants" in result
+
+    def test_group_by_merchant(self, populated_db: Database):
+        """FR-003: group_by='merchant' should aggregate by merchant."""
+        result = analyze_spending(populated_db, group_by="merchant")
+        assert result["group_by"] == "merchant"
+        assert "merchants" in result
+        assert "total_outcome" in result
+
+    def test_group_by_merchant_structure(self, populated_db: Database):
+        """FR-003: Merchant entries should have expected fields."""
+        result = analyze_spending(populated_db, group_by="merchant")
+        for merchant in result["merchants"]:
+            assert "name" in merchant
+            assert "amount" in merchant
+            assert "count" in merchant
+            assert "share_pct" in merchant

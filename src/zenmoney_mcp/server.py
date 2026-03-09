@@ -139,6 +139,14 @@ async def list_tools() -> list[Tool]:
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                         "default": "this_month",
                     },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO, e.g. '2026-01-01'). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
+                    },
                     "category_id": {
                         "type": "string",
                         "description": "Category UUID for drill-down (includes subcategories)",
@@ -158,6 +166,12 @@ async def list_tools() -> list[Tool]:
                         "description": "Include hold transactions (pre-authorizations)",
                         "default": False,
                     },
+                    "group_by": {
+                        "type": "string",
+                        "enum": ["category", "merchant"],
+                        "description": "Aggregation mode: 'category' (default) or 'merchant'",
+                        "default": "category",
+                    },
                 },
             },
         ),
@@ -171,6 +185,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                         "default": "this_month",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
                     },
                     "top_n": {
                         "type": "integer",
@@ -190,6 +212,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                         "default": "this_month",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
                     },
                     "category_id": {
                         "type": "string",
@@ -211,7 +241,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "month": {
                         "type": "string",
-                        "description": "Month in 'YYYY-MM' format. Defaults to current month if not specified.",
+                        "description": "Month in 'YYYY-MM' format. Defaults to current budget period.",
                     },
                 },
             },
@@ -287,6 +317,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                     },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
+                    },
                 },
                 "required": ["account_id", "period"],
             },
@@ -312,7 +350,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="detect_anomalies",
-            description="Detect anomalous spending (outliers, suspicious duplicates). Answers: 'Any unusual spending?', 'Suspicious transactions?'",
+            description="Detect anomalous spending (outliers, suspicious duplicates). Answers: 'Any unusual spending?', 'Suspicious transactions?'. Severity: z>=3.0 high, z>=2.0 medium, else low. Minimum z_threshold is 1.5.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -321,13 +359,21 @@ async def list_tools() -> list[Tool]:
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                         "default": "this_month",
                     },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
+                    },
                     "category_id": {
                         "type": "string",
                         "description": "Category UUID to filter",
                     },
                     "z_threshold": {
                         "type": "number",
-                        "description": "Z-score threshold for outlier detection (standard deviations)",
+                        "description": "Z-score threshold for outlier detection (minimum 1.5)",
                         "default": 2.0,
                     },
                 },
@@ -401,6 +447,14 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
                     },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date (ISO). Overrides period.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
+                    },
                     "category_id": {
                         "type": "string",
                         "description": "Category UUID (includes subcategories)",
@@ -471,6 +525,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             top_n=arguments.get("top_n", 10),
             include_transfers=arguments.get("include_transfers", False),
             include_holds=arguments.get("include_holds", False),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
+            group_by=arguments.get("group_by", "category"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -479,6 +536,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             db,
             period=arguments.get("period", "this_month"),
             top_n=arguments.get("top_n", 10),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -488,6 +547,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             period=arguments.get("period", "this_month"),
             category_id=arguments.get("category_id"),
             top_n=arguments.get("top_n", 10),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -527,6 +588,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             db,
             account_id=arguments.get("account_id"),
             period=arguments.get("period"),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -544,6 +607,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             period=arguments.get("period", "this_month"),
             category_id=arguments.get("category_id"),
             z_threshold=arguments.get("z_threshold", 2.0),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -588,6 +653,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             max_amount=arguments.get("max_amount"),
             tx_type=arguments.get("type"),
             limit=arguments.get("limit", 50),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 

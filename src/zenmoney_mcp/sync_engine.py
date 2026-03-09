@@ -1,9 +1,12 @@
 """Sync engine for ZenMoney API using /v8/diff/ protocol."""
 
+import logging
 import time
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from .database import Database
 
@@ -71,19 +74,30 @@ class SyncEngine:
             "serverTimestamp": server_timestamp,
         }
 
+        timeout = 300.0 if force_full else 60.0
+        max_attempts = 2 if force_full else 1
+
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    ZENMONEY_API_URL,
-                    json=request_body,
-                    headers={
-                        "Authorization": f"Bearer {self.token}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=60.0,
-                )
-            except httpx.HTTPError as e:
-                raise SyncError(f"HTTP error during sync: {e}") from e
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    response = await client.post(
+                        ZENMONEY_API_URL,
+                        json=request_body,
+                        headers={
+                            "Authorization": f"Bearer {self.token}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=timeout,
+                    )
+                    break
+                except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        continue
+                    raise SyncError(f"HTTP error during sync after {max_attempts} attempts: {e}") from e
+                except httpx.HTTPError as e:
+                    raise SyncError(f"HTTP error during sync: {e}") from e
 
         if response.status_code != 200:
             raise SyncError(
@@ -127,6 +141,10 @@ class SyncEngine:
         for entity_name, (upsert_method, table_name) in ENTITY_MAPPING.items():
             items = diff_data.get(entity_name, [])
             if items:
+                if entity_name == "user":
+                    for item in items:
+                        logger.debug("User entity fields: %s", list(item.keys()))
+                        logger.debug("User entity monthStartDay=%s", item.get("monthStartDay"))
                 method = getattr(self.db, upsert_method)
                 count = method(items)
                 if count > 0:

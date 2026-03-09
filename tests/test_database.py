@@ -61,6 +61,61 @@ class TestDatabaseSchema:
         assert expected_indexes <= index_names
 
 
+class TestMigration:
+    """Test schema migrations for existing databases."""
+
+    def test_migrate_adds_month_start_day(self):
+        """Existing DB without month_start_day column gets it after init_schema."""
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        # Create old schema without month_start_day
+        conn.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                login TEXT,
+                currency INTEGER,
+                parent INTEGER,
+                changed INTEGER
+            )
+        """)
+        conn.execute(
+            "INSERT INTO users (id, login, currency, parent, changed) VALUES (1, 'test', 1, NULL, 1000)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Now open via Database — init_schema should migrate
+        db = Database(":memory:")
+        # Manually recreate the old table in the in-memory DB
+        raw_conn = db.connect()
+        raw_conn.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                login TEXT,
+                currency INTEGER,
+                parent INTEGER,
+                changed INTEGER
+            )
+        """)
+        raw_conn.execute(
+            "INSERT INTO users (id, login, currency, parent, changed) VALUES (1, 'test', 1, NULL, 1000)"
+        )
+        raw_conn.commit()
+
+        # Run migration
+        db._migrate(raw_conn)
+        raw_conn.commit()
+
+        # Column should exist and default to NULL
+        row = raw_conn.execute("SELECT month_start_day FROM users WHERE id = 1").fetchone()
+        assert row["month_start_day"] is None
+
+        # get_user_month_start_day should return 1 (default)
+        assert db.get_user_month_start_day() == 1
+
+
 class TestSyncMeta:
     """Test sync metadata operations."""
 

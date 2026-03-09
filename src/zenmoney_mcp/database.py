@@ -25,11 +25,12 @@ CREATE TABLE IF NOT EXISTS companies (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY,
-    login    TEXT,
-    currency INTEGER,  -- основная валюта пользователя (instruments.id)
-    parent   INTEGER,
-    changed  INTEGER
+    id              INTEGER PRIMARY KEY,
+    login           TEXT,
+    currency        INTEGER,  -- основная валюта пользователя (instruments.id)
+    parent          INTEGER,
+    month_start_day INTEGER,  -- день начала бюджетного месяца (1-31)
+    changed         INTEGER
 );
 
 -- Пользовательские сущности
@@ -202,7 +203,18 @@ class Database:
         conn = self.connect()
         conn.executescript(SCHEMA)
         conn.executescript(INDEXES)
+        self._migrate(conn)
         conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Apply schema migrations for existing databases."""
+        # Check if month_start_day column exists in users table
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "month_start_day" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN month_start_day INTEGER")
 
     # -------------------------------------------------------------------------
     # Sync metadata
@@ -292,14 +304,15 @@ class Database:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO users
-                (id, login, currency, parent, changed)
-                VALUES (?, ?, ?, ?, ?)
+                (id, login, currency, parent, month_start_day, changed)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
                     item.get("login"),
                     item.get("currency"),
                     item.get("parent"),
+                    item.get("monthStartDay"),
                     item.get("changed"),
                 ),
             )
@@ -591,6 +604,14 @@ class Database:
             "SELECT currency FROM users WHERE parent IS NULL LIMIT 1"
         ).fetchone()
         return row["currency"] if row else None
+
+    def get_user_month_start_day(self) -> int:
+        """Get primary user's budget month start day (1-31). Returns 1 if not set."""
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT month_start_day FROM users WHERE parent IS NULL LIMIT 1"
+        ).fetchone()
+        return row["month_start_day"] if row and row["month_start_day"] else 1
 
     def get_instrument_rate(self, instrument_id: int) -> float:
         """Get instrument rate (cost of 1 unit in RUB)."""

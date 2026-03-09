@@ -10,15 +10,26 @@ from .database import Database
 from .utils import convert_to_user_currency
 
 
-def get_period_dates(period: str) -> tuple[str, str]:
+def get_period_dates(
+    period: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[str, str]:
     """Convert period string to start and end dates.
 
     Args:
         period: One of "this_month", "last_month", "last_30_days", or "YYYY-MM"
+        start_date: Optional explicit start date (ISO format). Overrides period.
+        end_date: Optional explicit end date (ISO format). Used with start_date.
 
     Returns:
         Tuple of (start_date, end_date) as ISO strings.
     """
+    if start_date:
+        if end_date:
+            return start_date, end_date
+        return start_date, date.today().isoformat()
+
     today = date.today()
 
     if period == "this_month":
@@ -100,6 +111,7 @@ def get_net_worth(db: Database) -> dict[str, Any]:
     savings_total = 0.0
     loans_total = 0.0
     debts_total = 0.0
+    out_of_balance_total = 0.0
 
     for row in rows:
         balance = row["balance"] or 0
@@ -122,6 +134,7 @@ def get_net_worth(db: Database) -> dict[str, Any]:
 
         if not row["in_balance"]:
             out_of_balance.append(account_info)
+            out_of_balance_total += converted
             continue
 
         acc_type = row["type"]
@@ -140,7 +153,7 @@ def get_net_worth(db: Database) -> dict[str, Any]:
             current_accounts.append(account_info)
             current_total += converted
 
-    net_worth = current_total + savings_total + loans_total + debts_total
+    net_worth = current_total + savings_total + loans_total + debts_total + out_of_balance_total
 
     return {
         "net_worth": round(net_worth, 2),
@@ -164,7 +177,10 @@ def get_net_worth(db: Database) -> dict[str, Any]:
                 "accounts": debts_accounts,
             },
         },
-        "out_of_balance": out_of_balance,
+        "out_of_balance": {
+            "total": round(out_of_balance_total, 2),
+            "accounts": out_of_balance,
+        },
     }
 
 
@@ -318,6 +334,9 @@ def analyze_spending(
     top_n: int = 10,
     include_transfers: bool = False,
     include_holds: bool = False,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    group_by: str = "category",
 ) -> dict[str, Any]:
     """Analyze spending by categories.
 
@@ -330,12 +349,15 @@ def analyze_spending(
         top_n: Number of top categories to return.
         include_transfers: Include transfers in analysis.
         include_holds: Include hold transactions.
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
+        group_by: Aggregation mode: "category" (default) or "merchant".
 
     Returns:
         Dictionary with spending breakdown by categories.
     """
     conn = db.connect()
-    start_date, end_date = get_period_dates(period)
+    start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -366,9 +388,13 @@ def analyze_spending(
             t.outcome,
             t.outcome_instrument,
             t.tag,
-            t.hold
+            t.hold,
+            t.merchant,
+            t.payee,
+            m.title as merchant_title
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.outcome_account
+        LEFT JOIN merchants m ON m.id = t.merchant
         WHERE t.deleted = 0
           AND t.date BETWEEN ? AND ?
           AND t.outcome > 0
@@ -384,6 +410,7 @@ def analyze_spending(
 
     # Aggregate by category
     category_totals: dict[str | None, dict[str, Any]] = {}
+    merchant_totals: dict[str | None, dict[str, Any]] = {}
     holds_excluded = {"amount": 0.0, "count": 0}
 
     for row in rows:
@@ -427,6 +454,47 @@ def analyze_spending(
         category_totals[primary_tag]["amount"] += amount
         category_totals[primary_tag]["count"] += 1
 
+        # Track merchant totals (for group_by=merchant or drill-down)
+        merchant_name = row["merchant_title"] or row["payee"] or None
+        merchant_key = row["merchant"] or merchant_name
+        if merchant_key not in merchant_totals:
+            merchant_totals[merchant_key] = {
+                "merchant_id": row["merchant"],
+                "name": merchant_name or "Unknown",
+                "amount": 0.0,
+                "count": 0,
+            }
+        merchant_totals[merchant_key]["amount"] += amount
+        merchant_totals[merchant_key]["count"] += 1
+
+    # Calculate total
+    total_outcome = sum(cat["amount"] for cat in category_totals.values())
+
+    # If group_by == "merchant", return merchant aggregation
+    if group_by == "merchant":
+        merchants_list = []
+        for data in merchant_totals.values():
+            merchants_list.append({
+                "merchant_id": data["merchant_id"],
+                "name": data["name"],
+                "amount": round(data["amount"], 2),
+                "share_pct": round(data["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
+                "count": data["count"],
+                "avg_check": round(data["amount"] / data["count"], 2) if data["count"] > 0 else 0,
+            })
+        merchants_list.sort(key=lambda x: x["amount"], reverse=True)
+
+        return {
+            "period": {"start": start_date, "end": end_date},
+            "total_outcome": round(total_outcome, 2),
+            "currency": currency_code,
+            "group_by": "merchant",
+            "merchants": merchants_list[:top_n],
+            "returned_count": min(len(merchants_list), top_n),
+            "total_merchants": len(merchants_list),
+            "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
+        }
+
     # Get category names and parent info
     tag_info = {}
     if category_totals:
@@ -453,9 +521,7 @@ def analyze_spending(
                     if ti["parent"]:
                         ti["parent_title"] = parent_titles.get(ti["parent"])
 
-    # Calculate totals and percentages
-    total_outcome = sum(cat["amount"] for cat in category_totals.values())
-
+    # Calculate percentages
     categories = []
     for tag_id, data in category_totals.items():
         info = tag_info.get(tag_id, {})
@@ -487,7 +553,7 @@ def analyze_spending(
         else:
             categorized.append(cat)
 
-    return {
+    result = {
         "period": {"start": start_date, "end": end_date},
         "total_outcome": round(total_outcome, 2),
         "currency": currency_code,
@@ -498,11 +564,28 @@ def analyze_spending(
         "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
     }
 
+    # Add top_merchants when in drill-down mode (category_id is set)
+    if category_id and merchant_totals:
+        top_merchants = []
+        for data in merchant_totals.values():
+            top_merchants.append({
+                "merchant_id": data["merchant_id"],
+                "name": data["name"],
+                "amount": round(data["amount"], 2),
+                "count": data["count"],
+            })
+        top_merchants.sort(key=lambda x: x["amount"], reverse=True)
+        result["top_merchants"] = top_merchants[:10]
+
+    return result
+
 
 def analyze_income(
     db: Database,
     period: str = "this_month",
     top_n: int = 10,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Analyze income by categories and sources.
 
@@ -512,12 +595,14 @@ def analyze_income(
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         top_n: Number of top categories/sources to return.
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
         Dictionary with income breakdown by categories and sources.
     """
     conn = db.connect()
-    start_date, end_date = get_period_dates(period)
+    start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -673,6 +758,53 @@ def analyze_income(
     }
 
 
+def _compute_budget_period(
+    month_start_day: int, target_year: int, target_month: int
+) -> tuple[date, date]:
+    """Compute budget period start/end for a given budget month.
+
+    Args:
+        month_start_day: Day of month when budget period starts (1-31).
+        target_year: Year of the budget month.
+        target_month: Month number (1-12) of the budget month.
+
+    Returns:
+        (period_start, period_end) dates.
+    """
+    import calendar
+
+    # Clamp start day to actual days in target month
+    max_day = calendar.monthrange(target_year, target_month)[1]
+    clamped_start = min(month_start_day, max_day)
+    period_start = date(target_year, target_month, clamped_start)
+
+    # End = day before the start of the next budget period
+    if target_month == 12:
+        next_year, next_mon = target_year + 1, 1
+    else:
+        next_year, next_mon = target_year, target_month + 1
+
+    max_day_next = calendar.monthrange(next_year, next_mon)[1]
+    next_period_start_day = min(month_start_day, max_day_next)
+    next_period_start = date(next_year, next_mon, next_period_start_day)
+    period_end = next_period_start - timedelta(days=1)
+
+    return period_start, period_end
+
+
+def _current_budget_month(month_start_day: int, today: date) -> tuple[int, int]:
+    """Determine which budget month 'today' falls into.
+
+    Returns (year, month) of the budget month.
+    """
+    if month_start_day <= 1 or today.day >= month_start_day:
+        return today.year, today.month
+    # Before the start day → previous budget month
+    if today.month == 1:
+        return today.year - 1, 12
+    return today.year, today.month - 1
+
+
 def check_budget_health(
     db: Database,
     month: str | None = None,
@@ -689,33 +821,41 @@ def check_budget_health(
         Dictionary with budget health status for each category.
     """
     conn = db.connect()
+    today = date.today()
+    month_start_day = db.get_user_month_start_day()
 
-    # Determine month
+    # Determine period and budget month
     if month:
         try:
-            year, mon = map(int, month.split("-"))
-            target_date = date(year, mon, 1)
+            target_year, target_month = map(int, month.split("-"))
+            date(target_year, target_month, 1)  # validate
         except (ValueError, AttributeError):
-            target_date = date.today().replace(day=1)
+            target_year, target_month = _current_budget_month(month_start_day, today)
+        period_start, period_end = _compute_budget_period(
+            month_start_day, target_year, target_month
+        )
     else:
-        target_date = date.today().replace(day=1)
+        target_year, target_month = _current_budget_month(month_start_day, today)
+        period_start, period_end = _compute_budget_period(
+            month_start_day, target_year, target_month
+        )
 
-    month_start = target_date.isoformat()
+    # Budget records are always keyed by YYYY-MM-01
+    budget_date = date(target_year, target_month, 1).isoformat()
 
-    # Calculate days in month and days elapsed
-    today = date.today()
-    if target_date.year == today.year and target_date.month == today.month:
-        days_elapsed = today.day
+    # Calculate days progress
+    days_total = (period_end - period_start).days + 1
+
+    if period_start <= today <= period_end:
+        days_elapsed = (today - period_start).days + 1
+        month_status = "current"
+    elif today > period_end:
+        days_elapsed = days_total
+        month_status = "completed"
     else:
-        # For past/future months, assume full month
-        days_elapsed = 1
+        days_elapsed = 0
+        month_status = "future"
 
-    # Days in month
-    if target_date.month == 12:
-        next_month = date(target_date.year + 1, 1, 1)
-    else:
-        next_month = date(target_date.year, target_date.month + 1, 1)
-    days_total = (next_month - target_date).days
     days_remaining = max(0, days_total - days_elapsed)
 
     # Get user currency
@@ -736,19 +876,23 @@ def check_budget_health(
         FROM budgets b
         LEFT JOIN tags t ON t.id = b.tag
         WHERE b.date = ?
-    """, (month_start,)).fetchall()
+    """, (budget_date,)).fetchall()
 
     if not budget_rows:
         return {
-            "month": target_date.strftime("%Y-%m"),
+            "month": f"{target_year:04d}-{target_month:02d}",
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "status": month_status,
             "days_elapsed": days_elapsed,
             "days_total": days_total,
             "message": "No budgets configured for this month",
             "categories": [],
         }
 
-    # Get month date range for actuals
-    month_end = (next_month - timedelta(days=1)).isoformat()
+    # Date range for actuals
+    month_start = period_start.isoformat()
+    month_end = period_end.isoformat()
 
     categories = []
     overall_planned = 0.0
@@ -783,6 +927,12 @@ def check_budget_health(
                   AND tag = ?
             """, (month_start, month_end, tag_id)).fetchone()["total"]
             planned = budget_outcome + reminder_sum
+
+        # Clamp negative planned to 0
+        planned_warning = None
+        if planned < 0:
+            planned_warning = f"Computed planned was {round(planned, 2)}, clamped to 0"
+            planned = 0
 
         # Calculate actual spending for this tag
         # Include children tags
@@ -874,6 +1024,8 @@ def check_budget_health(
 
         if insight:
             cat_data["insight"] = insight
+        if planned_warning:
+            cat_data["warning"] = planned_warning
 
         if is_total:
             overall_data = cat_data.copy()
@@ -889,16 +1041,48 @@ def check_budget_health(
     categories.sort(key=lambda x: x["pct_used"], reverse=True)
 
     result = {
-        "month": target_date.strftime("%Y-%m"),
+        "month": f"{target_year:04d}-{target_month:02d}",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "status": month_status,
         "days_elapsed": days_elapsed,
         "days_total": days_total,
         "currency": currency_code,
         "categories": categories,
     }
 
-    # Add overall if we have it
-    if "overall_data" in locals():
-        result["overall"] = overall_data
+    # Build overall from accumulated totals (not from the "000..." total budget row
+    # which has no real transactions mapped to it)
+    if overall_planned > 0 or overall_actual > 0:
+        overall_remaining = overall_planned - overall_actual
+        overall_pct_used = (overall_actual / overall_planned * 100) if overall_planned > 0 else 0
+        overall_daily_remaining = (overall_remaining / days_remaining) if days_remaining > 0 else 0
+
+        if overall_pct_used < 80:
+            overall_status = "on_track"
+        elif overall_pct_used < 100:
+            overall_status = "warning"
+        else:
+            overall_status = "overspent"
+
+        month_progress = days_elapsed / days_total if days_total > 0 else 0
+        spend_progress = overall_pct_used / 100 if overall_planned > 0 else 0
+        if spend_progress > month_progress * 1.1:
+            overall_pace = "ahead_of_pace"
+        elif spend_progress < month_progress * 0.9:
+            overall_pace = "behind_pace"
+        else:
+            overall_pace = "on_pace"
+
+        result["overall"] = {
+            "planned": round(overall_planned, 2),
+            "actual": round(overall_actual, 2),
+            "remaining": round(overall_remaining, 2),
+            "pct_used": round(overall_pct_used, 1),
+            "daily_remaining": round(overall_daily_remaining, 2) if days_remaining > 0 else 0,
+            "status": overall_status,
+            "pace": overall_pace,
+        }
 
     return result
 
@@ -908,6 +1092,8 @@ def analyze_merchants(
     period: str = "this_month",
     category_id: str | None = None,
     top_n: int = 10,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Analyze spending by merchants/payees.
 
@@ -918,12 +1104,14 @@ def analyze_merchants(
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         category_id: Optional category filter (includes children).
         top_n: Number of top merchants to return.
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
         Dictionary with spending breakdown by merchants.
     """
     conn = db.connect()
-    start_date, end_date = get_period_dates(period)
+    start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -1276,6 +1464,9 @@ def detect_recurring(
             "yearly_cost": round(yearly_cost, 2),
         })
 
+    # Build set of detected names for dedup
+    detected_names = {r["name"].strip().lower() for r in recurring if r.get("name")}
+
     # Add reminders with interval != null
     reminder_rows = conn.execute("""
         SELECT r.id, r.interval, r.step, r.outcome, r.payee, r.tag,
@@ -1287,6 +1478,11 @@ def detect_recurring(
     """).fetchall()
 
     for row in reminder_rows:
+        # Skip if already detected from transactions
+        reminder_name = (row["payee"] or "Unknown").strip().lower()
+        if reminder_name in detected_names:
+            continue
+
         frequency_map = {
             "day": "daily",
             "week": "weekly",
@@ -1294,6 +1490,18 @@ def detect_recurring(
             "year": "yearly",
         }
         frequency = frequency_map.get(row["interval"], row["interval"])
+
+        # Compute yearly_cost from amount and frequency
+        interval_days_map = {
+            "daily": 1,
+            "weekly": 7,
+            "month": 30,
+            "monthly": 30,
+            "year": 365,
+            "yearly": 365,
+        }
+        interval_d = interval_days_map.get(frequency, 30)
+        yearly_cost = row["outcome"] * (365 / interval_d)
 
         recurring.append({
             "name": row["payee"] or "Unknown",
@@ -1305,6 +1513,7 @@ def detect_recurring(
             "confidence": 1.0,
             "source": "reminder",
             "type": "other",
+            "yearly_cost": round(yearly_cost, 2),
         })
 
     # Sort by yearly cost descending
@@ -1981,6 +2190,8 @@ def detect_anomalies(
     period: str = "this_month",
     category_id: str | None = None,
     z_threshold: float = 2.0,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Detect anomalous transactions.
 
@@ -1990,13 +2201,18 @@ def detect_anomalies(
         db: Database instance.
         period: Time period to analyze.
         category_id: Optional category filter.
-        z_threshold: Z-score threshold (standard deviations).
+        z_threshold: Z-score threshold (standard deviations). Minimum 1.5.
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
         Dictionary with detected anomalies.
     """
+    # Enforce minimum z_threshold
+    z_threshold = max(z_threshold, 1.5)
+
     conn = db.connect()
-    start_date, end_date = get_period_dates(period)
+    start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
     # Get user currency for conversion
     user_currency_id = db.get_user_currency()
@@ -2111,7 +2327,7 @@ def detect_anomalies(
                     "z_score": round(z_score, 2),
                     "mean": round(mean, 2),
                     "stddev": round(stddev, 2),
-                    "severity": "high" if z_score > z_threshold * 1.5 else "medium",
+                    "severity": "high" if z_score >= 3.0 else ("medium" if z_score >= 2.0 else "low"),
                 })
 
     # Detect possible duplicates (same amount, date ±1 day, same payee)
@@ -2171,6 +2387,8 @@ def get_account_flow(
     db: Database,
     account_id: str,
     period: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Get cash flow for a specific account.
 
@@ -2180,12 +2398,14 @@ def get_account_flow(
         db: Database instance.
         account_id: Account ID (UUID).
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
         Dictionary with account flow breakdown.
     """
     conn = db.connect()
-    start_date, end_date = get_period_dates(period)
+    start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
     # Get account info
     account_row = conn.execute(
@@ -2425,6 +2645,8 @@ def search_transactions(
     max_amount: float | None = None,
     tx_type: str | None = None,
     limit: int = 50,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Search transactions with filters.
 
@@ -2441,6 +2663,8 @@ def search_transactions(
         max_amount: Maximum transaction amount.
         tx_type: Transaction type ("income", "outcome", "transfer").
         limit: Maximum results to return.
+        start_date: Optional explicit start date (ISO). Overrides period.
+        end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
         Dictionary with matching transactions.
@@ -2473,10 +2697,10 @@ def search_transactions(
     params: list[Any] = []
 
     # Period filter
-    if period:
-        start_date, end_date = get_period_dates(period)
+    if start_date or period:
+        sd, ed = get_period_dates(period or "this_month", start_date=start_date, end_date=end_date)
         query += " AND t.date BETWEEN ? AND ?"
-        params.extend([start_date, end_date])
+        params.extend([sd, ed])
 
     # Category filter (with children)
     if category_id:
@@ -2979,7 +3203,8 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
         "user_currency": user_code,
         "currencies": rate_list,
         "cross_rates": cross_rates,
-        "note": "Rates from ZenMoney (updated on sync). rate_to_rub = cost of 1 unit in RUB.",
+        "rate_source": "cbr",
+        "note": "Rates from ZenMoney (Central Bank of Russia, updated on sync). rate_to_rub = cost of 1 unit in RUB.",
     }
 
 
