@@ -31,45 +31,45 @@ Plus 6 resources: accounts, categories, budgets, merchants, currencies, sync sta
 ## Installation
 
 ```bash
-# Clone
-git clone https://github.com/yourusername/zenmoney-mcp.git
-cd zenmoney-mcp
+# Clone into any directory (example: ~/zenmoney-mcp)
+git clone https://github.com/nnslvp/zenmoney-mcp.git ~/zenmoney-mcp
+cd ~/zenmoney-mcp
 
 # Install with uv (recommended)
 uv venv && uv pip install -e ".[dev]"
 
 # Or with pip
-pip install -e ".[dev]"
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
 ## Setup
 
 1. Get your ZenMoney token at https://zerro.app/token
 
-2. Configure your MCP client:
+2. Configure your MCP client. Use the path where you cloned the repo; if you followed the install steps above, the binary is `~/zenmoney-mcp/.venv/bin/zenmoney-mcp`.
 
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
     "zenmoney": {
-      "command": "/path/to/zenmoney-mcp/.venv/bin/zenmoney-mcp",
+      "command": "~/zenmoney-mcp/.venv/bin/zenmoney-mcp",
       "env": {
-        "ZENMONEY_TOKEN": "your_token_here"
+        "ZENMONEY_TOKEN": "paste_token_from_step_1"
       }
     }
   }
 }
 ```
 
-**Cursor** (`.cursor/mcp.json`):
+**Cursor** (`.cursor/mcp.json` in your project, or global MCP settings):
 ```json
 {
   "mcpServers": {
     "zenmoney": {
-      "command": "/path/to/zenmoney-mcp/.venv/bin/zenmoney-mcp",
+      "command": "~/zenmoney-mcp/.venv/bin/zenmoney-mcp",
       "env": {
-        "ZENMONEY_TOKEN": "your_token_here"
+        "ZENMONEY_TOKEN": "paste_token_from_step_1"
       }
     }
   }
@@ -78,7 +78,7 @@ pip install -e ".[dev]"
 
 **Claude Code**:
 ```bash
-claude mcp add zenmoney /path/to/zenmoney-mcp/.venv/bin/zenmoney-mcp -e ZENMONEY_TOKEN=your_token_here
+claude mcp add zenmoney ~/zenmoney-mcp/.venv/bin/zenmoney-mcp -e ZENMONEY_TOKEN=paste_token_from_step_1
 ```
 
 ## How it works
