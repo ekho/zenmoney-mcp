@@ -16,6 +16,8 @@ def backup_database(
     """Copy a live SQLite database using SQLite's online backup API."""
     source_path = Path(source_path)
     destination_path = Path(destination_path)
+    if source_path.resolve() == destination_path.resolve():
+        raise ValueError("backup source and destination must differ")
     if destination_path.exists() and not force:
         raise FileExistsError("backup destination already exists")
     if destination_path.exists():

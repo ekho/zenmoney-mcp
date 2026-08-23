@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import pytest
 
+from zenmoney_mcp import sync_worker
 from zenmoney_mcp.sync_worker import parse_interval, read_secret, run_worker, sync_once
 
 
@@ -49,8 +51,80 @@ def test_parse_interval_accepts_default_zero_and_positive_values(value, expected
 
 @pytest.mark.parametrize("value", ["-1", "one", "1.5", ""])
 def test_parse_interval_rejects_negative_and_non_integer_values(value):
-    with pytest.raises(ValueError, match="ZENMONEY_SYNC_INTERVAL"):
+    with pytest.raises(ValueError, match="ZENMONEY_SYNC_INTERVAL_SECONDS"):
         parse_interval(value)
+
+
+def test_worker_main_reads_interval_seconds_environment_variable(monkeypatch):
+    observed: dict[str, int] = {}
+
+    async def worker(sync, interval, stop):
+        del sync, stop
+        observed["interval"] = interval
+
+    monkeypatch.setenv("ZENMONEY_TOKEN", "token")
+    monkeypatch.setenv("ZENMONEY_SYNC_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("ZENMONEY_SYNC_INTERVAL", "-1")
+    monkeypatch.setattr(sync_worker, "run_worker", worker)
+    monkeypatch.setattr(sys, "argv", ["zenmoney-sync-worker"])
+
+    sync_worker.main()
+
+    assert observed == {"interval": 0}
+
+
+def test_worker_main_rejects_invalid_interval_seconds_environment_variable(
+    monkeypatch, capsys
+):
+    async def worker(*args):
+        raise AssertionError("invalid configuration reached worker")
+
+    monkeypatch.setenv("ZENMONEY_TOKEN", "token")
+    monkeypatch.setenv("ZENMONEY_SYNC_INTERVAL_SECONDS", "-1")
+    monkeypatch.setattr(sys, "argv", ["zenmoney-sync-worker"])
+    monkeypatch.setattr(sync_worker, "run_worker", worker)
+
+    with pytest.raises(SystemExit) as error:
+        sync_worker.main()
+
+    assert error.value.code == 1
+    assert capsys.readouterr().err == '{"event": "sync", "status": "failed"}\n'
+
+
+@pytest.mark.parametrize("token", [None, "", "   "])
+def test_worker_main_rejects_missing_or_blank_environment_token_without_secret_output(
+    monkeypatch, capsys, token
+):
+    monkeypatch.delenv("ZENMONEY_TOKEN_FILE", raising=False)
+    if token is None:
+        monkeypatch.delenv("ZENMONEY_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("ZENMONEY_TOKEN", token)
+    monkeypatch.setattr(sys, "argv", ["zenmoney-sync-worker"])
+
+    with pytest.raises(SystemExit) as error:
+        sync_worker.main()
+
+    assert error.value.code == 1
+    assert capsys.readouterr().err == '{"event": "sync", "status": "failed"}\n'
+
+
+def test_worker_main_rejects_blank_token_file_without_environment_secret_output(
+    monkeypatch, capsys, tmp_path
+):
+    token_file = tmp_path / "token"
+    token_file.write_text(" \n")
+    monkeypatch.setenv("ZENMONEY_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("ZENMONEY_TOKEN", "sentinel-token")
+    monkeypatch.setattr(sys, "argv", ["zenmoney-sync-worker"])
+
+    with pytest.raises(SystemExit) as error:
+        sync_worker.main()
+
+    assert error.value.code == 1
+    rendered = capsys.readouterr().err
+    assert "sentinel-token" not in rendered
+    assert rendered == '{"event": "sync", "status": "failed"}\n'
 
 
 @pytest.mark.asyncio

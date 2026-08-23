@@ -44,9 +44,11 @@ def parse_interval(value: str | None) -> int:
     try:
         interval = int(value)
     except ValueError as exc:
-        raise ValueError("ZENMONEY_SYNC_INTERVAL must be a non-negative integer") from exc
+        raise ValueError(
+            "ZENMONEY_SYNC_INTERVAL_SECONDS must be a non-negative integer"
+        ) from exc
     if interval < 0:
-        raise ValueError("ZENMONEY_SYNC_INTERVAL must be a non-negative integer")
+        raise ValueError("ZENMONEY_SYNC_INTERVAL_SECONDS must be a non-negative integer")
     return interval
 
 
@@ -107,7 +109,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.parse_args()
     try:
-        interval = parse_interval(os.environ.get("ZENMONEY_SYNC_INTERVAL"))
+        interval = parse_interval(os.environ.get("ZENMONEY_SYNC_INTERVAL_SECONDS"))
+        read_secret("ZENMONEY_TOKEN")
         asyncio.run(run_worker(sync_once, interval, asyncio.Event()))
     except ValueError:
         _emit("failed")

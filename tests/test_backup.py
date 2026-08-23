@@ -42,6 +42,28 @@ def test_backup_rejects_existing_destination_without_force(tmp_path):
         backup_database(source_path, destination_path)
 
 
+def test_backup_rejects_resolved_source_as_forced_destination_without_deleting_it(
+    tmp_path,
+):
+    source_path = tmp_path / "source.db"
+    source = sqlite3.connect(source_path)
+    source.execute("CREATE TABLE records (value TEXT)")
+    source.execute("INSERT INTO records VALUES ('keep')")
+    source.commit()
+    source.close()
+    (tmp_path / "nested").mkdir()
+    equivalent_destination = tmp_path / "nested" / ".." / "source.db"
+
+    with pytest.raises(ValueError, match="must differ"):
+        backup_database(source_path, equivalent_destination, force=True)
+
+    source = sqlite3.connect(source_path)
+    try:
+        assert source.execute("SELECT value FROM records").fetchall() == [("keep",)]
+    finally:
+        source.close()
+
+
 def test_backup_replaces_existing_destination_with_force(tmp_path):
     source_path = tmp_path / "source.db"
     destination_path = tmp_path / "backup.db"
