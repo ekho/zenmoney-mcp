@@ -1,39 +1,38 @@
 """MCP Server for ZenMoney financial analytics."""
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
-from mcp.types import Resource, TextContent, Tool
+from mcp.shared.exceptions import MCPError
+from mcp_types import (
+    CallToolResult,
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    ListResourcesResult,
+    ListToolsResult,
+    ReadResourceResult,
+    Resource,
+    TextContent,
+    TextResourceContents,
+    Tool,
+    ToolAnnotations,
+)
 
+from . import __version__
+from . import analytics as legacy_analytics
 from .analytics import (
-    analyze_income,
-    analyze_merchants,
-    analyze_spending,
-    analyze_transfers,
-    analyze_trends,
-    check_budget_health,
-    convert_currency,
-    detect_anomalies,
-    detect_recurring,
-    get_account_flow,
     get_accounts_resource,
     get_categories_resource,
     get_current_budgets_resource,
-    get_debts,
-    get_exchange_rates,
     get_instruments_resource,
-    get_liquidity,
     get_merchants_resource,
-    get_net_worth,
     get_sync_status_resource,
-    get_upcoming_payments,
-    search_transactions,
     suggest_category,
 )
-from .database import Database
 from .decision import (
     build_financial_plan,
     compare_debt_strategies,
@@ -52,33 +51,70 @@ from .planning import (
     get_financial_snapshot,
     get_spending_baseline,
 )
-from .sync_engine import SyncEngine
+from .financial_correctness import (
+    analyze_income,
+    analyze_merchants,
+    analyze_spending,
+    analyze_transfers,
+    analyze_trends,
+    check_budget_health,
+    convert_currency,
+    detect_anomalies,
+    detect_recurring,
+    get_account_flow,
+    get_debts,
+    get_exchange_rates,
+    get_liquidity,
+    get_net_worth,
+    get_upcoming_payments,
+    search_transactions,
+)
+from .financial_correctness import configure_legacy_analytics
+from .hardened_database import HardenedDatabase
+from .hardened_sync import HardenedSyncEngine
 
-
-# Initialize MCP server
-server = Server("zenmoney-mcp")
 
 # Global state
-_db: Database | None = None
-_sync_engine: SyncEngine | None = None
+_db: HardenedDatabase | None = None
+_sync_engine: HardenedSyncEngine | None = None
+
+configure_legacy_analytics(legacy_analytics)
+
+REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
+LOGGER = logging.getLogger(__name__)
 
 
-def get_db() -> Database:
+def get_database_path() -> Path:
+    """Return the configured local ZenMoney database path."""
+    configured_path = os.environ.get("ZENMONEY_DB_PATH")
+    if configured_path:
+        return Path(configured_path)
+    return Path.home() / ".cache" / "zenmoney-mcp" / "zenmoney.db"
+
+
+def get_db() -> HardenedDatabase:
     """Get or create database instance."""
     global _db
     if _db is None:
-        # Default to user's cache directory
-        cache_dir = Path.home() / ".cache" / "zenmoney-mcp"
+        db_path = get_database_path()
+        cache_dir = db_path.parent
         cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_dir.chmod(0o700)
-        db_path = cache_dir / "zenmoney.db"
 
-        _db = Database(db_path)
+        _db = HardenedDatabase(db_path)
         _db.init_schema()
     return _db
 
 
-def get_sync_engine() -> SyncEngine:
+def open_remote_db() -> HardenedDatabase:
+    """Open the configured ZenMoney snapshot for remote read-only access."""
+    db_path = get_database_path()
+    if not db_path.is_file():
+        raise FileNotFoundError(f"ZenMoney database does not exist: {db_path}")
+    return HardenedDatabase(db_path, read_only=True)
+
+
+def get_sync_engine() -> HardenedSyncEngine:
     """Get or create sync engine instance."""
     global _sync_engine
     if _sync_engine is None:
@@ -88,11 +124,11 @@ def get_sync_engine() -> SyncEngine:
                 "ZENMONEY_TOKEN environment variable is required. "
                 "Get your token at https://zerro.app/token"
             )
-        _sync_engine = SyncEngine(get_db(), token)
+        _sync_engine = HardenedSyncEngine(get_db(), token)
     return _sync_engine
 
 
-def init_for_testing(db: Database, token: str = "test_token") -> None:
+def init_for_testing(db: HardenedDatabase, token: str = "test_token") -> None:
     """Initialize server with test database and token.
 
     Args:
@@ -101,7 +137,7 @@ def init_for_testing(db: Database, token: str = "test_token") -> None:
     """
     global _db, _sync_engine
     _db = db
-    _sync_engine = SyncEngine(db, token)
+    _sync_engine = HardenedSyncEngine(db, token)
 
 
 # ============================================================================
@@ -109,6 +145,9 @@ def init_for_testing(db: Database, token: str = "test_token") -> None:
 # ============================================================================
 
 _DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+_MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+_PERIOD_PATTERN = r"^(this_month|last_month|last_30_days|\d{4}-(0[1-9]|1[0-2]))$"
+_CURRENCY_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{1,11}$"
 _PERIOD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -126,6 +165,56 @@ _PERIOD_SCHEMA = {
     "required": ["start_date", "end_date"],
     "additionalProperties": False,
 }
+
+
+def harden_tool_schemas(tools: list[Tool]) -> list[Tool]:
+    """Apply the validation contract while descriptors are constructed."""
+    integer_bounds = {
+        "top_n": (1, 100),
+        "limit": (1, 200),
+        "months": (1, 60),
+        "lookback_months": (1, 60),
+        "days_ahead": (1, 366),
+        "tolerance_pct": (0, 100),
+    }
+    non_negative = {"amount", "target_amount", "min_amount", "max_amount"}
+
+    for tool in tools:
+        properties = tool.input_schema.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        if tool.name == "analyze_spending":
+            properties.pop("include_transfers", None)
+        for name, value in properties.items():
+            if not isinstance(value, dict):
+                continue
+            if name in integer_bounds:
+                minimum, maximum = integer_bounds[name]
+                value.setdefault("minimum", minimum)
+                value.setdefault("maximum", maximum)
+            if name in non_negative:
+                value["minimum"] = 0
+            if name in {"start_date", "end_date"}:
+                value["pattern"] = _DATE_PATTERN
+            elif name == "month":
+                value["pattern"] = _MONTH_PATTERN
+            elif name == "period":
+                value["pattern"] = _PERIOD_PATTERN
+            elif name == "z_threshold":
+                value["minimum"] = 1.5
+                value["maximum"] = 10
+            elif name in {"from_currency", "to_currency"}:
+                value["pattern"] = _CURRENCY_PATTERN
+                value["maxLength"] = 12
+            elif name == "currencies":
+                value["minItems"] = 1
+                value["maxItems"] = 20
+                value["uniqueItems"] = True
+                items = value.setdefault("items", {"type": "string"})
+                if isinstance(items, dict):
+                    items["pattern"] = _CURRENCY_PATTERN
+                    items["maxLength"] = 12
+    return tools
 
 
 def _planning_tools() -> list[Tool]:
@@ -532,10 +621,9 @@ def _decision_tools() -> list[Tool]:
         ),
     ]
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
+async def list_tools(remote: bool = False) -> list[Tool]:
     """List available tools."""
-    return [
+    tools = harden_tool_schemas([
         Tool(
             name="sync_data",
             description="Sync data with ZenMoney. Use to refresh data before analysis.",
@@ -935,14 +1023,28 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
-    ] + _planning_tools() + _decision_tools()
+    ] + _planning_tools() + _decision_tools())
+    if not remote:
+        return tools
+    annotations = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        openWorldHint=False,
+    )
+    return [
+        tool.model_copy(update={"annotations": annotations})
+        for tool in tools
+        if tool.name not in REMOTE_EXCLUDED_TOOLS
+    ]
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def _dispatch_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase,
+) -> list[TextContent]:
     """Handle tool calls."""
-    db = get_db()
-
     if name == "sync_data":
         engine = get_sync_engine()
         force_full = arguments.get("force_full", False)
@@ -1226,11 +1328,36 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         raise ValueError(f"Unknown tool: {name}")
 
 
+async def call_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase | None = None,
+    remote: bool = False,
+    db_path: str | Path | None = None,
+) -> list[TextContent]:
+    """Dispatch a tool with the appropriate local or remote database lifecycle."""
+    if remote and name not in {tool.name for tool in await list_tools(remote=True)}:
+        raise MCPError(INVALID_PARAMS, "Remote tool is unavailable")
+
+    owned_db = remote and db is None
+    if db is None:
+        if remote and db_path is not None:
+            db = HardenedDatabase(db_path, read_only=True)
+        else:
+            db = open_remote_db() if remote else get_db()
+
+    try:
+        return await _dispatch_tool(name, arguments, db=db)
+    finally:
+        if owned_db:
+            db.close()
+
+
 # ============================================================================
 # Resources
 # ============================================================================
 
-@server.list_resources()
 async def list_resources() -> list[Resource]:
     """List available resources."""
     return [
@@ -1279,11 +1406,10 @@ async def list_resources() -> list[Resource]:
     ]
 
 
-@server.read_resource()
-async def read_resource(uri: str) -> str:
+async def _dispatch_resource(
+    uri: str, *, db: HardenedDatabase
+) -> str:
     """Read resource content."""
-    db = get_db()
-
     if uri == "zenmoney://accounts":
         result = get_accounts_resource(db)
     elif uri == "zenmoney://categories":
@@ -1304,9 +1430,113 @@ async def read_resource(uri: str) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+async def read_resource(
+    uri: str,
+    *,
+    db: HardenedDatabase | None = None,
+    remote: bool = False,
+    db_path: str | Path | None = None,
+) -> str:
+    """Read a resource with the appropriate local or remote database lifecycle."""
+    uri = str(uri)
+    if remote and uri not in {str(resource.uri) for resource in await list_resources()}:
+        raise MCPError(INVALID_PARAMS, "Remote resource is unavailable")
+
+    owned_db = remote and db is None
+    if db is None:
+        if remote and db_path is not None:
+            db = HardenedDatabase(db_path, read_only=True)
+        else:
+            db = open_remote_db() if remote else get_db()
+
+    try:
+        return await _dispatch_resource(uri, db=db)
+    finally:
+        if owned_db:
+            db.close()
+
+
 # ============================================================================
 # Main
 # ============================================================================
+
+def create_server(
+    *, remote: bool = False, db_path: str | Path | None = None
+) -> Server:
+    """Create an MCP SDK v2 server backed by the shared registry."""
+
+    async def _on_list_tools(context, params):
+        return ListToolsResult(tools=await list_tools(remote=remote))
+
+    async def _on_call_tool(context, params):
+        try:
+            content = await call_tool(
+                params.name,
+                dict(params.arguments or {}),
+                remote=remote,
+                db_path=db_path,
+            )
+        except MCPError:
+            raise
+        except Exception as exc:
+            if not remote:
+                raise
+            LOGGER.warning(
+                json.dumps(
+                    {
+                        "event": "remote_tool_call",
+                        "tool": params.name,
+                        "status": "failed",
+                        "exception_class": type(exc).__name__,
+                    }
+                )
+            )
+            raise MCPError(INTERNAL_ERROR, "Remote tool failed") from None
+        return CallToolResult(content=content)
+
+    async def _on_list_resources(context, params):
+        return ListResourcesResult(resources=await list_resources())
+
+    async def _on_read_resource(context, params):
+        try:
+            text = await read_resource(
+                params.uri,
+                remote=remote,
+                db_path=db_path,
+            )
+        except MCPError:
+            raise
+        except Exception as exc:
+            if not remote:
+                raise
+            LOGGER.warning(
+                json.dumps(
+                    {
+                        "event": "remote_resource_read",
+                        "status": "failed",
+                        "exception_class": type(exc).__name__,
+                    }
+                )
+            )
+            raise MCPError(INTERNAL_ERROR, "Remote resource failed") from None
+        return ReadResourceResult(
+            contents=[
+                TextResourceContents(
+                    uri=params.uri,
+                    mime_type="application/json",
+                    text=text,
+                )
+            ]
+        )
+
+    return Server(
+        name="zenmoney-mcp",
+        version=__version__,
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+        on_list_resources=_on_list_resources,
+        on_read_resource=_on_read_resource,
+    )
 
 def main() -> None:
     """Run the MCP server."""
@@ -1316,6 +1546,7 @@ def main() -> None:
 
     async def run():
         async with stdio_server() as (read_stream, write_stream):
+            server = create_server()
             await server.run(read_stream, write_stream, server.create_initialization_options())
 
     asyncio.run(run())

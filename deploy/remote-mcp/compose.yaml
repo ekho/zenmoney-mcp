@@ -1,0 +1,72 @@
+x-app: &app
+  image: ${ZENMONEY_IMAGE:-zenmoney-mcp:remote-test}
+  user: "10001:10001"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+
+services:
+  zenmoney-mcp:
+    <<: *app
+    command: [zenmoney-mcp-http]
+    environment:
+      ZENMONEY_DB_PATH: /data/zenmoney.db
+      ZENMONEY_HTTP_HOST: 0.0.0.0
+      ZENMONEY_HTTP_PORT: "8000"
+    expose: ["8000"]
+    volumes:
+      - zenmoney-data:/data:ro
+    networks: [mcp_internal]
+
+  zenmoney-sync:
+    <<: *app
+    command: [zenmoney-sync-worker]
+    environment:
+      ZENMONEY_DB_PATH: /data/zenmoney.db
+      ZENMONEY_SYNC_INTERVAL_SECONDS: ${ZENMONEY_SYNC_INTERVAL_SECONDS:-900}
+      ZENMONEY_TOKEN_FILE: /run/secrets/zenmoney-token
+    secrets: [zenmoney-token]
+    volumes:
+      - zenmoney-data:/data
+    networks: [egress]
+    stop_grace_period: 70s
+    healthcheck:
+      disable: true
+
+  tunnel-client:
+    image: ghcr.io/openai/tunnel-client:v0.0.12@sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e
+    command:
+      - --control-plane.tunnel-id=${CONTROL_PLANE_TUNNEL_ID:-tunnel_0123456789abcdef0123456789abcdef}
+      - --control-plane.api-key=file:/run/secrets/control-plane-api-key
+      - --mcp.server-url=http://zenmoney-mcp:8000/mcp
+      - --health.listen-addr=:8080
+      - --log.level=info
+      - --log.format=json
+    secrets: [control-plane-api-key]
+    networks: [mcp_internal, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, /usr/bin/tunnel-client, health, --port, "8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  mcp_internal:
+    internal: true
+  egress: {}
+
+volumes:
+  zenmoney-data: {}
+
+secrets:
+  zenmoney-token:
+    file: ./secrets/zenmoney-token
+  control-plane-api-key:
+    file: ./secrets/control-plane-api-key

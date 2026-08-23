@@ -1,0 +1,11 @@
+.git
+.github
+.superpowers
+.venv
+.pytest_cache
+deploy
+docs
+tests
+*.db
+*.py[cod]
+__pycache__

@@ -85,10 +85,25 @@ unless explicitly enabled, and credit capacity is always excluded.
 See [`docs/planning-semantics.md`](docs/planning-semantics.md) for the priority
 policy, formulas, rounding, data-quality labels, and limitations.
 
+## Runtime modes
+
+The installed `zenmoney-mcp` command is the local stdio server for Codex,
+ChatGPT Desktop, Claude Desktop, and Cursor. It uses the shared SDK v2
+registry and hardened runtime directly; it does not preserve an upstream
+server through a runtime overlay.
+
+For a private remote deployment, `zenmoney-mcp-http` exposes Streamable HTTP
+at `/mcp` only inside Docker, and the OpenAI Secure MCP Tunnel client connects
+outbound to OpenAI. The remote registry is read-only and excludes
+`sync_data` and `suggest_category`; all remaining available tools are bounded
+financial analytics over the cache. See the [remote operations runbook](deploy/remote-mcp/README.md)
+and [threat model](docs/remote-mcp-threat-model.md).
+
 ## Hardening in this fork
 
-The installed `zenmoney-mcp` command runs `zenmoney_mcp.entrypoint`, which keeps
-the upstream server intact and installs a small runtime overlay:
+The installed `zenmoney-mcp` command runs `zenmoney_mcp.entrypoint` against a
+shared SDK v2 registry with hardened database, synchronization, and analytics
+implementations:
 
 - `HardenedDatabase` adds idempotent migrations and strict FX handling;
 - `HardenedSyncEngine` validates responses and atomically replaces the live cache;
@@ -143,9 +158,9 @@ env_vars = ["ZENMONEY_TOKEN"]
 tool_timeout_sec = 120
 ```
 
-Restart the desktop client after changing MCP configuration. This repository is
-a local stdio server; ChatGPT web needs a supported remote-MCP or secure-tunnel
-setup instead of a local executable.
+Restart the desktop client after changing MCP configuration. For ChatGPT web,
+use the private remote Streamable HTTP + Secure MCP Tunnel deployment in the
+[operations runbook](deploy/remote-mcp/README.md), not a local executable.
 
 ## Claude Desktop or Cursor
 

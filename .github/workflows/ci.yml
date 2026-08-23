@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,3 +27,64 @@ jobs:
         run: python -m compileall -q src tests
       - name: Test
         run: python -m pytest tests/ -v --ignore=tests/test_integration.py
+
+  docker-compose:
+    runs-on: ubuntu-latest
+    env:
+      CONTROL_PLANE_TUNNEL_ID: tunnel_0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build image
+        run: docker build -t zenmoney-mcp:remote-test .
+      - name: Prepare synthetic ZenMoney secret
+        run: |
+          set -e
+          umask 077
+          temporary_secret="$(mktemp)"
+          trap 'rm -f "$temporary_secret"' EXIT
+          printf '%s' 'ci-synthetic-token' > "$temporary_secret"
+          sudo install -o 10001 -g 10001 -m 0400 "$temporary_secret" \
+            deploy/remote-mcp/secrets/zenmoney-token
+      - name: Validate Compose
+        run: docker compose -f deploy/remote-mcp/compose.yaml config -q
+      - name: Test static deployment contract
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pytest tests/test_remote_deployment.py -q
+      - name: Smoke final read-only MCP service and sync secret
+        run: |
+          set -e
+          compose=(docker compose -f deploy/remote-mcp/compose.yaml)
+          cleanup() { "${compose[@]}" down -v --remove-orphans; }
+          trap cleanup EXIT
+          "${compose[@]}" run --rm --no-deps --entrypoint python zenmoney-sync -c "import os; from pathlib import Path; from zenmoney_mcp.hardened_database import HardenedDatabase; from zenmoney_mcp.sync_worker import read_secret; assert os.getuid() == 10001; secret=Path('/run/secrets/zenmoney-token'); stat=secret.stat(); assert (stat.st_uid, stat.st_gid, stat.st_mode & 0o777) == (10001, 10001, 0o400); assert read_secret('ZENMONEY_TOKEN'); db=HardenedDatabase('/data/zenmoney.db', journal_mode='DELETE'); db.init_schema(); db.close()"
+          "${compose[@]}" up -d --no-deps zenmoney-mcp
+          for attempt in {1..20}; do
+            if "${compose[@]}" exec -T zenmoney-mcp python -c "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:8000/readyz', timeout=2).status == 200"; then
+              break
+            fi
+            if [ "$attempt" = 20 ]; then
+              "${compose[@]}" logs zenmoney-mcp
+              exit 1
+            fi
+            sleep 1
+          done
+          container_id="$("${compose[@]}" ps -q zenmoney-mcp)"
+          docker inspect "$container_id" | python -c 'import json,sys; container=json.load(sys.stdin)[0]; mount=next(item for item in container["Mounts"] if item["Destination"] == "/data"); assert mount["RW"] is False'
+
+  remote-mcp-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Exercise local Streamable HTTP MCP
+        run: python -m pytest tests/test_remote_http.py -q

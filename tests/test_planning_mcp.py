@@ -40,7 +40,7 @@ def planning_mcp_db():
 
 @pytest.mark.asyncio
 async def test_planning_tool_discovery_has_strict_schemas():
-    tools = {tool.name: tool.inputSchema for tool in await server.list_tools()}
+    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
 
     assert {
         "get_financial_snapshot",

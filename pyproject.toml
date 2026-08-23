@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "mcp>=1.0.0,<2",
+    "mcp>=2.0.0,<3",
     "httpx>=0.27.0",
 ]
 
@@ -22,6 +22,10 @@ dev = [
 
 [project.scripts]
 zenmoney-mcp = "zenmoney_mcp.entrypoint:main"
+zenmoney-mcp-http = "zenmoney_mcp.http_server:main"
+zenmoney-sync-once = "zenmoney_mcp.sync_worker:sync_once_main"
+zenmoney-sync-worker = "zenmoney_mcp.sync_worker:main"
+zenmoney-db-backup = "zenmoney_mcp.backup:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zenmoney_mcp"]

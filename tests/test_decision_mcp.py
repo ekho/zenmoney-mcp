@@ -18,7 +18,7 @@ def decision_mcp_db(decision_db):
 
 @pytest.mark.asyncio
 async def test_decision_tool_discovery_has_strict_bounded_schemas():
-    tools = {tool.name: tool.inputSchema for tool in await server.list_tools()}
+    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
 
     names = {
         "plan_emergency_fund",
