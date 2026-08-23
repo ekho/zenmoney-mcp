@@ -22,9 +22,26 @@ write tools, and adds financially conservative calculations and atomic sync.
 | Find matching transactions | `search_transactions` |
 | What happened on this account? | `get_account_flow` |
 | Convert currencies | `convert_currency`, `get_exchange_rates` |
+| Overall financial position | `get_financial_snapshot` |
+| Monthly cash flow | `get_cash_flow` |
+| Normal spending level | `get_spending_baseline` |
+| Compare periods | `compare_periods` |
+| Emergency fund coverage | `get_emergency_fund_status` |
+| Debt burden | `get_debt_service` |
+| 30/60/90 day forecast | `forecast_cash_flow` |
 
 The server also exposes resources for accounts, categories, budgets, merchants,
-currencies, and synchronization status.
+currencies, synchronization status, and a cache-only financial snapshot at
+`zenmoney://financial-snapshot`. Reading a resource never starts synchronization.
+
+Planning analytics are deliberately conservative:
+
+- emergency-fund coverage requires explicit essential category IDs or a monthly
+  essential-spending override;
+- debt service reports observed balances and payments but does not infer APR,
+  minimum payments, or amortization schedules;
+- recurring-payment detection is a historical heuristic and is labeled as such;
+- cash-flow forecasts are transparent scenarios, not prediction guarantees.
 
 ## Hardening in this fork
 

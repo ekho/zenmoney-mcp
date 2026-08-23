@@ -61,7 +61,9 @@ def harden_tool_schemas(tools):
             if not isinstance(value, dict):
                 continue
             if name in integer_bounds:
-                value["minimum"], value["maximum"] = integer_bounds[name]
+                minimum, maximum = integer_bounds[name]
+                value.setdefault("minimum", minimum)
+                value.setdefault("maximum", maximum)
             if name in non_negative:
                 value["minimum"] = 0
             if name in {"start_date", "end_date"}:

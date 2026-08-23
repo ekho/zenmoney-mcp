@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from typing import Any, Iterable
 
 from .hardened_database import CurrencyRateError, HardenedDatabase
+from .money import FinancialDataError
 from .validation import (
     InputValidationError,
     bounded_int,
@@ -19,10 +20,6 @@ from .validation import (
 )
 
 _TOTAL_BUDGET_TAG = "00000000-0000-0000-0000-000000000000"
-
-
-class FinancialDataError(ValueError):
-    """Raised when synced data cannot support a trustworthy calculation."""
 
 
 def _user_currency(db: HardenedDatabase) -> tuple[int, str, str, float]:

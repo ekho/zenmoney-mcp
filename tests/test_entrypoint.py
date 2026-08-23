@@ -99,6 +99,28 @@ def test_tool_discovery_advertises_runtime_bounds_and_removes_dead_flag():
     assert conversion["to_currency"]["maxLength"] == 12
 
 
+def test_tool_discovery_preserves_stricter_planning_bounds():
+    from zenmoney_mcp.entrypoint import harden_tool_schemas
+
+    tool = SimpleNamespace(
+        name="get_spending_baseline",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "months": {"type": "integer", "minimum": 3, "maximum": 24}
+            },
+        },
+    )
+
+    result = harden_tool_schemas([tool])
+
+    assert result[0].inputSchema["properties"]["months"] == {
+        "type": "integer",
+        "minimum": 3,
+        "maximum": 24,
+    }
+
+
 @pytest.mark.asyncio
 async def test_install_hardening_reregisters_list_tools_handler():
     class McpServer:
