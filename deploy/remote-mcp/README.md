@@ -74,15 +74,26 @@ docker compose --env-file deploy/remote-mcp/.env \
   zenmoney-mcp zenmoney-sync tunnel-client
 ```
 
-**Manual, not run:** after the client is running, diagnose a named client
-profile with the documented command:
+**Manual, not run:** the pinned `v0.0.12` client accepts the Compose
+direct-config flags for `doctor`. Load the non-secret tunnel ID from `.env` and
+run it in the already-running client, whose Compose secret mount supplies the
+runtime key:
 
 ```bash
-tunnel-client doctor --profile <profile> --explain
+set -a
+. deploy/remote-mcp/.env
+set +a
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml exec tunnel-client \
+  /usr/bin/tunnel-client doctor --explain \
+  --control-plane.tunnel-id="$CONTROL_PLANE_TUNNEL_ID" \
+  --control-plane.api-key=file:/run/secrets/control-plane-api-key \
+  --mcp.server-url=http://zenmoney-mcp:8000/mcp \
+  --health.listen-addr=:8080 \
+  --log.level=info \
+  --log.format=json
 ```
 
-Compose supplies direct flags rather than a named profile, so first inspect
-`tunnel-client doctor --help` in the pinned image before adapting this command.
 A doctor result is not part of CI and requires the real runtime key and tunnel
 ID.
 
@@ -105,27 +116,39 @@ docker compose --env-file deploy/remote-mcp/.env \
 ```
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
-database. This places the backup on the named data volume:
+database. Keep backups outside the Compose project and restrict the host
+directory before mounting it into the backup command:
 
 ```bash
+BACKUP_DIR=/absolute/path/to/zenmoney-backups
+BACKUP_NAME="zenmoney-$(date +%Y%m%d-%H%M%S).db"
+install -d -m 700 "$BACKUP_DIR"
 docker compose --env-file deploy/remote-mcp/.env \
-  -f deploy/remote-mcp/compose.yaml exec zenmoney-sync \
-  zenmoney-db-backup /data/backup-$(date +%Y%m%d-%H%M%S).db \
+  -f deploy/remote-mcp/compose.yaml run --rm --no-deps \
+  --volume "$BACKUP_DIR:/backup:rw" \
+  --entrypoint zenmoney-db-backup zenmoney-sync \
+  "/backup/$BACKUP_NAME" \
   --source /data/zenmoney.db
 ```
 
-Restore is offline. Stop all roles, validate the selected backup with
-`PRAGMA quick_check`, replace the database, set its mode to `0600`, and start
-again. Replace `BACKUP` with the backup path on `/data`.
+Restore is offline. Set `BACKUP` to the absolute path created above, stop all
+roles, then bind the backup read-only. The command stages a copy on the named
+volume; it validates `PRAGMA quick_check` and the required `sync_meta` schema
+before deleting only stale target sidecars and atomically replacing the target.
+It never copies directly over a live database.
 
 ```bash
+BACKUP=/absolute/path/to/zenmoney-backups/zenmoney-YYYYmmdd-HHMMSS.db
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml down
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml run --rm --no-deps --entrypoint python \
-  zenmoney-sync -c "import os, shutil, sqlite3; backup='BACKUP'; conn=sqlite3.connect(f'file:{backup}?mode=ro', uri=True); assert conn.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; conn.close(); shutil.copyfile(backup, '/data/zenmoney.db'); os.chmod('/data/zenmoney.db', 0o600)"
+  --volume "$BACKUP:/restore/backup.db:ro" zenmoney-sync -c "import os, shutil, sqlite3; backup='/restore/backup.db'; stage='/data/zenmoney.restore-staging.db'; target='/data/zenmoney.db'; os.path.exists(stage) and os.unlink(stage); shutil.copyfile(backup, stage); os.chmod(stage, 0o600); conn=sqlite3.connect(f'file:{stage}?mode=ro', uri=True); assert conn.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; assert conn.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'\").fetchone(); conn.close(); [os.unlink(target + suffix) for suffix in ('-wal', '-shm') if os.path.exists(target + suffix)]; os.replace(stage, target); os.chmod(target, 0o600)"
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml up -d
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml exec zenmoney-mcp \
+  python -c "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:8000/readyz').read().decode())"
 ```
 
 `docker compose down` removes containers and networks but preserves the named

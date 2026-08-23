@@ -12,12 +12,19 @@ public MCP endpoint and does not add an OAuth provider.
 | SQLite financial cache | Named volume; writable only by the sync worker and mounted read-only by the MCP server. |
 | MCP outputs | Remote registry is read-only, bounded, and excludes sync/API-dependent tools. |
 
-The seven trust boundaries are ZenMoney API → sync worker → SQLite volume →
-MCP server → tunnel-client → OpenAI tunnel service → ChatGPT. ZenMoney and
-OpenAI are external HTTPS services; every transition after the volume has a
-distinct runtime role. The Compose `mcp_internal` network keeps the MCP server
-off the host network, while `egress` carries outbound traffic. Network
-separation is not a destination allowlist.
+The seven trust-boundary crossings are:
+
+1. operator secret provisioning → runtime roles;
+2. ZenMoney API ↔ sync worker;
+3. sync worker → SQLite RW volume;
+4. SQLite RO volume → MCP server;
+5. MCP server → tunnel-client over `mcp_internal`;
+6. tunnel-client → OpenAI tunnel service over outbound HTTPS;
+7. OpenAI tunnel service → authorized ChatGPT workspace/account.
+
+The Compose `mcp_internal` network keeps the MCP server off the host network,
+while `egress` carries outbound traffic. Network separation is not a
+destination allowlist.
 
 ## Threats and mitigations
 
