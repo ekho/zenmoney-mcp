@@ -34,6 +34,15 @@ from .analytics import (
     suggest_category,
 )
 from .database import Database
+from .planning import (
+    compare_periods,
+    forecast_cash_flow,
+    get_cash_flow,
+    get_debt_service,
+    get_emergency_fund_status,
+    get_financial_snapshot,
+    get_spending_baseline,
+)
 from .sync_engine import SyncEngine
 
 
@@ -89,6 +98,165 @@ def init_for_testing(db: Database, token: str = "test_token") -> None:
 # ============================================================================
 # Tools
 # ============================================================================
+
+_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+_PERIOD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "start_date": {
+            "type": "string",
+            "pattern": _DATE_PATTERN,
+            "description": "Inclusive period start in YYYY-MM-DD format",
+        },
+        "end_date": {
+            "type": "string",
+            "pattern": _DATE_PATTERN,
+            "description": "Inclusive period end in YYYY-MM-DD format",
+        },
+    },
+    "required": ["start_date", "end_date"],
+    "additionalProperties": False,
+}
+
+
+def _planning_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="get_financial_snapshot",
+            description="Get a compact read-only snapshot of current financial position and recent cash flow.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="get_cash_flow",
+            description="Get normalized household income, spending, and net cash flow with transfers and holds excluded.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "enum": [
+                            "current_period",
+                            "last_complete_month",
+                            "last_30_days",
+                            "trailing_3_complete_months",
+                            "trailing_6_complete_months",
+                            "trailing_12_complete_months",
+                        ],
+                        "default": "current_period",
+                        "description": "Period preset; start_date and end_date select a custom range",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "pattern": _DATE_PATTERN,
+                        "description": "Custom inclusive start date; requires end_date",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "pattern": _DATE_PATTERN,
+                        "description": "Custom inclusive end date; requires start_date",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_spending_baseline",
+            description="Get completed-month spending statistics with median as the normal-spending baseline.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "months": {
+                        "type": "integer",
+                        "minimum": 3,
+                        "maximum": 24,
+                        "default": 6,
+                        "description": "Number of completed budget months",
+                    },
+                    "category_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional category ID; descendants are included",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="compare_periods",
+            description="Compare income, spending, net cash flow, and category spending between two periods.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "enum": [
+                            "last_month_vs_previous",
+                            "last_quarter_vs_previous",
+                            "last_complete_month_vs_year_ago",
+                        ],
+                        "default": "last_month_vs_previous",
+                        "description": "Comparison preset used unless period_a and period_b are supplied",
+                    },
+                    "period_a": {**_PERIOD_SCHEMA, "description": "Earlier custom period"},
+                    "period_b": {**_PERIOD_SCHEMA, "description": "Later custom period"},
+                },
+            },
+        ),
+        Tool(
+            name="get_emergency_fund_status",
+            description="Measure reserve coverage using explicit essential categories or a monthly override.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "essential_category_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Explicit essential category IDs; descendants are included",
+                    },
+                    "monthly_essential_override": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Explicit monthly essential-spending amount",
+                    },
+                    "baseline_months": {
+                        "type": "integer",
+                        "minimum": 3,
+                        "maximum": 24,
+                        "default": 6,
+                        "description": "Completed months used for category baseline",
+                    },
+                    "target_months": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "default": 6,
+                        "description": "Target reserve coverage in months",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_debt_service",
+            description="Get actual debt balances, transfer-based payments, and debt-service ratio without APR assumptions.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="forecast_cash_flow",
+            description="Get transparent 30/60/90-day scheduled, recurring, and baseline cash-flow scenarios.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "horizon_days": {
+                        "type": "integer",
+                        "enum": [30, 60, 90],
+                        "default": 90,
+                        "description": "Scenario horizon in days",
+                    }
+                },
+            },
+        ),
+    ]
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
@@ -493,7 +661,7 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
-    ]
+    ] + _planning_tools()
 
 
 @server.call_tool()
@@ -659,6 +827,56 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
+    elif name == "get_financial_snapshot":
+        result = get_financial_snapshot(db)
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_cash_flow":
+        result = get_cash_flow(
+            db,
+            period=arguments.get("period", "current_period"),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_spending_baseline":
+        result = get_spending_baseline(
+            db,
+            months=arguments.get("months", 6),
+            category_id=arguments.get("category_id"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "compare_periods":
+        result = compare_periods(
+            db,
+            preset=arguments.get("preset", "last_month_vs_previous"),
+            period_a=arguments.get("period_a"),
+            period_b=arguments.get("period_b"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_emergency_fund_status":
+        result = get_emergency_fund_status(
+            db,
+            essential_category_ids=arguments.get("essential_category_ids"),
+            monthly_essential_override=arguments.get("monthly_essential_override"),
+            baseline_months=arguments.get("baseline_months", 6),
+            target_months=arguments.get("target_months", 6),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_debt_service":
+        result = get_debt_service(db)
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "forecast_cash_flow":
+        result = forecast_cash_flow(
+            db, horizon_days=arguments.get("horizon_days", 90)
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -707,6 +925,12 @@ async def list_resources() -> list[Resource]:
             description="Sync state and cache statistics",
             mimeType="application/json",
         ),
+        Resource(
+            uri="zenmoney://financial-snapshot",
+            name="Financial Snapshot",
+            description="Current financial snapshot from the synchronized local cache",
+            mimeType="application/json",
+        ),
     ]
 
 
@@ -727,6 +951,8 @@ async def read_resource(uri: str) -> str:
         result = get_instruments_resource(db)
     elif uri == "zenmoney://sync-status":
         result = get_sync_status_resource(db)
+    elif uri == "zenmoney://financial-snapshot":
+        result = get_financial_snapshot(db)
     else:
         raise ValueError(f"Unknown resource: {uri}")
 

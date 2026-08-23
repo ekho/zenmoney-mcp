@@ -74,7 +74,7 @@ The last rule treats scheduled outcomes as already represented in the historical
 
 ## Data quality
 
-Every derived tool returns last sync time, staleness, completed months available, missing exchange rates, and warnings. Completed months available counts completed budget periods containing at least one eligible transaction. No composite score is introduced.
+Every derived tool returns last sync time, staleness, completed months available, missing exchange rates, and warnings. Completed months available counts completed budget periods containing at least one eligible transaction through a whole-history SQL aggregate that returns one row; it does not materialize transactions or dates. No composite score is introduced.
 
 ## Resource
 
