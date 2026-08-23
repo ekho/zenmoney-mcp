@@ -142,6 +142,9 @@ async def test_sync_once_uses_file_secret_and_creates_the_configured_cache_paren
         def __init__(self, database, token):
             assert token == "file-token"
             assert database.db_path == str(database_path)
+            assert database.connect().execute(
+                "PRAGMA journal_mode"
+            ).fetchone()[0] == "delete"
 
         async def sync(self):
             return {"status": "synced"}

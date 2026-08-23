@@ -25,16 +25,22 @@ allowlists.
 
 ## Configure and start
 
-Run from the repository root. `.env` contains identifiers only; secret values
-live in ignored files and must never be committed.
+Run from the repository root. `.env` contains identifiers only and must never
+contain the ZenMoney token. Export that token from a password manager or other
+operator-controlled source before every Compose command; Compose materializes
+it as a UID/GID `10001`, mode-`0400` secret only for `zenmoney-sync`. The OpenAI
+runtime key remains an ignored file because the official tunnel container owns
+that mount separately.
 
 ```bash
 cp deploy/remote-mcp/.env.example deploy/remote-mcp/.env
 mkdir -p deploy/remote-mcp/secrets
-printf '%s' "$ZENMONEY_TOKEN" > deploy/remote-mcp/secrets/zenmoney-token
 printf '%s' "$CONTROL_PLANE_API_KEY" > deploy/remote-mcp/secrets/control-plane-api-key
-chmod 600 deploy/remote-mcp/secrets/zenmoney-token \
-  deploy/remote-mcp/secrets/control-plane-api-key
+chmod 600 deploy/remote-mcp/secrets/control-plane-api-key
+printf 'ZenMoney token: '
+read -r -s ZENMONEY_TOKEN
+printf '\n'
+export ZENMONEY_TOKEN
 ```
 
 Set `CONTROL_PLANE_TUNNEL_ID` in `deploy/remote-mcp/.env` to the value from
@@ -51,6 +57,21 @@ docker compose --env-file deploy/remote-mcp/.env \
 The pinned images are `python:3.12.14-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134`,
 `ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1`,
 and `ghcr.io/openai/tunnel-client:v0.0.12@sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e`.
+
+To review or update the tunnel-client pin, compare the configured tag with the
+[official releases](https://github.com/openai/tunnel-client/releases), read the
+candidate release notes, then resolve its multi-architecture index digest:
+
+```bash
+TUNNEL_TAG=v0.0.12
+docker buildx imagetools inspect "ghcr.io/openai/tunnel-client:$TUNNEL_TAG"
+```
+
+Copy the top-level `Digest: sha256:...` value—not a platform child digest—into
+the tag-plus-digest image reference in `compose.yaml` and `TUNNEL_IMAGE` in the
+deployment test. Verify the update with `docker pull` of that exact reference,
+`docker compose ... config -q`, the deployment tests, and the runtime smoke
+before rollout.
 
 ## Verify
 
@@ -116,7 +137,8 @@ docker compose --env-file deploy/remote-mcp/.env \
 ```
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
-database. Keep backups outside the Compose project. This uses the already
+database. Backups contain sensitive financial data: keep them encrypted at
+rest, access-controlled, and outside the Compose project. This uses the already
 running `zenmoney-sync` container, then copies the completed temporary volume
 file to a host-owned temporary file before atomically publishing it:
 
@@ -148,8 +170,10 @@ cleanup
 
 Restore is offline. Set `BACKUP` to the absolute path created above, stop all
 roles, then bind the backup read-only. The command stages a copy on the named
-volume; it validates `PRAGMA quick_check` and the required `sync_meta` schema
-before deleting only stale target sidecars and atomically replacing the target.
+volume. It first normalizes the staged file to the `DELETE` rollback journal.
+The shared snapshot validator then checks `PRAGMA quick_check`, every synced
+entity table, the exact `sync_meta` schema, and its supported `schema_version`
+before the command atomically replaces the target and removes stale sidecars.
 It never copies directly over a live database.
 
 ```bash
@@ -159,7 +183,7 @@ docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml down
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml run --rm --no-deps --entrypoint python \
-  --volume "$BACKUP:/restore/backup.db:ro" zenmoney-sync -c "import os, shutil, sqlite3; backup='/restore/backup.db'; stage='/data/zenmoney.restore-staging.db'; target='/data/zenmoney.db'; os.path.exists(stage) and os.unlink(stage); shutil.copyfile(backup, stage); os.chmod(stage, 0o600); conn=sqlite3.connect(f'file:{stage}?mode=ro', uri=True); assert conn.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; assert conn.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'\").fetchone(); conn.close(); os.replace(stage, target); os.chmod(target, 0o600); [os.unlink(target + suffix) for suffix in ('-wal', '-shm') if os.path.exists(target + suffix)]"
+  --volume "$BACKUP:/restore/backup.db:ro" zenmoney-sync -c "import os, shutil; from zenmoney_mcp.hardened_database import HardenedDatabase, validate_snapshot; backup='/restore/backup.db'; stage='/data/zenmoney.restore-staging.db'; target='/data/zenmoney.db'; os.path.exists(stage) and os.unlink(stage); shutil.copyfile(backup, stage); os.chmod(stage, 0o600); writer=HardenedDatabase(stage, journal_mode='DELETE'); writer.connect(); writer.close(); db=HardenedDatabase(stage, read_only=True); assert validate_snapshot(db.connect()); db.close(); os.replace(stage, target); os.chmod(target, 0o600); [os.unlink(target + suffix) for suffix in ('-wal', '-shm') if os.path.exists(target + suffix)]"
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml up -d
 docker compose --env-file deploy/remote-mcp/.env \

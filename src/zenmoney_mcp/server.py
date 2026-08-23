@@ -1,6 +1,7 @@
 """MCP Server for ZenMoney financial analytics."""
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 from mcp_types import (
     CallToolResult,
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     ListResourcesResult,
     ListToolsResult,
@@ -79,6 +81,7 @@ _sync_engine: HardenedSyncEngine | None = None
 configure_legacy_analytics(legacy_analytics)
 
 REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
+LOGGER = logging.getLogger(__name__)
 
 
 def get_database_path() -> Path:
@@ -1466,12 +1469,27 @@ def create_server(
         return ListToolsResult(tools=await list_tools(remote=remote))
 
     async def _on_call_tool(context, params):
-        content = await call_tool(
-            params.name,
-            dict(params.arguments or {}),
-            remote=remote,
-            db_path=db_path,
-        )
+        try:
+            content = await call_tool(
+                params.name,
+                dict(params.arguments or {}),
+                remote=remote,
+                db_path=db_path,
+            )
+        except Exception as exc:
+            if not remote:
+                raise
+            LOGGER.warning(
+                json.dumps(
+                    {
+                        "event": "remote_tool_call",
+                        "tool": params.name,
+                        "status": "failed",
+                        "exception_class": type(exc).__name__,
+                    }
+                )
+            )
+            raise MCPError(INTERNAL_ERROR, "Remote tool failed") from None
         return CallToolResult(content=content)
 
     async def _on_list_resources(context, params):

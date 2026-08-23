@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from pathlib import Path
 
-from .hardened_database import HardenedDatabase
+from .hardened_database import HardenedDatabase, validate_snapshot
 from .server import get_database_path
 
 
@@ -20,18 +22,40 @@ def backup_database(
         raise ValueError("backup source and destination must differ")
     if destination_path.exists() and not force:
         raise FileExistsError("backup destination already exists")
-    if destination_path.exists():
-        destination_path.unlink()
 
     source = HardenedDatabase(source_path, read_only=True)
-    destination = HardenedDatabase(destination_path)
+    destination: HardenedDatabase | None = None
+    temporary_path: Path | None = None
     try:
-        source.connect().backup(destination.connect())
-        destination.connect().commit()
-    finally:
+        if not validate_snapshot(source.connect()):
+            raise ValueError("source is not a valid ZenMoney snapshot")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination_path.parent,
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        destination = HardenedDatabase(temporary_path, journal_mode="DELETE")
+        destination_conn = destination.connect()
+        source.connect().backup(destination_conn)
+        destination_conn.execute("PRAGMA journal_mode=DELETE")
+        destination_conn.commit()
         destination.close()
+        validation = HardenedDatabase(temporary_path, read_only=True)
+        try:
+            if not validate_snapshot(validation.connect()):
+                raise ValueError("backup is not a valid ZenMoney snapshot")
+        finally:
+            validation.close()
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, destination_path)
+    finally:
+        if destination is not None:
+            destination.close()
         source.close()
-    destination_path.chmod(0o600)
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     return destination_path
 
 

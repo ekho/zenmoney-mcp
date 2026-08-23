@@ -10,6 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 COMPOSE_FILE = ROOT / "deploy" / "remote-mcp" / "compose.yaml"
+ENV_EXAMPLE = ROOT / "deploy" / "remote-mcp" / ".env.example"
+RUNBOOK = ROOT / "deploy" / "remote-mcp" / "README.md"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TUNNEL_IMAGE = (
     "ghcr.io/openai/tunnel-client:v0.0.12@"
     "sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e"
@@ -25,6 +28,7 @@ def _compose_config() -> dict:
         env={
             **os.environ,
             "CONTROL_PLANE_TUNNEL_ID": "tunnel_0123456789abcdef0123456789abcdef",
+            "ZENMONEY_TOKEN": "synthetic-static-test-token",
         },
         text=True,
     )
@@ -55,9 +59,17 @@ def test_compose_keeps_mcp_private_and_separates_credentials():
     assert "CONTROL_PLANE_API_KEY" not in sync_environment
     assert sync_environment["ZENMONEY_TOKEN_FILE"] == "/run/secrets/zenmoney-token"
 
-    assert {secret["source"] for secret in services["zenmoney-sync"]["secrets"]} == {
-        "zenmoney-token"
-    }
+    sync_secret = services["zenmoney-sync"]["secrets"]
+    assert sync_secret == [
+        {
+            "source": "zenmoney-token",
+            "target": "zenmoney-token",
+            "uid": "10001",
+            "gid": "10001",
+            "mode": "0400",
+        }
+    ]
+    assert config["secrets"]["zenmoney-token"]["environment"] == "ZENMONEY_TOKEN"
     assert {
         secret["source"] for secret in services["tunnel-client"]["secrets"]
     } == {"control-plane-api-key"}
@@ -87,3 +99,21 @@ def test_compose_uses_pinned_tunnel_contract_and_hardened_roles():
 
     assert services["zenmoney-mcp"]["user"] == "10001:10001"
     assert services["zenmoney-sync"]["user"] == "10001:10001"
+    assert services["zenmoney-sync"]["stop_grace_period"] in {"1m10s", "70s"}
+
+
+def test_operations_and_ci_cover_sensitive_backups_pin_updates_and_runtime_smoke():
+    env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "ZENMONEY_TOKEN=replace-with-your-token" in env_example
+    assert "sensitive financial data" in runbook
+    assert "docker buildx imagetools inspect" in runbook
+    assert "github.com/openai/tunnel-client/releases" in runbook
+    assert "validate_snapshot" in runbook
+    assert "HardenedDatabase(stage, journal_mode='DELETE')" in runbook
+    assert "os.getuid() == 10001" in workflow
+    assert "read_secret('ZENMONEY_TOKEN')" in workflow
+    assert "docker compose" in workflow and "up -d --no-deps zenmoney-mcp" in workflow
+    assert 'mount["RW"] is False' in workflow

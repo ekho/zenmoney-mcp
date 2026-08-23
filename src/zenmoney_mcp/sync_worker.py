@@ -57,7 +57,7 @@ async def sync_once() -> dict[str, Any]:
     database_path = get_database_path()
     database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     database_path.parent.chmod(0o700)
-    database = HardenedDatabase(database_path)
+    database = HardenedDatabase(database_path, journal_mode="DELETE")
     try:
         database.init_schema()
         return await HardenedSyncEngine(

@@ -5,13 +5,22 @@ import sqlite3
 import pytest
 
 from zenmoney_mcp.backup import backup_database
+from zenmoney_mcp.hardened_database import HardenedDatabase
+
+
+def _write_snapshot(path, marker: str) -> None:
+    database = HardenedDatabase(path)
+    database.init_schema()
+    database.set_meta("snapshot", marker)
+    database.close()
 
 
 def test_online_backup_copies_committed_wal_rows_and_sets_owner_permissions(tmp_path):
     source_path = tmp_path / "source.db"
     destination_path = tmp_path / "backup.db"
+    _write_snapshot(source_path, "committed")
     source = sqlite3.connect(source_path)
-    source.execute("PRAGMA journal_mode=WAL")
+    assert source.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     source.execute("CREATE TABLE records (value TEXT)")
     source.execute("INSERT INTO records VALUES ('committed')")
     source.commit()
@@ -23,7 +32,11 @@ def test_online_backup_copies_committed_wal_rows_and_sets_owner_permissions(tmp_
 
     destination = sqlite3.connect(destination_path)
     try:
+        assert destination.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         assert destination.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert destination.execute(
+            "SELECT value FROM sync_meta WHERE key = 'snapshot'"
+        ).fetchone()[0] == "committed"
         assert destination.execute("SELECT value FROM records").fetchall() == [
             ("committed",)
         ]
@@ -35,7 +48,7 @@ def test_online_backup_copies_committed_wal_rows_and_sets_owner_permissions(tmp_
 def test_backup_rejects_existing_destination_without_force(tmp_path):
     source_path = tmp_path / "source.db"
     destination_path = tmp_path / "backup.db"
-    sqlite3.connect(source_path).close()
+    _write_snapshot(source_path, "source")
     destination_path.write_text("do not overwrite")
 
     with pytest.raises(FileExistsError):
@@ -46,6 +59,7 @@ def test_backup_rejects_resolved_source_as_forced_destination_without_deleting_i
     tmp_path,
 ):
     source_path = tmp_path / "source.db"
+    _write_snapshot(source_path, "source")
     source = sqlite3.connect(source_path)
     source.execute("CREATE TABLE records (value TEXT)")
     source.execute("INSERT INTO records VALUES ('keep')")
@@ -67,17 +81,53 @@ def test_backup_rejects_resolved_source_as_forced_destination_without_deleting_i
 def test_backup_replaces_existing_destination_with_force(tmp_path):
     source_path = tmp_path / "source.db"
     destination_path = tmp_path / "backup.db"
-    source = sqlite3.connect(source_path)
-    source.execute("CREATE TABLE records (value TEXT)")
-    source.execute("INSERT INTO records VALUES ('new')")
-    source.commit()
-    source.close()
+    _write_snapshot(source_path, "new")
     destination_path.write_text("old")
 
     backup_database(source_path, destination_path, force=True)
 
     destination = sqlite3.connect(destination_path)
     try:
-        assert destination.execute("SELECT value FROM records").fetchall() == [("new",)]
+        assert destination.execute(
+            "SELECT value FROM sync_meta WHERE key = 'snapshot'"
+        ).fetchone()[0] == "new"
     finally:
         destination.close()
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "malformed"])
+def test_forced_backup_failure_preserves_existing_destination_byte_for_byte(
+    tmp_path, source_kind
+):
+    source_path = tmp_path / "source.db"
+    destination_path = tmp_path / "backup.db"
+    original = b"previous validated backup\x00contents"
+    destination_path.write_bytes(original)
+    if source_kind == "malformed":
+        source_path.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(sqlite3.Error):
+        backup_database(source_path, destination_path, force=True)
+
+    assert destination_path.read_bytes() == original
+    assert list(tmp_path.glob(".backup.db.*.tmp")) == []
+
+
+def test_forced_backup_rejects_partial_snapshot_without_replacing_destination(
+    tmp_path,
+):
+    source_path = tmp_path / "source.db"
+    destination_path = tmp_path / "backup.db"
+    original = b"previous validated backup"
+    _write_snapshot(source_path, "partial")
+    source = sqlite3.connect(source_path)
+    source.execute("DROP TABLE transactions")
+    source.commit()
+    source.close()
+    destination_path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="valid ZenMoney snapshot"):
+        backup_database(source_path, destination_path, force=True)
+
+    assert destination_path.read_bytes() == original
+    assert list(tmp_path.glob(".backup.db.*.tmp")) == []

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 
 import httpx2
@@ -17,8 +19,11 @@ from zenmoney_mcp.hardened_database import HardenedDatabase
 from zenmoney_mcp.http_server import create_app
 
 
-def _write_snapshot(path, timestamp: int, balance: float = 1000) -> None:
-    database = HardenedDatabase(path)
+def _write_snapshot(
+    path, timestamp: int, balance: float = 1000, *, journal_mode: str | None = None
+) -> None:
+    kwargs = {"journal_mode": journal_mode} if journal_mode is not None else {}
+    database = HardenedDatabase(path, **kwargs)
     database.init_schema()
     conn = database.connect()
     conn.execute(
@@ -81,6 +86,37 @@ async def test_remote_mcp_exposes_only_annotated_read_only_surface(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_journal_snapshot_works_from_truly_read_only_directory(tmp_path):
+    path = tmp_path / "snapshot.db"
+    _write_snapshot(path, 100, journal_mode="DELETE")
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        connection.close()
+    path.chmod(0o444)
+    tmp_path.chmod(0o555)
+
+    try:
+        app = create_app(path)
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1"
+        ) as http_client:
+            readiness = await http_client.get("/readyz")
+        async with _mcp_client(app) as client:
+            await client.initialize()
+            result = await client.call_tool("get_net_worth", {})
+    finally:
+        tmp_path.chmod(0o755)
+        path.chmod(0o600)
+
+    assert readiness.status_code == 200
+    assert readiness.json() == {"status": "ready"}
+    assert json.loads(result.content[0].text)["net_worth"] == 1000
+
+
+@pytest.mark.asyncio
 async def test_remote_mcp_rejects_excluded_and_unknown_tools_before_db_open(tmp_path):
     app = create_app(tmp_path / "missing.db")
 
@@ -103,6 +139,47 @@ async def test_remote_dispatch_rejection_is_an_expected_fixed_mcp_error(tmp_path
             remote=True,
             db_path=tmp_path / "missing.db",
         )
+
+
+@pytest.mark.asyncio
+async def test_remote_application_error_redacts_arguments_response_and_logs(
+    monkeypatch, tmp_path, caplog
+):
+    sentinel = "account-sentinel-9b4e"
+    path = tmp_path / "snapshot.db"
+    _write_snapshot(path, 100)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"failed account {sentinel}")
+
+    monkeypatch.setattr(server, "get_account_flow", fail)
+    caplog.set_level(logging.WARNING)
+    app = create_app(path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        with pytest.raises(MCPError) as error:
+            await client.call_tool(
+                "get_account_flow",
+                {"account_id": sentinel, "period": "this_month"},
+            )
+
+    rendered = f"{error.value}\n{caplog.text}"
+    assert sentinel not in rendered
+    assert str(error.value) == "Remote tool failed"
+    structured = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("{")
+    ]
+    assert structured == [
+        {
+            "event": "remote_tool_call",
+            "tool": "get_account_flow",
+            "status": "failed",
+            "exception_class": "RuntimeError",
+        }
+    ]
 
 
 @pytest.mark.asyncio

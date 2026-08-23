@@ -27,10 +27,16 @@ services:
       ZENMONEY_DB_PATH: /data/zenmoney.db
       ZENMONEY_SYNC_INTERVAL_SECONDS: ${ZENMONEY_SYNC_INTERVAL_SECONDS:-900}
       ZENMONEY_TOKEN_FILE: /run/secrets/zenmoney-token
-    secrets: [zenmoney-token]
+    secrets:
+      - source: zenmoney-token
+        target: zenmoney-token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     volumes:
       - zenmoney-data:/data
     networks: [egress]
+    stop_grace_period: 70s
     healthcheck:
       disable: true
 
@@ -66,6 +72,6 @@ volumes:
 
 secrets:
   zenmoney-token:
-    file: ./secrets/zenmoney-token
+    environment: ZENMONEY_TOKEN
   control-plane-api-key:
     file: ./secrets/control-plane-api-key

@@ -23,6 +23,32 @@ SYNC_ENTITY_TABLES = (
     "reminders",
     "reminder_markers",
 )
+REQUIRED_SNAPSHOT_TABLES = frozenset((*SYNC_ENTITY_TABLES, "sync_meta"))
+
+
+def validate_snapshot(conn: sqlite3.Connection) -> bool:
+    """Return whether a connection contains the complete supported sync schema."""
+    quick_check = conn.execute("PRAGMA quick_check").fetchone()
+    if quick_check is None or quick_check[0] != "ok":
+        return False
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if not REQUIRED_SNAPSHOT_TABLES <= tables:
+        return False
+    sync_meta_columns = {
+        (str(row[1]), str(row[2]).upper(), int(row[5]))
+        for row in conn.execute("PRAGMA table_info(sync_meta)").fetchall()
+    }
+    if sync_meta_columns != {("key", "TEXT", 1), ("value", "TEXT", 0)}:
+        return False
+    version = conn.execute(
+        "SELECT value FROM sync_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    return version is not None and str(version[0]) == str(SCHEMA_VERSION)
 
 
 class CurrencyRateError(ValueError):
@@ -65,13 +91,7 @@ class HardenedDatabase(Database):
     def check_ready(self) -> bool:
         """Return whether this database is a readable ZenMoney snapshot."""
         try:
-            conn = self.connect()
-            quick_check = conn.execute("PRAGMA quick_check").fetchone()
-            if quick_check is None or quick_check[0] != "ok":
-                return False
-            return conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'"
-            ).fetchone() is not None
+            return validate_snapshot(self.connect())
         except sqlite3.Error:
             return False
 
