@@ -100,9 +100,7 @@ class SyncEngine:
                     raise SyncError(f"HTTP error during sync: {e}") from e
 
         if response.status_code != 200:
-            raise SyncError(
-                f"API returned status {response.status_code}: {response.text}"
-            )
+            raise SyncError(f"API returned status {response.status_code}")
 
         try:
             diff_data = response.json()

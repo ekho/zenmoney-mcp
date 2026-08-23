@@ -3,7 +3,7 @@
 import pytest
 
 from zenmoney_mcp.database import Database
-from zenmoney_mcp.sync_engine import SyncEngine
+from zenmoney_mcp.sync_engine import SyncEngine, SyncError
 
 
 class TestSyncEngine:
@@ -172,6 +172,32 @@ class TestSyncEngine:
         conn = sync_engine.db.connect()
         row = conn.execute("SELECT tag FROM transactions WHERE id = ?", ("tx-no-tag",)).fetchone()
         assert row["tag"] is None
+
+    @pytest.mark.asyncio
+    async def test_http_error_does_not_expose_response_body(self, db, monkeypatch):
+        engine = SyncEngine(db, "token")
+
+        class Response:
+            status_code = 500
+            text = "sensitive upstream response"
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return Response()
+
+        monkeypatch.setattr("zenmoney_mcp.sync_engine.httpx.AsyncClient", Client)
+
+        with pytest.raises(SyncError) as error:
+            await engine.sync()
+
+        assert "status 500" in str(error.value)
+        assert Response.text not in str(error.value)
 
 
 class TestSyncEngineWithPopulatedDB:

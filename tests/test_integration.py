@@ -8,8 +8,8 @@ import os
 
 import pytest
 
-from zenmoney_mcp.database import Database
-from zenmoney_mcp.sync_engine import SyncEngine
+from zenmoney_mcp.hardened_database import HardenedDatabase
+from zenmoney_mcp.hardened_sync import HardenedSyncEngine
 
 
 # Skip all tests in this module if ZENMONEY_TOKEN is not set
@@ -20,25 +20,25 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def integration_db() -> Database:
+def integration_db() -> HardenedDatabase:
     """Create in-memory database for integration tests."""
-    db = Database(":memory:")
+    db = HardenedDatabase(":memory:")
     db.init_schema()
     return db
 
 
 @pytest.fixture
-def integration_sync_engine(integration_db: Database) -> SyncEngine:
+def integration_sync_engine(integration_db: HardenedDatabase) -> HardenedSyncEngine:
     """Create sync engine with real token."""
     token = os.environ.get("ZENMONEY_TOKEN")
-    return SyncEngine(integration_db, token)
+    return HardenedSyncEngine(integration_db, token)
 
 
 class TestIntegrationSync:
     """Integration tests for sync with real API."""
 
     @pytest.mark.asyncio
-    async def test_full_sync(self, integration_sync_engine: SyncEngine):
+    async def test_full_sync(self, integration_sync_engine: HardenedSyncEngine):
         """Test full sync fetches data from API."""
         result = await integration_sync_engine.sync(force_full=True)
 
@@ -54,7 +54,7 @@ class TestIntegrationSync:
         assert db.count_table("tags") >= 0  # User might have no tags
 
     @pytest.mark.asyncio
-    async def test_incremental_sync(self, integration_sync_engine: SyncEngine):
+    async def test_incremental_sync(self, integration_sync_engine: HardenedSyncEngine):
         """Test incremental sync after full sync."""
         # First full sync
         await integration_sync_engine.sync(force_full=True)
@@ -68,7 +68,7 @@ class TestIntegrationSync:
         assert result["new_server_timestamp"] >= first_timestamp
 
     @pytest.mark.asyncio
-    async def test_sync_data_structure(self, integration_sync_engine: SyncEngine):
+    async def test_sync_data_structure(self, integration_sync_engine: HardenedSyncEngine):
         """Test that synced data has correct structure."""
         await integration_sync_engine.sync(force_full=True)
 

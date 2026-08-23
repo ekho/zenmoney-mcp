@@ -3228,8 +3228,8 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
         "user_currency": user_code,
         "currencies": rate_list,
         "cross_rates": cross_rates,
-        "rate_source": "cbr",
-        "note": "Rates from ZenMoney (Central Bank of Russia, updated on sync). rate_to_rub = cost of 1 unit in RUB.",
+        "rate_source": "ZenMoney synchronized instrument data",
+        "note": "Rates synchronized from ZenMoney. rate_to_rub is the cost of 1 unit in RUB.",
     }
 
 
