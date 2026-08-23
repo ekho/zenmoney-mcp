@@ -76,20 +76,20 @@ docker compose --env-file deploy/remote-mcp/.env \
 
 **Manual, not run:** the pinned `v0.0.12` client accepts the Compose
 direct-config flags for `doctor`. Load the non-secret tunnel ID from `.env` and
-run it in the already-running client, whose Compose secret mount supplies the
-runtime key:
+run a one-shot diagnostic container; it receives the existing Compose secret
+mount but does not start a tunnel daemon:
 
 ```bash
 set -a
 . deploy/remote-mcp/.env
 set +a
 docker compose --env-file deploy/remote-mcp/.env \
-  -f deploy/remote-mcp/compose.yaml exec tunnel-client \
-  /usr/bin/tunnel-client doctor --explain \
+  -f deploy/remote-mcp/compose.yaml run --rm --no-deps \
+  --entrypoint /usr/bin/tunnel-client tunnel-client doctor --explain \
   --control-plane.tunnel-id="$CONTROL_PLANE_TUNNEL_ID" \
   --control-plane.api-key=file:/run/secrets/control-plane-api-key \
   --mcp.server-url=http://zenmoney-mcp:8000/mcp \
-  --health.listen-addr=:8080 \
+  --health.listen-addr=:0 \
   --log.level=info \
   --log.format=json
 ```
@@ -122,13 +122,16 @@ directory before mounting it into the backup command:
 ```bash
 BACKUP_DIR=/absolute/path/to/zenmoney-backups
 BACKUP_NAME="zenmoney-$(date +%Y%m%d-%H%M%S).db"
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
 install -d -m 700 "$BACKUP_DIR"
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml run --rm --no-deps \
+  --user 0:0 \
   --volume "$BACKUP_DIR:/backup:rw" \
-  --entrypoint zenmoney-db-backup zenmoney-sync \
-  "/backup/$BACKUP_NAME" \
-  --source /data/zenmoney.db
+  --env BACKUP_NAME --env HOST_UID --env HOST_GID \
+  --entrypoint /bin/sh zenmoney-sync -ec \
+  'zenmoney-db-backup "/backup/$BACKUP_NAME" --source /data/zenmoney.db && chown "$HOST_UID:$HOST_GID" "/backup/$BACKUP_NAME" && chmod 600 "/backup/$BACKUP_NAME"'
 ```
 
 Restore is offline. Set `BACKUP` to the absolute path created above, stop all
@@ -138,12 +141,13 @@ before deleting only stale target sidecars and atomically replacing the target.
 It never copies directly over a live database.
 
 ```bash
+set -e
 BACKUP=/absolute/path/to/zenmoney-backups/zenmoney-YYYYmmdd-HHMMSS.db
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml down
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml run --rm --no-deps --entrypoint python \
-  --volume "$BACKUP:/restore/backup.db:ro" zenmoney-sync -c "import os, shutil, sqlite3; backup='/restore/backup.db'; stage='/data/zenmoney.restore-staging.db'; target='/data/zenmoney.db'; os.path.exists(stage) and os.unlink(stage); shutil.copyfile(backup, stage); os.chmod(stage, 0o600); conn=sqlite3.connect(f'file:{stage}?mode=ro', uri=True); assert conn.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; assert conn.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'\").fetchone(); conn.close(); [os.unlink(target + suffix) for suffix in ('-wal', '-shm') if os.path.exists(target + suffix)]; os.replace(stage, target); os.chmod(target, 0o600)"
+  --volume "$BACKUP:/restore/backup.db:ro" zenmoney-sync -c "import os, shutil, sqlite3; backup='/restore/backup.db'; stage='/data/zenmoney.restore-staging.db'; target='/data/zenmoney.db'; os.path.exists(stage) and os.unlink(stage); shutil.copyfile(backup, stage); os.chmod(stage, 0o600); conn=sqlite3.connect(f'file:{stage}?mode=ro', uri=True); assert conn.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; assert conn.execute(\"SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'\").fetchone(); conn.close(); os.replace(stage, target); os.chmod(target, 0o600); [os.unlink(target + suffix) for suffix in ('-wal', '-shm') if os.path.exists(target + suffix)]"
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml up -d
 docker compose --env-file deploy/remote-mcp/.env \
