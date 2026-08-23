@@ -35,7 +35,7 @@ class HardenedDatabase(Database):
     def connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
-        if self.db_path != ":memory:":
+        if not self.read_only and self.db_path != ":memory:":
             path = Path(self.db_path)
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
@@ -45,7 +45,7 @@ class HardenedDatabase(Database):
                 os.close(fd)
             path.chmod(0o600)
         conn = super().connect()
-        if self.db_path != ":memory:":
+        if not self.read_only and self.db_path != ":memory:":
             path = Path(self.db_path)
             for candidate in (
                 path,
@@ -57,8 +57,23 @@ class HardenedDatabase(Database):
         return conn
 
     def init_schema(self) -> None:
+        if self.read_only:
+            return
         super().init_schema()
         self._apply_hardening_migrations()
+
+    def check_ready(self) -> bool:
+        """Return whether this database is a readable ZenMoney snapshot."""
+        try:
+            conn = self.connect()
+            quick_check = conn.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or quick_check[0] != "ok":
+                return False
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'"
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
 
     def _columns(self, table: str) -> set[str]:
         return {

@@ -76,19 +76,34 @@ _sync_engine: HardenedSyncEngine | None = None
 configure_legacy_analytics(legacy_analytics)
 
 
+def get_database_path() -> Path:
+    """Return the configured local ZenMoney database path."""
+    configured_path = os.environ.get("ZENMONEY_DB_PATH")
+    if configured_path:
+        return Path(configured_path)
+    return Path.home() / ".cache" / "zenmoney-mcp" / "zenmoney.db"
+
+
 def get_db() -> HardenedDatabase:
     """Get or create database instance."""
     global _db
     if _db is None:
-        # Default to user's cache directory
-        cache_dir = Path.home() / ".cache" / "zenmoney-mcp"
+        db_path = get_database_path()
+        cache_dir = db_path.parent
         cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_dir.chmod(0o700)
-        db_path = cache_dir / "zenmoney.db"
 
         _db = HardenedDatabase(db_path)
         _db.init_schema()
     return _db
+
+
+def open_remote_db() -> HardenedDatabase:
+    """Open the configured ZenMoney snapshot for remote read-only access."""
+    db_path = get_database_path()
+    if not db_path.is_file():
+        raise FileNotFoundError(f"ZenMoney database does not exist: {db_path}")
+    return HardenedDatabase(db_path, read_only=True)
 
 
 def get_sync_engine() -> HardenedSyncEngine:

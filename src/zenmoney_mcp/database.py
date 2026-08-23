@@ -4,6 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 SCHEMA = """
@@ -171,24 +172,33 @@ CREATE INDEX IF NOT EXISTS idx_rm_date ON reminder_markers(date);
 class Database:
     """SQLite database wrapper for ZenMoney cache."""
 
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, *, read_only: bool = False):
         """Initialize database connection.
 
         Args:
             db_path: Path to SQLite file, or None/":memory:" for in-memory DB.
+            read_only: Open a file-backed database without allowing writes.
         """
         if db_path is None:
             db_path = ":memory:"
         self.db_path = str(db_path)
+        self.read_only = read_only
         self._conn: sqlite3.Connection | None = None
 
     def connect(self) -> sqlite3.Connection:
         """Get or create database connection."""
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            if self.read_only and self.db_path != ":memory:":
+                self._conn = sqlite3.connect(
+                    f"file:{quote(self.db_path)}?mode=ro",
+                    uri=True,
+                    check_same_thread=False,
+                )
+            else:
+                self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             # Enable WAL mode for better concurrency (only for file-based DBs)
-            if self.db_path != ":memory:":
+            if not self.read_only and self.db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
         return self._conn
 
@@ -200,6 +210,8 @@ class Database:
 
     def init_schema(self) -> None:
         """Create all tables and indexes."""
+        if self.read_only:
+            return
         conn = self.connect()
         conn.executescript(SCHEMA)
         conn.executescript(INDEXES)
