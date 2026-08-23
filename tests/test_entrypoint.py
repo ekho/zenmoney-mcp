@@ -1,3 +1,6 @@
+import inspect
+import json
+
 import pytest
 
 from zenmoney_mcp import server
@@ -15,6 +18,35 @@ def test_server_uses_hardened_runtime_dependencies():
     assert server.HardenedDatabase is HardenedDatabase
     assert server.HardenedSyncEngine is HardenedSyncEngine
     assert server.get_net_worth is corrected.get_net_worth
+
+
+@pytest.mark.asyncio
+async def test_call_tool_requires_and_accepts_hardened_database():
+    assert inspect.signature(server.call_tool).parameters["db"].annotation == (
+        HardenedDatabase | None
+    )
+
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    conn = db.connect()
+    conn.execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) "
+        "VALUES (1,'Ruble','RUB','₽',1,1)"
+    )
+    conn.execute(
+        "INSERT INTO users(id,login,currency,parent,month_start_day,changed) "
+        "VALUES (1,'u',1,NULL,1,1)"
+    )
+    conn.execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('cash','Cash','checking',1,1000,1,0,0,1,1)"
+    )
+    conn.commit()
+    try:
+        content = await server.call_tool("get_net_worth", {}, db=db)
+        assert json.loads(content[0].text)["net_worth"] == 1000
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

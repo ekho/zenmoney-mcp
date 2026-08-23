@@ -28,7 +28,6 @@ from .analytics import (
     get_sync_status_resource,
     suggest_category,
 )
-from .database import Database
 from .decision import (
     build_financial_plan,
     compare_debt_strategies,
@@ -1008,7 +1007,7 @@ async def call_tool(
     name: str,
     arguments: dict[str, Any],
     *,
-    db: Database | None = None,
+    db: HardenedDatabase | None = None,
     remote: bool = False,
 ) -> list[TextContent]:
     """Handle tool calls."""
@@ -1350,7 +1349,7 @@ async def list_resources() -> list[Resource]:
 
 
 async def read_resource(
-    uri: str, *, db: Database | None = None
+    uri: str, *, db: HardenedDatabase | None = None
 ) -> str:
     """Read resource content."""
     db = db or get_db()
