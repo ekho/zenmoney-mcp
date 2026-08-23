@@ -1633,8 +1633,8 @@ class TestT17GetExchangeRates:
     def test_rates_has_source_info(self, populated_db: Database):
         """FR-007: Exchange rate source info."""
         result = get_exchange_rates(populated_db)
-        assert result["rate_source"] == "cbr"
-        assert "Central Bank of Russia" in result["note"]
+        assert result["rate_source"] == "ZenMoney synchronized instrument data"
+        assert "Central Bank" not in result["note"]
 
 
 # ============================================================================

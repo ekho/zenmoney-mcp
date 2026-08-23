@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from zenmoney_mcp.database import Database
+from zenmoney_mcp.hardened_database import CurrencyRateError, HardenedDatabase, SCHEMA_VERSION
+
+
+def test_migration_deduplicates_nullable_budgets_and_sets_schema_version(tmp_path):
+    path = tmp_path / "legacy.db"
+    legacy = Database(path)
+    legacy.init_schema()
+    conn = legacy.connect()
+    conn.execute(
+        "INSERT INTO budgets(user,tag,date,income,income_lock,outcome,outcome_lock,changed) VALUES (1,NULL,'2026-08-01',0,0,100,1,1)"
+    )
+    conn.execute(
+        "INSERT INTO budgets(user,tag,date,income,income_lock,outcome,outcome_lock,changed) VALUES (1,NULL,'2026-08-01',0,0,200,1,2)"
+    )
+    conn.commit()
+    legacy.close()
+
+    db = HardenedDatabase(path)
+    db.init_schema()
+    rows = db.connect().execute("SELECT outcome,tag_key FROM budgets").fetchall()
+    assert [(row["outcome"], row["tag_key"]) for row in rows] == [(200.0, "")]
+    assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
+def test_strict_rate_lookup_rejects_missing_and_zero_rates():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.connect().execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) VALUES (1,'Bad','BAD','?',0,1)"
+    )
+    db.connect().commit()
+    with pytest.raises(CurrencyRateError, match="zero"):
+        db.require_instrument_rate(1)
+    with pytest.raises(CurrencyRateError, match="missing"):
+        db.require_instrument_rate(999)
+
+
+
+def test_reminder_marker_currency_columns_are_migrated_and_persisted():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_reminder_markers([{
+        "id": "marker", "user": 1, "date": "2026-08-21", "state": "planned",
+        "income": 0, "outcome": 10, "incomeInstrument": 1,
+        "outcomeInstrument": 2, "tag": ["food"], "changed": 1,
+    }])
+    row = db.connect().execute(
+        "SELECT income_instrument,outcome_instrument FROM reminder_markers WHERE id='marker'"
+    ).fetchone()
+    assert row["income_instrument"] == 1
+    assert row["outcome_instrument"] == 2
+
+
+def test_migration_keeps_budget_row_with_highest_changed_even_if_inserted_first(tmp_path):
+    path = tmp_path / "legacy-changed.db"
+    legacy = Database(path)
+    legacy.init_schema()
+    conn = legacy.connect()
+    conn.execute(
+        "INSERT INTO budgets(user,tag,date,income,income_lock,outcome,outcome_lock,changed) "
+        "VALUES (1,NULL,'2026-08-01',0,0,250,1,20)"
+    )
+    conn.execute(
+        "INSERT INTO budgets(user,tag,date,income,income_lock,outcome,outcome_lock,changed) "
+        "VALUES (1,NULL,'2026-08-01',0,0,100,1,10)"
+    )
+    conn.commit()
+    legacy.close()
+
+    db = HardenedDatabase(path)
+    db.init_schema()
+
+    rows = db.connect().execute("SELECT outcome,changed FROM budgets").fetchall()
+    assert [(row["outcome"], row["changed"]) for row in rows] == [(250.0, 20)]
+
+
+def test_legacy_rate_helper_is_strict_on_hardened_database():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.connect().execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) "
+        "VALUES (1,'Ruble','RUB','₽',1,1)"
+    )
+    db.connect().commit()
+
+    assert db.get_instrument_rate(1) == 1.0
+    with pytest.raises(CurrencyRateError, match="999"):
+        db.get_instrument_rate(999)
+
+
+def test_partial_account_diff_preserves_start_balance_when_field_is_omitted():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_accounts(
+        [
+            {
+                "id": "account",
+                "title": "Initial",
+                "type": "checking",
+                "instrument": 1,
+                "balance": 10,
+                "startBalance": 7,
+                "changed": 1,
+            }
+        ]
+    )
+
+    db.upsert_accounts(
+        [
+            {
+                "id": "account",
+                "title": "Updated",
+                "type": "checking",
+                "instrument": 1,
+                "balance": 20,
+                "changed": 2,
+            }
+        ]
+    )
+
+    row = db.connect().execute(
+        "SELECT title, balance, start_balance FROM accounts WHERE id = 'account'"
+    ).fetchone()
+    assert (row["title"], row["balance"], row["start_balance"]) == (
+        "Updated",
+        20.0,
+        7.0,
+    )
+
+
+def test_partial_reminder_diff_preserves_schedule_and_currency_fields_when_omitted():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_reminders(
+        [
+            {
+                "id": "reminder",
+                "payee": "Initial",
+                "points": [1, 15],
+                "incomeInstrument": 1,
+                "outcomeInstrument": 2,
+                "changed": 1,
+            }
+        ]
+    )
+
+    db.upsert_reminders(
+        [{"id": "reminder", "payee": "Updated", "changed": 2}]
+    )
+
+    row = db.connect().execute(
+        "SELECT payee, points, income_instrument, outcome_instrument "
+        "FROM reminders WHERE id = 'reminder'"
+    ).fetchone()
+    assert row["payee"] == "Updated"
+    assert row["points"] == "[1, 15]"
+    assert row["income_instrument"] == 1
+    assert row["outcome_instrument"] == 2
+
+
+def test_partial_marker_diff_preserves_currency_fields_when_omitted():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_reminder_markers(
+        [
+            {
+                "id": "marker",
+                "state": "planned",
+                "incomeInstrument": 1,
+                "outcomeInstrument": 2,
+                "changed": 1,
+            }
+        ]
+    )
+
+    db.upsert_reminder_markers(
+        [{"id": "marker", "state": "processed", "changed": 2}]
+    )
+
+    row = db.connect().execute(
+        "SELECT state, income_instrument, outcome_instrument "
+        "FROM reminder_markers WHERE id = 'marker'"
+    ).fetchone()
+    assert (row["state"], row["income_instrument"], row["outcome_instrument"]) == (
+        "processed",
+        1,
+        2,
+    )
+
+
+def test_file_database_uses_owner_only_permissions(tmp_path):
+    path = tmp_path / "zenmoney.db"
+    db = HardenedDatabase(path)
+    db.init_schema()
+    db.connect().execute("INSERT INTO sync_meta(key,value) VALUES ('test','1')")
+    db.connect().commit()
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        assert sidecar.stat().st_mode & 0o777 == 0o600

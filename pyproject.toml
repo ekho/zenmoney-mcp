@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zenmoney-mcp"
-version = "0.1.0"
-description = "Read-only MCP server for personal finance analytics over ZenMoney API"
+version = "0.2.0"
+description = "Read-only MCP server for trustworthy personal finance analytics over ZenMoney API"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "httpx>=0.27.0",
 ]
 
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-zenmoney-mcp = "zenmoney_mcp.server:main"
+zenmoney-mcp = "zenmoney_mcp.entrypoint:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zenmoney_mcp"]

@@ -1,3 +1,3 @@
-"""ZenMoney MCP Server - Read-only financial analytics."""
+"""ZenMoney MCP Server — read-only financial analytics."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

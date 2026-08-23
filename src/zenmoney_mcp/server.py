@@ -51,7 +51,8 @@ def get_db() -> Database:
     if _db is None:
         # Default to user's cache directory
         cache_dir = Path.home() / ".cache" / "zenmoney-mcp"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_dir.chmod(0o700)
         db_path = cache_dir / "zenmoney.db"
 
         _db = Database(db_path)
