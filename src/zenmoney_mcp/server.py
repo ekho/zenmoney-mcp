@@ -1440,7 +1440,7 @@ async def read_resource(
     """Read a resource with the appropriate local or remote database lifecycle."""
     uri = str(uri)
     if remote and uri not in {str(resource.uri) for resource in await list_resources()}:
-        raise ValueError(f"Unknown remote resource: {uri}")
+        raise MCPError(INVALID_PARAMS, "Remote resource is unavailable")
 
     owned_db = remote and db is None
     if db is None:
@@ -1476,6 +1476,8 @@ def create_server(
                 remote=remote,
                 db_path=db_path,
             )
+        except MCPError:
+            raise
         except Exception as exc:
             if not remote:
                 raise
@@ -1496,16 +1498,33 @@ def create_server(
         return ListResourcesResult(resources=await list_resources())
 
     async def _on_read_resource(context, params):
+        try:
+            text = await read_resource(
+                params.uri,
+                remote=remote,
+                db_path=db_path,
+            )
+        except MCPError:
+            raise
+        except Exception as exc:
+            if not remote:
+                raise
+            LOGGER.warning(
+                json.dumps(
+                    {
+                        "event": "remote_resource_read",
+                        "status": "failed",
+                        "exception_class": type(exc).__name__,
+                    }
+                )
+            )
+            raise MCPError(INTERNAL_ERROR, "Remote resource failed") from None
         return ReadResourceResult(
             contents=[
                 TextResourceContents(
                     uri=params.uri,
                     mime_type="application/json",
-                    text=await read_resource(
-                        params.uri,
-                        remote=remote,
-                        db_path=db_path,
-                    ),
+                    text=text,
                 )
             ]
         )

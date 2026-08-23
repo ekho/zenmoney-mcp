@@ -13,6 +13,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
+from mcp_types import INTERNAL_ERROR, INVALID_PARAMS
 
 from zenmoney_mcp import server
 from zenmoney_mcp.hardened_database import HardenedDatabase
@@ -117,17 +118,24 @@ async def test_delete_journal_snapshot_works_from_truly_read_only_directory(tmp_
 
 
 @pytest.mark.asyncio
-async def test_remote_mcp_rejects_excluded_and_unknown_tools_before_db_open(tmp_path):
+async def test_remote_mcp_rejects_excluded_and_unknown_tools_before_db_open(
+    tmp_path, caplog
+):
+    caplog.set_level(logging.WARNING)
     app = create_app(tmp_path / "missing.db")
 
     async with _mcp_client(app) as client:
         await client.initialize()
-        with pytest.raises(MCPError):
-            await client.call_tool("sync_data", {})
-        with pytest.raises(MCPError):
-            await client.call_tool("suggest_category", {"payee": "shop"})
-        with pytest.raises(MCPError):
-            await client.call_tool("not_registered", {})
+        for name, arguments in (
+            ("sync_data", {}),
+            ("suggest_category", {"payee": "shop"}),
+            ("not_registered", {}),
+        ):
+            with pytest.raises(MCPError) as error:
+                await client.call_tool(name, arguments)
+            assert error.value.code == INVALID_PARAMS
+            assert error.value.message == "Remote tool is unavailable"
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio
@@ -166,6 +174,8 @@ async def test_remote_application_error_redacts_arguments_response_and_logs(
 
     rendered = f"{error.value}\n{caplog.text}"
     assert sentinel not in rendered
+    assert "Traceback" not in rendered
+    assert error.value.code == INTERNAL_ERROR
     assert str(error.value) == "Remote tool failed"
     structured = [
         json.loads(record.getMessage())
@@ -180,6 +190,83 @@ async def test_remote_application_error_redacts_arguments_response_and_logs(
             "exception_class": "RuntimeError",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_remote_resource_error_redacts_exception_response_and_logs(
+    monkeypatch, tmp_path, caplog
+):
+    sentinel = "resource-sentinel-c742"
+    path = tmp_path / "snapshot.db"
+    _write_snapshot(path, 100)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"resource failure {sentinel}")
+
+    monkeypatch.setattr(server, "get_accounts_resource", fail)
+    caplog.set_level(logging.WARNING)
+    app = create_app(path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        with pytest.raises(MCPError) as error:
+            await client.read_resource("zenmoney://accounts")
+
+    rendered = f"{error.value}\n{caplog.text}"
+    assert sentinel not in rendered
+    assert "Traceback" not in rendered
+    assert error.value.code == INTERNAL_ERROR
+    assert error.value.message == "Remote resource failed"
+    structured = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("{")
+    ]
+    assert structured == [
+        {
+            "event": "remote_resource_read",
+            "status": "failed",
+            "exception_class": "RuntimeError",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_unknown_resource_preserves_safe_invalid_params_error(
+    tmp_path, caplog
+):
+    sentinel = "resource-sentinel-unknown-67d1"
+    caplog.set_level(logging.WARNING)
+    app = create_app(tmp_path / "missing.db")
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        with pytest.raises(MCPError) as error:
+            await client.read_resource(f"zenmoney://{sentinel}")
+
+    rendered = f"{error.value}\n{caplog.text}"
+    assert sentinel not in rendered
+    assert "Traceback" not in rendered
+    assert error.value.code == INVALID_PARAMS
+    assert error.value.message == "Remote resource is unavailable"
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_local_resource_keeps_application_exception(monkeypatch):
+    sentinel = "local-resource-sentinel"
+    database = HardenedDatabase(":memory:")
+    database.init_schema()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(server, "get_accounts_resource", fail)
+    try:
+        with pytest.raises(RuntimeError, match=sentinel):
+            await server.read_resource("zenmoney://accounts", db=database)
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio

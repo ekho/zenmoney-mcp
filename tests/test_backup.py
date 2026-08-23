@@ -131,3 +131,25 @@ def test_forced_backup_rejects_partial_snapshot_without_replacing_destination(
 
     assert destination_path.read_bytes() == original
     assert list(tmp_path.glob(".backup.db.*.tmp")) == []
+
+
+def test_forced_backup_publish_failure_preserves_destination_and_cleans_temp(
+    monkeypatch, tmp_path
+):
+    source_path = tmp_path / "source.db"
+    destination_path = tmp_path / "backup.db"
+    original = b"previous validated backup"
+    _write_snapshot(source_path, "new")
+    destination_path.write_bytes(original)
+
+    def fail_replace(source, destination):
+        assert source.parent == destination.parent == tmp_path
+        raise OSError("synthetic publish failure")
+
+    monkeypatch.setattr("zenmoney_mcp.backup.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="synthetic publish failure"):
+        backup_database(source_path, destination_path, force=True)
+
+    assert destination_path.read_bytes() == original
+    assert list(tmp_path.glob(".backup.db.*.tmp")) == []
