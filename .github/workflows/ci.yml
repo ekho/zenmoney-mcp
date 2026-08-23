@@ -32,7 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CONTROL_PLANE_TUNNEL_ID: tunnel_0123456789abcdef0123456789abcdef
-      ZENMONEY_TOKEN: ci-synthetic-token
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +40,15 @@ jobs:
           cache: pip
       - name: Build image
         run: docker build -t zenmoney-mcp:remote-test .
+      - name: Prepare synthetic ZenMoney secret
+        run: |
+          set -e
+          umask 077
+          temporary_secret="$(mktemp)"
+          trap 'rm -f "$temporary_secret"' EXIT
+          printf '%s' 'ci-synthetic-token' > "$temporary_secret"
+          sudo install -o 10001 -g 10001 -m 0400 "$temporary_secret" \
+            deploy/remote-mcp/secrets/zenmoney-token
       - name: Validate Compose
         run: docker compose -f deploy/remote-mcp/compose.yaml config -q
       - name: Test static deployment contract

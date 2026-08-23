@@ -26,21 +26,29 @@ allowlists.
 ## Configure and start
 
 Run from the repository root. `.env` contains identifiers only and must never
-contain the ZenMoney token. Export that token from a password manager or other
-operator-controlled source before every Compose command; Compose materializes
-it as a UID/GID `10001`, mode-`0400` secret only for `zenmoney-sync`. The OpenAI
-runtime key remains an ignored file because the official tunnel container owns
-that mount separately.
+contain the ZenMoney token. Both credentials use ignored file-backed Compose
+secrets and are mounted into separate roles. Compose file-source remapping is
+not implemented: service-level secret `uid`, `gid`, and `mode` settings do not
+change the bind-mounted source. The ZenMoney source file itself must therefore
+be owned by numeric UID/GID `10001:10001` with mode `0400` before startup.
 
 ```bash
 cp deploy/remote-mcp/.env.example deploy/remote-mcp/.env
 mkdir -p deploy/remote-mcp/secrets
 printf '%s' "$CONTROL_PLANE_API_KEY" > deploy/remote-mcp/secrets/control-plane-api-key
 chmod 600 deploy/remote-mcp/secrets/control-plane-api-key
+umask 077
+ZENMONEY_TOKEN_TMP="$(mktemp)"
+trap 'rm -f "$ZENMONEY_TOKEN_TMP"' EXIT
 printf 'ZenMoney token: '
 read -r -s ZENMONEY_TOKEN
 printf '\n'
-export ZENMONEY_TOKEN
+printf '%s' "$ZENMONEY_TOKEN" > "$ZENMONEY_TOKEN_TMP"
+unset ZENMONEY_TOKEN
+sudo install -o 10001 -g 10001 -m 0400 "$ZENMONEY_TOKEN_TMP" \
+  deploy/remote-mcp/secrets/zenmoney-token
+rm -f "$ZENMONEY_TOKEN_TMP"
+trap - EXIT
 ```
 
 Set `CONTROL_PLANE_TUNNEL_ID` in `deploy/remote-mcp/.env` to the value from

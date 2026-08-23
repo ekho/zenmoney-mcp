@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -28,7 +29,6 @@ def _compose_config() -> dict:
         env={
             **os.environ,
             "CONTROL_PLANE_TUNNEL_ID": "tunnel_0123456789abcdef0123456789abcdef",
-            "ZENMONEY_TOKEN": "synthetic-static-test-token",
         },
         text=True,
     )
@@ -59,17 +59,16 @@ def test_compose_keeps_mcp_private_and_separates_credentials():
     assert "CONTROL_PLANE_API_KEY" not in sync_environment
     assert sync_environment["ZENMONEY_TOKEN_FILE"] == "/run/secrets/zenmoney-token"
 
-    sync_secret = services["zenmoney-sync"]["secrets"]
-    assert sync_secret == [
+    assert "secrets" not in services["zenmoney-mcp"]
+    assert services["zenmoney-sync"]["secrets"] == [
         {
             "source": "zenmoney-token",
-            "target": "zenmoney-token",
-            "uid": "10001",
-            "gid": "10001",
-            "mode": "0400",
+            "target": "/run/secrets/zenmoney-token",
         }
     ]
-    assert config["secrets"]["zenmoney-token"]["environment"] == "ZENMONEY_TOKEN"
+    assert Path(config["secrets"]["zenmoney-token"]["file"]) == (
+        ROOT / "deploy" / "remote-mcp" / "secrets" / "zenmoney-token"
+    )
     assert {
         secret["source"] for secret in services["tunnel-client"]["secrets"]
     } == {"control-plane-api-key"}
@@ -107,12 +106,20 @@ def test_operations_and_ci_cover_sensitive_backups_pin_updates_and_runtime_smoke
     runbook = RUNBOOK.read_text(encoding="utf-8")
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
-    assert "ZENMONEY_TOKEN=replace-with-your-token" in env_example
+    assert "ZENMONEY_TOKEN" not in env_example
     assert "sensitive financial data" in runbook
     assert "docker buildx imagetools inspect" in runbook
     assert "github.com/openai/tunnel-client/releases" in runbook
     assert "validate_snapshot" in runbook
     assert "HardenedDatabase(stage, journal_mode='DELETE')" in runbook
+    assert re.search(r"file-source remapping is\s+not implemented", runbook)
+    assert "sudo install -o 10001 -g 10001 -m 0400" in runbook
+    assert "ZENMONEY_TOKEN:" not in workflow
+    prepare_secret = workflow.index("Prepare synthetic ZenMoney secret")
+    validate_compose = workflow.index("Validate Compose")
+    assert prepare_secret < validate_compose
+    assert "sudo install -o 10001 -g 10001 -m 0400" in workflow
+    assert "deploy/remote-mcp/secrets/zenmoney-token" in workflow
     assert "os.getuid() == 10001" in workflow
     assert "read_secret('ZENMONEY_TOKEN')" in workflow
     assert "docker compose" in workflow and "up -d --no-deps zenmoney-mcp" in workflow

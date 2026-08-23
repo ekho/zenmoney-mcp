@@ -7,7 +7,7 @@ public MCP endpoint and does not add an OAuth provider.
 
 | Asset | Protection |
 | --- | --- |
-| ZenMoney token | Supplied from the operator environment to a Compose secret mounted only into `zenmoney-sync` as UID/GID `10001`, mode `0400`. |
+| ZenMoney token | Ignored file-backed Compose secret mounted only into `zenmoney-sync`; the host source is owned by UID/GID `10001`, mode `0400`. |
 | OpenAI tunnel runtime API key | File-mounted only into `tunnel-client`; ignored secret file with mode `0600`. |
 | SQLite financial cache | Named volume; writable only by the sync worker and mounted read-only by the MCP server. |
 | MCP outputs | Remote registry is read-only, bounded, and excludes sync/API-dependent tools. |
@@ -31,7 +31,7 @@ destination allowlist.
 | Threat | Mitigation |
 | --- | --- |
 | Public exposure | No service has a `ports` mapping. The MCP HTTP server is internal-only; `tunnel-client` polls outbound over HTTPS. The operator must not add a public port or proxy. |
-| Secret leakage | The ZenMoney token becomes a UID/GID `10001`, mode-`0400` Compose secret; the tunnel key remains an ignored file secret. They are mounted into separate roles. Never put either value in `.env`, logs, images, or commits. |
+| Secret leakage | Both credentials are ignored file-backed secrets mounted into separate roles. Because Compose does not remap file-source ownership, the ZenMoney source itself is UID/GID `10001`, mode `0400`; the tunnel key remains mode `0600`. Never put either value in `.env`, logs, images, or commits. |
 | Logs containing finances | App logs use fixed non-sensitive fields; HTTP access logs and raw MCP request logging are disabled. Operators must not enable body logging or export unredacted diagnostics. |
 | Malicious MCP input | The SDK owns protocol parsing; remote dispatch rejects unknown and excluded tools. Remote tools have read-only, non-destructive, closed-world annotations and strict schemas. |
 | Stale cache | The worker performs an immediate sync then a configured interval; failed sync preserves the last readable snapshot. `/readyz` reports database readiness, not freshness. Operators choose and monitor a suitable interval. |
