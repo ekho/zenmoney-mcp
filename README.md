@@ -43,6 +43,48 @@ Planning analytics are deliberately conservative:
 - recurring-payment detection is a historical heuristic and is labeled as such;
 - cash-flow forecasts are transparent scenarios, not prediction guarantees.
 
+## Financial Planning
+
+Phase 3 adds deterministic decision support on top of the factual analytics.
+Every result exposes inputs, assumptions, constraints, reasons, alternatives,
+and measurable outcomes; it does not execute or write a financial decision.
+
+| Question | Tool |
+|---|---|
+| How fast can I build a 6-month emergency fund? | `plan_emergency_fund` |
+| Should I pay the high-interest loan first? | `plan_debt_payoff`, `compare_debt_strategies` |
+| Can I afford a car in 18 months? | `plan_financial_goal` |
+| Which of my goals conflict? | `plan_multiple_goals` |
+| What happens if my income falls by 20%? | `run_financial_scenario` |
+| How should I allocate my monthly free cash flow? | `build_financial_plan` |
+
+Planning inputs that ZenMoney does not contain must be supplied explicitly:
+
+```json
+{
+  "emergency_fund": {
+    "target_months": 6,
+    "essential_category_ids": ["category-id"]
+  },
+  "debt_accounts": {
+    "loan-account-id": {
+      "apr_pct": 19.9,
+      "minimum_payment": 15000
+    }
+  },
+  "goals": []
+}
+```
+
+Missing APR, minimum payments, or essential-spending configuration returns
+`configuration_required`; the server never invents those values. Calculations
+use zero investment return, Decimal money arithmetic, and future calendar
+month-end snapshots. Restricted deposits are excluded from emergency reserves
+unless explicitly enabled, and credit capacity is always excluded.
+
+See [`docs/planning-semantics.md`](docs/planning-semantics.md) for the priority
+policy, formulas, rounding, data-quality labels, and limitations.
+
 ## Hardening in this fork
 
 The installed `zenmoney-mcp` command runs `zenmoney_mcp.entrypoint`, which keeps
