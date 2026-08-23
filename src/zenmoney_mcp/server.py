@@ -34,6 +34,15 @@ from .analytics import (
     suggest_category,
 )
 from .database import Database
+from .decision import (
+    build_financial_plan,
+    compare_debt_strategies,
+    plan_debt_payoff,
+    plan_emergency_fund,
+    plan_financial_goal,
+    plan_multiple_goals,
+    run_financial_scenario,
+)
 from .planning import (
     compare_periods,
     forecast_cash_flow,
@@ -254,6 +263,271 @@ def _planning_tools() -> list[Tool]:
                         "description": "Scenario horizon in days",
                     }
                 },
+            },
+        ),
+    ]
+
+
+_DEBT_ACCOUNTS_SCHEMA = {
+    "type": "object",
+    "maxProperties": 50,
+    "additionalProperties": {
+        "type": "object",
+        "properties": {
+            "apr_pct": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Nominal annual percentage rate; never inferred",
+            },
+            "minimum_payment": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Required monthly minimum payment",
+            },
+        },
+        "required": ["apr_pct", "minimum_payment"],
+        "additionalProperties": False,
+    },
+    "description": "Planning configuration keyed by ZenMoney debt account ID",
+}
+
+_GOAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "minLength": 1, "description": "Goal name"},
+        "target_amount": {"type": "number", "minimum": 0, "description": "Target amount"},
+        "current_amount": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0,
+            "description": "Amount already assigned to the goal",
+        },
+        "target_date": {
+            "type": "string",
+            "pattern": _DATE_PATTERN,
+            "description": "Deadline in YYYY-MM-DD format",
+        },
+        "priority": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Ascending numeric priority; 1 is highest",
+        },
+    },
+    "required": ["name", "target_amount", "target_date", "priority"],
+    "additionalProperties": False,
+}
+
+
+def _decision_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="plan_emergency_fund",
+            description="Plan deterministic month-end contributions to an explicitly configured emergency-fund target.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target_months": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "default": 6,
+                        "description": "Target months of essential spending",
+                    },
+                    "essential_category_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Explicit essential categories; descendants are included",
+                    },
+                    "monthly_essential_override": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Explicit monthly essential-spending amount",
+                    },
+                    "minimum_liquidity_buffer": {
+                        "type": "number",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Minimum own liquid funds to preserve",
+                    },
+                    "allocation_pct_of_free_cash_flow": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "default": 75,
+                        "description": "Percentage of non-negative trailing free cash flow allocated monthly",
+                    },
+                    "include_restricted_deposits": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Explicitly allow restricted deposits in eligible reserve",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="plan_debt_payoff",
+            description="Build a Decimal amortization schedule using minimum-only, avalanche, snowball, or explicit custom priority.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "monthly_extra_payment": {
+                        "type": "number",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Monthly amount above configured minimum payments",
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["minimum_only", "avalanche", "snowball", "custom"],
+                        "default": "avalanche",
+                        "description": "Debt payment priority strategy",
+                    },
+                    "debt_accounts": _DEBT_ACCOUNTS_SCHEMA,
+                    "custom_order": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 50,
+                        "uniqueItems": True,
+                        "description": "Every active debt account ID in custom priority order",
+                    },
+                },
+                "required": ["debt_accounts"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="compare_debt_strategies",
+            description="Compare minimum-only, snowball, and avalanche by payoff duration and total interest.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "monthly_extra_payment": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Monthly extra used by snowball and avalanche",
+                    },
+                    "debt_accounts": _DEBT_ACCOUNTS_SCHEMA,
+                },
+                "required": ["monthly_extra_payment", "debt_accounts"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="plan_financial_goal",
+            description="Solve one zero-return goal by deadline or by explicit monthly contribution.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "description": "Goal name"},
+                    "target_amount": {"type": "number", "minimum": 0, "description": "Target amount"},
+                    "current_amount": {"type": "number", "minimum": 0, "default": 0, "description": "Amount already funded"},
+                    "target_date": {"type": "string", "pattern": _DATE_PATTERN, "description": "Deadline mode date"},
+                    "monthly_contribution": {"type": "number", "minimum": 0, "description": "Contribution mode amount"},
+                    "priority": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium", "description": "Reported goal priority"},
+                    "annual_return_pct": {"type": "number", "const": 0, "default": 0, "description": "Phase 3 supports zero investment return only"},
+                },
+                "required": ["name", "target_amount"],
+                "oneOf": [
+                    {"required": ["target_date"], "not": {"required": ["monthly_contribution"]}},
+                    {"required": ["monthly_contribution"], "not": {"required": ["target_date"]}},
+                ],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="plan_multiple_goals",
+            description="Detect goal conflicts with stable greedy allocation by explicit numeric priority.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "monthly_available": {"type": "number", "minimum": 0, "description": "Monthly amount available across goals"},
+                    "goals": {"type": "array", "items": _GOAL_SCHEMA, "maxItems": 50, "description": "Configured goals"},
+                },
+                "required": ["monthly_available", "goals"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="run_financial_scenario",
+            description="Run a deterministic month-end cash, debt, goal, and net-worth scenario without Monte Carlo.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "horizon_months": {"type": "integer", "minimum": 1, "maximum": 120, "description": "Calendar-month horizon"},
+                    "scenario_name": {"type": "string", "enum": ["negative", "base", "positive"], "default": "base", "description": "Categorical label; changes remain explicit"},
+                    "minimum_liquidity_buffer": {"type": "number", "minimum": 0, "default": 0, "description": "Warning threshold"},
+                    "scenario": {
+                        "type": "object",
+                        "properties": {
+                            "income_change_pct": {"type": "number", "minimum": -100, "default": 0, "description": "Constant monthly income change"},
+                            "expense_change_pct": {"type": "number", "minimum": -100, "default": 0, "description": "Constant monthly expense change"},
+                            "one_time_expenses": {
+                                "type": "array",
+                                "maxItems": 120,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "month": {"type": "integer", "minimum": 1, "maximum": 120},
+                                        "amount": {"type": "number", "minimum": 0},
+                                    },
+                                    "required": ["month", "amount"],
+                                    "additionalProperties": False,
+                                },
+                                "description": "Explicit one-time costs by scenario month",
+                            },
+                            "monthly_extra_debt_payment": {"type": "number", "minimum": 0, "default": 0, "description": "Principal-only scenario reduction"},
+                            "goals": {
+                                "type": "array",
+                                "maxItems": 50,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string", "minLength": 1},
+                                        "target_amount": {"type": "number", "minimum": 0},
+                                        "current_amount": {"type": "number", "minimum": 0, "default": 0},
+                                        "monthly_contribution": {"type": "number", "minimum": 0},
+                                    },
+                                    "required": ["name", "target_amount", "monthly_contribution"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["horizon_months", "scenario"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="build_financial_plan",
+            description="Orchestrate Phase 2 facts and configured reserve, debt, and goals into one structured allocation plan.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "planning_horizon_months": {"type": "integer", "minimum": 1, "maximum": 120, "default": 24, "description": "Plan horizon"},
+                    "minimum_liquidity_buffer": {"type": "number", "minimum": 0, "default": 100000, "description": "Minimum liquid funds"},
+                    "emergency_fund": {
+                        "type": "object",
+                        "properties": {
+                            "target_months": {"type": "integer", "minimum": 1, "maximum": 60, "default": 6},
+                            "essential_category_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 100, "uniqueItems": True},
+                            "monthly_essential_override": {"type": "number", "minimum": 0},
+                            "include_restricted_deposits": {"type": "boolean", "default": False},
+                        },
+                        "additionalProperties": False,
+                        "description": "Explicit emergency-fund planning inputs",
+                    },
+                    "debt_accounts": _DEBT_ACCOUNTS_SCHEMA,
+                    "goals": {"type": "array", "items": _GOAL_SCHEMA, "maxItems": 50, "description": "Configured goals"},
+                },
+                "required": ["emergency_fund", "debt_accounts", "goals"],
+                "additionalProperties": False,
             },
         ),
     ]
@@ -661,7 +935,7 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
-    ] + _planning_tools()
+    ] + _planning_tools() + _decision_tools()
 
 
 @server.call_tool()
@@ -874,6 +1148,77 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     elif name == "forecast_cash_flow":
         result = forecast_cash_flow(
             db, horizon_days=arguments.get("horizon_days", 90)
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "plan_emergency_fund":
+        result = plan_emergency_fund(
+            db,
+            target_months=arguments.get("target_months", 6),
+            essential_category_ids=arguments.get("essential_category_ids"),
+            monthly_essential_override=arguments.get("monthly_essential_override"),
+            minimum_liquidity_buffer=arguments.get("minimum_liquidity_buffer", 0),
+            allocation_pct_of_free_cash_flow=arguments.get("allocation_pct_of_free_cash_flow", 75),
+            include_restricted_deposits=arguments.get("include_restricted_deposits", False),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "plan_debt_payoff":
+        result = plan_debt_payoff(
+            db,
+            monthly_extra_payment=arguments.get("monthly_extra_payment", 0),
+            strategy=arguments.get("strategy", "avalanche"),
+            debt_accounts=arguments.get("debt_accounts"),
+            custom_order=arguments.get("custom_order"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "compare_debt_strategies":
+        result = compare_debt_strategies(
+            db,
+            monthly_extra_payment=arguments.get("monthly_extra_payment"),
+            debt_accounts=arguments.get("debt_accounts"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "plan_financial_goal":
+        result = plan_financial_goal(
+            db,
+            name=arguments.get("name"),
+            target_amount=arguments.get("target_amount"),
+            current_amount=arguments.get("current_amount", 0),
+            target_date=arguments.get("target_date"),
+            monthly_contribution=arguments.get("monthly_contribution"),
+            priority=arguments.get("priority", "medium"),
+            annual_return_pct=arguments.get("annual_return_pct", 0),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "plan_multiple_goals":
+        result = plan_multiple_goals(
+            monthly_available=arguments.get("monthly_available"),
+            goals=arguments.get("goals"),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "run_financial_scenario":
+        result = run_financial_scenario(
+            db,
+            horizon_months=arguments.get("horizon_months"),
+            scenario=arguments.get("scenario"),
+            scenario_name=arguments.get("scenario_name", "base"),
+            minimum_liquidity_buffer=arguments.get("minimum_liquidity_buffer", 0),
+        )
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "build_financial_plan":
+        result = build_financial_plan(
+            db,
+            planning_horizon_months=arguments.get("planning_horizon_months", 24),
+            minimum_liquidity_buffer=arguments.get("minimum_liquidity_buffer", 100_000),
+            emergency_fund=arguments.get("emergency_fund"),
+            debt_accounts=arguments.get("debt_accounts"),
+            goals=arguments.get("goals"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
