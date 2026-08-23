@@ -116,22 +116,34 @@ docker compose --env-file deploy/remote-mcp/.env \
 ```
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
-database. Keep backups outside the Compose project and restrict the host
-directory before mounting it into the backup command:
+database. Keep backups outside the Compose project. This uses the already
+running `zenmoney-sync` container, then copies the completed temporary volume
+file to a host-owned temporary file before atomically publishing it:
 
 ```bash
+set -e
 BACKUP_DIR=/absolute/path/to/zenmoney-backups
 BACKUP_NAME="zenmoney-$(date +%Y%m%d-%H%M%S).db"
-HOST_UID=$(id -u)
-HOST_GID=$(id -g)
+VOLUME_BACKUP="/data/.${BACKUP_NAME}.$$"
+HOST_TMP="$BACKUP_DIR/.${BACKUP_NAME}.tmp"
 install -d -m 700 "$BACKUP_DIR"
+cleanup() {
+  rm -f "$HOST_TMP" || true
+  docker compose --env-file deploy/remote-mcp/.env \
+    -f deploy/remote-mcp/compose.yaml exec -T zenmoney-sync \
+    /bin/rm -f "$VOLUME_BACKUP" || true
+}
+trap cleanup EXIT
 docker compose --env-file deploy/remote-mcp/.env \
-  -f deploy/remote-mcp/compose.yaml run --rm --no-deps \
-  --user 0:0 \
-  --volume "$BACKUP_DIR:/backup:rw" \
-  --env BACKUP_NAME --env HOST_UID --env HOST_GID \
-  --entrypoint /bin/sh zenmoney-sync -ec \
-  'zenmoney-db-backup "/backup/$BACKUP_NAME" --source /data/zenmoney.db && chown "$HOST_UID:$HOST_GID" "/backup/$BACKUP_NAME" && chmod 600 "/backup/$BACKUP_NAME"'
+  -f deploy/remote-mcp/compose.yaml exec -T zenmoney-sync \
+  zenmoney-db-backup "$VOLUME_BACKUP" --source /data/zenmoney.db
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml cp \
+  "zenmoney-sync:$VOLUME_BACKUP" "$HOST_TMP"
+chmod 600 "$HOST_TMP"
+mv "$HOST_TMP" "$BACKUP_DIR/$BACKUP_NAME"
+trap - EXIT
+cleanup
 ```
 
 Restore is offline. Set `BACKUP` to the absolute path created above, stop all
