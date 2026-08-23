@@ -96,7 +96,8 @@ Exact final payments are capped at the remaining amount due. If payment does not
 exceed interest and no account makes positive principal progress, the result
 reports `negative_amortization` and no payoff date. Strategy comparison names
 separate winners for lowest interest and shortest duration; it never declares a
-strategy universally best.
+strategy universally best. Schedules stop after 120 months and report
+`payoff_horizon_exceeded` instead of returning an unbounded payload.
 
 ## Goals
 

@@ -11,7 +11,7 @@ from ..validation import InputValidationError
 from .models import HUNDRED, decimal_number, money, month_end_after, number
 
 STRATEGIES = {"minimum_only", "avalanche", "snowball", "custom"}
-MAX_PAYOFF_MONTHS = 1200
+MAX_PAYOFF_MONTHS = 120
 
 
 def _configuration(

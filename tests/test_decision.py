@@ -298,6 +298,22 @@ def test_debt_payoff_reports_negative_amortization(decision_db):
     assert result["schedule"][0]["accounts"][0]["ending_balance"] == 1050
 
 
+def test_debt_payoff_stops_at_120_month_planning_horizon(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=-1000 WHERE id='loan'")
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={"loan": {"apr_pct": 0, "minimum_payment": 1}},
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result["estimated_payoff_months"] is None
+    assert len(result["schedule"]) == 120
+    assert result["schedule"][-1]["ending_debt"] == 880
+    assert "payoff_horizon_exceeded" in result["warnings"]
+
+
 def test_debt_payoff_returns_configuration_required_for_missing_apr(decision_db):
     result = plan_debt_payoff(
         decision_db,
