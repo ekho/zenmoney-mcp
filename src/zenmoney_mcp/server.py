@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
+from mcp.shared.exceptions import MCPError
 from mcp_types import (
     CallToolResult,
+    INVALID_PARAMS,
     ListResourcesResult,
     ListToolsResult,
     ReadResourceResult,
@@ -15,6 +17,7 @@ from mcp_types import (
     TextContent,
     TextResourceContents,
     Tool,
+    ToolAnnotations,
 )
 
 from . import __version__
@@ -74,6 +77,8 @@ _db: HardenedDatabase | None = None
 _sync_engine: HardenedSyncEngine | None = None
 
 configure_legacy_analytics(legacy_analytics)
+
+REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
 
 
 def get_database_path() -> Path:
@@ -615,7 +620,7 @@ def _decision_tools() -> list[Tool]:
 
 async def list_tools(remote: bool = False) -> list[Tool]:
     """List available tools."""
-    return harden_tool_schemas([
+    tools = harden_tool_schemas([
         Tool(
             name="sync_data",
             description="Sync data with ZenMoney. Use to refresh data before analysis.",
@@ -1016,18 +1021,27 @@ async def list_tools(remote: bool = False) -> list[Tool]:
             },
         ),
     ] + _planning_tools() + _decision_tools())
+    if not remote:
+        return tools
+    annotations = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        openWorldHint=False,
+    )
+    return [
+        tool.model_copy(update={"annotations": annotations})
+        for tool in tools
+        if tool.name not in REMOTE_EXCLUDED_TOOLS
+    ]
 
 
-async def call_tool(
+async def _dispatch_tool(
     name: str,
     arguments: dict[str, Any],
     *,
-    db: HardenedDatabase | None = None,
-    remote: bool = False,
+    db: HardenedDatabase,
 ) -> list[TextContent]:
     """Handle tool calls."""
-    db = db or get_db()
-
     if name == "sync_data":
         engine = get_sync_engine()
         force_full = arguments.get("force_full", False)
@@ -1311,6 +1325,32 @@ async def call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
+async def call_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase | None = None,
+    remote: bool = False,
+    db_path: str | Path | None = None,
+) -> list[TextContent]:
+    """Dispatch a tool with the appropriate local or remote database lifecycle."""
+    if remote and name not in {tool.name for tool in await list_tools(remote=True)}:
+        raise MCPError(INVALID_PARAMS, "Remote tool is unavailable")
+
+    owned_db = remote and db is None
+    if db is None:
+        if remote and db_path is not None:
+            db = HardenedDatabase(db_path, read_only=True)
+        else:
+            db = open_remote_db() if remote else get_db()
+
+    try:
+        return await _dispatch_tool(name, arguments, db=db)
+    finally:
+        if owned_db:
+            db.close()
+
+
 # ============================================================================
 # Resources
 # ============================================================================
@@ -1363,12 +1403,10 @@ async def list_resources() -> list[Resource]:
     ]
 
 
-async def read_resource(
-    uri: str, *, db: HardenedDatabase | None = None
+async def _dispatch_resource(
+    uri: str, *, db: HardenedDatabase
 ) -> str:
     """Read resource content."""
-    db = db or get_db()
-
     if uri == "zenmoney://accounts":
         result = get_accounts_resource(db)
     elif uri == "zenmoney://categories":
@@ -1389,11 +1427,39 @@ async def read_resource(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+async def read_resource(
+    uri: str,
+    *,
+    db: HardenedDatabase | None = None,
+    remote: bool = False,
+    db_path: str | Path | None = None,
+) -> str:
+    """Read a resource with the appropriate local or remote database lifecycle."""
+    uri = str(uri)
+    if remote and uri not in {str(resource.uri) for resource in await list_resources()}:
+        raise ValueError(f"Unknown remote resource: {uri}")
+
+    owned_db = remote and db is None
+    if db is None:
+        if remote and db_path is not None:
+            db = HardenedDatabase(db_path, read_only=True)
+        else:
+            db = open_remote_db() if remote else get_db()
+
+    try:
+        return await _dispatch_resource(uri, db=db)
+    finally:
+        if owned_db:
+            db.close()
+
+
 # ============================================================================
 # Main
 # ============================================================================
 
-def create_server(*, remote: bool = False) -> Server:
+def create_server(
+    *, remote: bool = False, db_path: str | Path | None = None
+) -> Server:
     """Create an MCP SDK v2 server backed by the shared registry."""
 
     async def _on_list_tools(context, params):
@@ -1404,6 +1470,7 @@ def create_server(*, remote: bool = False) -> Server:
             params.name,
             dict(params.arguments or {}),
             remote=remote,
+            db_path=db_path,
         )
         return CallToolResult(content=content)
 
@@ -1416,7 +1483,11 @@ def create_server(*, remote: bool = False) -> Server:
                 TextResourceContents(
                     uri=params.uri,
                     mime_type="application/json",
-                    text=await read_resource(params.uri),
+                    text=await read_resource(
+                        params.uri,
+                        remote=remote,
+                        db_path=db_path,
+                    ),
                 )
             ]
         )
