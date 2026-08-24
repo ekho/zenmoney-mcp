@@ -130,18 +130,16 @@ More detail is available in
 
 ## Installation
 
-```bash
-git clone https://github.com/ekho/zenmoney-mcp.git ~/zenmoney-mcp
-cd ~/zenmoney-mcp
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-```
-
-Set the token in the process environment rather than committing it:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
+the server directly from GitHub:
 
 ```bash
 export ZENMONEY_TOKEN="replace-with-your-token"
+uvx --from git+https://github.com/ekho/zenmoney-mcp.git zenmoney-mcp
 ```
+
+`uvx` downloads the package into an isolated cached environment; cloning the
+repository or creating a virtual environment is not required.
 
 The first hardened start performs additive SQLite migrations. Back up
 `~/.cache/zenmoney-mcp/zenmoney.db` before the first run when preserving an
@@ -149,11 +147,12 @@ existing cache matters. A full sync can recreate the cache from ZenMoney.
 
 ## ChatGPT Desktop and Codex
 
-Use the absolute executable path in `~/.codex/config.toml`:
+Add the server to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.zenmoney]
-command = "/Users/you/zenmoney-mcp/.venv/bin/zenmoney-mcp"
+command = "uvx"
+args = ["--from", "git+https://github.com/ekho/zenmoney-mcp.git", "zenmoney-mcp"]
 env_vars = ["ZENMONEY_TOKEN"]
 tool_timeout_sec = 120
 ```
@@ -168,13 +167,28 @@ use the private remote Streamable HTTP + Secure MCP Tunnel deployment in the
 {
   "mcpServers": {
     "zenmoney": {
-      "command": "/Users/you/zenmoney-mcp/.venv/bin/zenmoney-mcp",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/ekho/zenmoney-mcp.git",
+        "zenmoney-mcp"
+      ],
       "env": {
         "ZENMONEY_TOKEN": "replace-with-your-token"
       }
     }
   }
 }
+```
+
+## Development
+
+Clone the repository only when changing or testing the code locally:
+
+```bash
+git clone https://github.com/ekho/zenmoney-mcp.git ~/zenmoney-mcp
+cd ~/zenmoney-mcp
+uv sync --extra dev
 ```
 
 ## Data flow
@@ -187,9 +201,9 @@ use the private remote Streamable HTTP + Secure MCP Tunnel deployment in the
 ## Testing
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m compileall -q src tests
-python -m pytest tests/ -v --ignore=tests/test_integration.py
+uv sync --extra dev
+uv run python -m compileall -q src tests
+uv run python -m pytest tests/ -v --ignore=tests/test_integration.py
 ```
 
 The live integration test requires `ZENMONEY_TOKEN` and is excluded from CI.
