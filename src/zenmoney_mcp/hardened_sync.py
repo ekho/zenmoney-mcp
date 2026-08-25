@@ -130,6 +130,11 @@ class HardenedSyncEngine:
         last_sync_time: int | None = None,
     ) -> dict[str, Any]:
         validated = self._validate_diff(diff_data)
+        if force_full and any(
+            not isinstance(validated.get(entity), list)
+            for entity in ENTITY_MAPPING
+        ):
+            raise SyncError("full sync response is missing entity arrays")
         if not force_full and any(
             deletion.get("object") == "budget"
             for deletion in validated.get("deletion") or []

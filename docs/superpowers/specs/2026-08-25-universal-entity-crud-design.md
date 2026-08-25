@@ -214,6 +214,9 @@ Incremental sync merges an incoming partial object over the prior raw object,
 then writes both normalized columns and canonical compact JSON. Unknown fields
 survive. Full sync builds `entity_raw` from the full response and marks
 `user_entity_raw_complete=1` only after atomic snapshot publication succeeds.
+Every mapped system and user entity array must be present in a full response;
+a missing or null array rejects the response before replacing the cache or
+enabling mutations.
 
 The existing transaction `raw_json` column is migrated into `entity_raw` when
 present and retained as an unused compatibility column. New mutation code reads

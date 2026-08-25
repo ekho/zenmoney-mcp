@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from zenmoney_mcp.hardened_database import HardenedDatabase
-from zenmoney_mcp.hardened_sync import HardenedSyncEngine, SyncError
+from zenmoney_mcp.hardened_sync import ENTITY_MAPPING, HardenedSyncEngine, SyncError
 
 
 def base_db():
@@ -16,12 +16,14 @@ def base_db():
 
 
 def full_snapshot():
-    return {
+    snapshot = {
         'serverTimestamp':20,
+        **{entity: [] for entity in ENTITY_MAPPING},
         'instrument':[{'id':1,'title':'RUB','shortTitle':'RUB','symbol':'₽','rate':1,'changed':2}],
         'user':[{'id':1,'login':'u','currency':1,'parent':None,'changed':2}],
         'account':[{'id':'fresh','title':'Fresh','type':'checking','instrument':1,'balance':20,'user':1,'changed':2}],
     }
+    return snapshot
 
 
 def test_force_full_replaces_cache_instead_of_leaving_stale_rows():
@@ -49,6 +51,22 @@ def test_only_full_sync_enables_user_entity_mutations():
 
     engine.apply_diff_data(full_snapshot(), force_full=True)
     assert db.user_entity_mutations_ready() is True
+
+
+def test_incomplete_full_response_does_not_enable_mutations_or_replace_cache():
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+    partial = full_snapshot()
+    partial.pop("reminderMarker")
+
+    with pytest.raises(SyncError, match="full sync response"):
+        engine.apply_diff_data(partial, force_full=True)
+
+    assert db.user_entity_mutations_ready() is False
+    assert db.get_server_timestamp() == 10
+    assert [row["id"] for row in db.connect().execute("SELECT id FROM accounts")] == [
+        "stale"
+    ]
 
 
 def test_missing_timestamp_does_not_mutate_original_cache():
