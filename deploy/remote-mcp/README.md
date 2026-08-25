@@ -29,15 +29,21 @@ Run from the repository root. `.env` contains identifiers only and must never
 contain the ZenMoney token. Both credentials use ignored file-backed Compose
 secrets and are mounted into separate roles. Compose file-source remapping is
 not implemented: service-level secret `uid`, `gid`, and `mode` settings do not
-change the bind-mounted source. The ZenMoney source file itself must therefore
-be owned by numeric UID/GID `10001:10001` with mode `0400` before startup.
+change the bind-mounted source. The source files must therefore be provisioned
+for their runtime roles before startup: the control-plane key as `0:0` and the
+ZenMoney token as `10001:10001`, both with mode `0400`.
 
 ```bash
 cp deploy/remote-mcp/.env.example deploy/remote-mcp/.env
 mkdir -p deploy/remote-mcp/secrets
-printf '%s' "$CONTROL_PLANE_API_KEY" > deploy/remote-mcp/secrets/control-plane-api-key
-chmod 600 deploy/remote-mcp/secrets/control-plane-api-key
 umask 077
+CONTROL_PLANE_API_KEY_TMP="$(mktemp)"
+trap 'rm -f "$CONTROL_PLANE_API_KEY_TMP"' EXIT
+printf '%s' "$CONTROL_PLANE_API_KEY" > "$CONTROL_PLANE_API_KEY_TMP"
+sudo install -o 0 -g 0 -m 0400 "$CONTROL_PLANE_API_KEY_TMP" \
+  deploy/remote-mcp/secrets/control-plane-api-key
+rm -f "$CONTROL_PLANE_API_KEY_TMP"
+trap - EXIT
 ZENMONEY_TOKEN_TMP="$(mktemp)"
 trap 'rm -f "$ZENMONEY_TOKEN_TMP"' EXIT
 printf 'ZenMoney token: '
