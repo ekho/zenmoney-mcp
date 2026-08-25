@@ -39,10 +39,26 @@ def test_compose_keeps_mcp_private_and_separates_credentials():
     config = _compose_config()
     services = config["services"]
     networks = config["networks"]
+    volumes = config["volumes"]
 
     assert set(services) == {"zenmoney-mcp", "zenmoney-sync", "tunnel-client"}
     assert "ports" not in services["zenmoney-mcp"]
-    assert services["zenmoney-mcp"]["volumes"][0]["read_only"] is True
+    mcp_mounts = {
+        mount["target"]: mount for mount in services["zenmoney-mcp"]["volumes"]
+    }
+    sync_mounts = {
+        mount["target"]: mount for mount in services["zenmoney-sync"]["volumes"]
+    }
+    tunnel_mounts = {
+        mount["target"] for mount in services["tunnel-client"].get("volumes", [])
+    }
+    assert mcp_mounts["/data"]["read_only"] is True
+    assert mcp_mounts["/sync-control"].get("read_only", False) is False
+    assert sync_mounts["/sync-control"].get("read_only", False) is False
+    assert mcp_mounts["/sync-control"]["source"] == "zenmoney-sync-control"
+    assert sync_mounts["/sync-control"]["source"] == "zenmoney-sync-control"
+    assert "/sync-control" not in tunnel_mounts
+    assert set(volumes) == {"zenmoney-data", "zenmoney-sync-control"}
     assert services["zenmoney-mcp"]["networks"] == {"mcp_internal": None}
     assert services["zenmoney-sync"]["networks"] == {"egress": None}
     assert set(services["tunnel-client"]["networks"]) == {"mcp_internal", "egress"}
@@ -123,4 +139,5 @@ def test_operations_and_ci_cover_sensitive_backups_pin_updates_and_runtime_smoke
     assert "os.getuid() == 10001" in workflow
     assert "read_secret('ZENMONEY_TOKEN')" in workflow
     assert "docker compose" in workflow and "up -d --no-deps zenmoney-mcp" in workflow
-    assert 'mount["RW"] is False' in workflow
+    assert 'mounts["/data"]["RW"] is False' in workflow
+    assert 'mounts["/sync-control"]["RW"] is True' in workflow

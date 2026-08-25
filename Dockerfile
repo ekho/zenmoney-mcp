@@ -18,7 +18,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
 WORKDIR /app
 RUN groupadd --gid 10001 zenmoney \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin zenmoney \
-    && install -d -o 10001 -g 10001 /data
+    && install -d -o 10001 -g 10001 /data /sync-control
 COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 USER 10001:10001
 EXPOSE 8000

@@ -1,4 +1,4 @@
-"""Streamable HTTP tests for the remote read-only MCP surface."""
+"""Streamable HTTP tests for the private remote MCP surface."""
 
 from __future__ import annotations
 
@@ -61,10 +61,11 @@ async def _mcp_client(app):
 
 
 @pytest.mark.asyncio
-async def test_remote_mcp_exposes_only_annotated_read_only_surface(tmp_path):
+async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     path = tmp_path / "snapshot.db"
+    control_path = tmp_path / "sync-state.json"
     _write_snapshot(path, 100)
-    app = create_app(path)
+    app = create_app(path, control_path)
 
     async with _mcp_client(app) as client:
         initialized = await client.initialize()
@@ -73,17 +74,130 @@ async def test_remote_mcp_exposes_only_annotated_read_only_surface(tmp_path):
         result = await client.call_tool("get_net_worth", {})
 
     names = {tool.name for tool in tools}
+    tools_by_name = {tool.name: tool for tool in tools}
     assert initialized.server_info.name == "zenmoney-mcp"
     assert "get_net_worth" in names
+    assert {"force_sync", "get_sync_status"} <= names
     assert not ({"sync_data", "suggest_category"} & names)
     assert {str(resource.uri) for resource in resources} >= {
         "zenmoney://accounts",
         "zenmoney://sync-status",
     }
-    assert all(tool.annotations.read_only_hint is True for tool in tools)
+    assert tools_by_name["force_sync"].annotations.read_only_hint is False
+    assert tools_by_name["force_sync"].annotations.open_world_hint is True
+    assert tools_by_name["get_sync_status"].annotations.read_only_hint is True
+    assert all(
+        tool.annotations.read_only_hint is True
+        for tool in tools
+        if tool.name != "force_sync"
+    )
     assert all(tool.annotations.destructive_hint is False for tool in tools)
-    assert all(tool.annotations.open_world_hint is False for tool in tools)
+    assert all(
+        tool.annotations.open_world_hint is False
+        for tool in tools
+        if tool.name != "force_sync"
+    )
     assert json.loads(result.content[0].text)["net_worth"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_remote_force_sync_and_status_work_before_first_snapshot(tmp_path):
+    control_path = tmp_path / "sync-state.json"
+    app = create_app(tmp_path / "missing.db", control_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        requested = await client.call_tool("force_sync", {"force_full": True})
+        status = await client.call_tool("get_sync_status", {})
+
+    requested_payload = json.loads(requested.content[0].text)
+    status_payload = json.loads(status.content[0].text)
+    assert requested_payload["status"] == "accepted"
+    assert requested_payload["mode"] == "full"
+    assert status_payload["state"] == "pending"
+    assert status_payload["request_id"] == requested_payload["request_id"]
+    assert status_payload["last_sync_time"] is None
+    assert status_payload["staleness"] == "never_synced"
+    assert status_payload["cache_stats"] == {}
+
+
+@pytest.mark.asyncio
+async def test_remote_sync_status_combines_control_and_snapshot_metadata(tmp_path):
+    path = tmp_path / "snapshot.db"
+    control_path = tmp_path / "sync-state.json"
+    _write_snapshot(path, 321)
+    database = HardenedDatabase(path)
+    database.set_meta("last_sync_time", "1")
+    database.close()
+    app = create_app(path, control_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        status = await client.call_tool("get_sync_status", {})
+
+    payload = json.loads(status.content[0].text)
+    assert payload["state"] == "idle"
+    assert payload["last_server_timestamp"] == 321
+    assert payload["last_sync_time"] is not None
+    assert payload["cache_stats"]["accounts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_sync_control_rejects_invalid_state_without_echo(tmp_path):
+    control_path = tmp_path / "sync-state.json"
+    sentinel = "sensitive-control-content"
+    control_path.write_text(sentinel, encoding="utf-8")
+    app = create_app(tmp_path / "missing.db", control_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        status = await client.call_tool("get_sync_status", {})
+        requested = await client.call_tool("force_sync", {})
+
+    assert json.loads(status.content[0].text) == {
+        "state": "failed",
+        "request_id": None,
+        "mode": None,
+        "requested_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "failure_code": "invalid_sync_state",
+        "last_server_timestamp": 0,
+        "last_sync_time": None,
+        "cache_stats": {},
+        "staleness": "never_synced",
+    }
+    assert json.loads(requested.content[0].text) == {
+        "status": "rejected",
+        "failure_code": "invalid_sync_state",
+    }
+    assert sentinel not in status.content[0].text
+    assert sentinel not in requested.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("force_sync", {"extra": 1}),
+        ("force_sync", {"force_full": "yes"}),
+        ("get_sync_status", {"extra": 1}),
+    ],
+)
+async def test_remote_sync_tools_reject_arguments_outside_their_schema(
+    tmp_path, name, arguments
+):
+    control_path = tmp_path / "sync-state.json"
+    app = create_app(tmp_path / "missing.db", control_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        with pytest.raises(MCPError) as error:
+            await client.call_tool(name, arguments)
+
+    assert error.value.code == INVALID_PARAMS
+    assert error.value.message == "Invalid tool arguments"
+    assert not control_path.exists()
 
 
 @pytest.mark.asyncio
