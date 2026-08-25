@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "zenmoney-mcp"
 version = "0.2.0"
-description = "Read-only MCP server for trustworthy personal finance analytics over ZenMoney API"
+description = "MCP server for trustworthy ZenMoney analytics and confirmed transaction changes"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

@@ -2,7 +2,8 @@
 
 ## What is this
 
-Read-only MCP server for personal finance analytics over ZenMoney API.
+MCP server for personal finance analytics and confirmed transaction changes
+over ZenMoney API.
 
 ## Tech stack
 

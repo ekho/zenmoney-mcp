@@ -97,6 +97,10 @@ class ProposalStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
+            for candidate in (self.path, f"{self.path}-wal", f"{self.path}-shm"):
+                path = Path(candidate)
+                if path.exists():
+                    path.chmod(0o600)
         return self._conn
 
     def _init_schema(self) -> None:
@@ -510,6 +514,8 @@ def validate_transaction_patch(
     ):
         value = result.get(field)
         if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise MutationValidationError(f"{field} must be a number")
             _number(abs(value), field)
             if value < minimum or value > maximum:
                 raise MutationValidationError(f"{field} is out of range")

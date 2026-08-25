@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-import os
+from pathlib import Path
 
 import pytest
 
@@ -159,6 +159,7 @@ def test_prepare_rejects_duplicate_ids_and_forbidden_fields(financial_db, tmp_pa
         ({"incomeInstrument": 999}, "instrument"),
         ({"opIncome": 10, "opIncomeInstrument": None}, "paired"),
         ({"latitude": 91}, "latitude"),
+        ({"latitude": True}, "latitude"),
     ],
 )
 def test_prepare_rejects_invalid_transaction_results(
@@ -243,7 +244,17 @@ def test_store_recovers_running_and_removes_old_terminal_rows(financial_db, tmp_
 
     store.cleanup(now=4 + 30 * 24 * 60 * 60 + 1)
     assert store.get(prepared["proposal_id"], now=4 + 30 * 24 * 60 * 60 + 1) is None
-    assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+def test_store_protects_database_and_wal_files(tmp_path):
+    path = tmp_path / "private" / "proposals.db"
+    store = ProposalStore(path)
+
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        assert candidate.stat().st_mode & 0o777 == 0o600
+
+    store.close()
 
 
 class SuccessfulEngine:
