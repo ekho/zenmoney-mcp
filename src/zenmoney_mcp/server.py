@@ -78,6 +78,14 @@ from .sync_control import (
     read_sync_state,
     request_sync,
 )
+from .transaction_mutations import (
+    MutationStateError,
+    MutationValidationError,
+    ProposalStore,
+    execute_transaction_proposal,
+    get_transaction_change_proposal,
+    prepare_transaction_changes,
+)
 
 
 # Global state
@@ -88,6 +96,13 @@ configure_legacy_analytics(legacy_analytics)
 
 REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
 REMOTE_CONTROL_TOOLS = frozenset({"force_sync", "get_sync_status"})
+MUTATION_TOOLS = frozenset(
+    {
+        "prepare_transaction_changes",
+        "get_transaction_change_proposal",
+        "apply_transaction_changes",
+    }
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -97,6 +112,11 @@ def get_database_path() -> Path:
     if configured_path:
         return Path(configured_path)
     return Path.home() / ".cache" / "zenmoney-mcp" / "zenmoney.db"
+
+
+def get_mutation_path() -> Path:
+    """Return the local persistent transaction proposal path."""
+    return get_database_path().with_name("mutation-proposals.db")
 
 
 def get_db() -> HardenedDatabase:
@@ -628,6 +648,98 @@ def _decision_tools() -> list[Tool]:
         ),
     ]
 
+
+def _mutation_tools() -> list[Tool]:
+    nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    nullable_number = {"anyOf": [{"type": "number"}, {"type": "null"}]}
+    nullable_integer = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    patch_schema = {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+            "date": {"type": "string", "pattern": _DATE_PATTERN},
+            "income": {"type": "number", "minimum": 0},
+            "outcome": {"type": "number", "minimum": 0},
+            "incomeAccount": {"type": "string", "minLength": 1},
+            "outcomeAccount": {"type": "string", "minLength": 1},
+            "incomeInstrument": {"type": "integer"},
+            "outcomeInstrument": {"type": "integer"},
+            "tag": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": True,
+            },
+            "merchant": nullable_string,
+            "payee": nullable_string,
+            "comment": nullable_string,
+            "opIncome": nullable_number,
+            "opOutcome": nullable_number,
+            "opIncomeInstrument": nullable_integer,
+            "opOutcomeInstrument": nullable_integer,
+            "latitude": nullable_number,
+            "longitude": nullable_number,
+            "deleted": {"type": "boolean", "const": True},
+        },
+        "additionalProperties": False,
+    }
+    proposal_schema = {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string", "format": "uuid"},
+        },
+        "required": ["proposal_id"],
+        "additionalProperties": False,
+    }
+    return [
+        Tool(
+            name="prepare_transaction_changes",
+            description="Prepare an immutable transaction change batch for review; does not write to ZenMoney.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "transaction_id": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                                "set": patch_schema,
+                            },
+                            "required": ["transaction_id", "set"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["changes"],
+                "additionalProperties": False,
+            },
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, openWorldHint=False
+            ),
+        ),
+        Tool(
+            name="get_transaction_change_proposal",
+            description="Read a prepared or executed transaction change proposal by ID.",
+            inputSchema=proposal_schema,
+            annotations=ToolAnnotations(
+                readOnlyHint=True, destructiveHint=False, openWorldHint=False
+            ),
+        ),
+        Tool(
+            name="apply_transaction_changes",
+            description="Apply the exact previously reviewed transaction change proposal.",
+            inputSchema=proposal_schema,
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=True, openWorldHint=True
+            ),
+        ),
+    ]
+
 async def list_tools(remote: bool = False) -> list[Tool]:
     """List available tools."""
     tools = harden_tool_schemas([
@@ -1030,7 +1142,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                 },
             },
         ),
-    ] + _planning_tools() + _decision_tools())
+    ] + _planning_tools() + _decision_tools() + _mutation_tools())
     if not remote:
         return tools
     tools = [
@@ -1065,9 +1177,15 @@ async def list_tools(remote: bool = False) -> list[Tool]:
         tool.model_copy(
             update={
                 "annotations": ToolAnnotations(
-                    readOnlyHint=tool.name != "force_sync",
-                    destructiveHint=False,
-                    openWorldHint=tool.name == "force_sync",
+                    readOnlyHint=tool.name
+                    not in {
+                        "force_sync",
+                        "prepare_transaction_changes",
+                        "apply_transaction_changes",
+                    },
+                    destructiveHint=tool.name == "apply_transaction_changes",
+                    openWorldHint=tool.name
+                    in {"force_sync", "apply_transaction_changes"},
                 )
             }
         )
@@ -1164,6 +1282,51 @@ def _dispatch_remote_control_tool(
         if owned_db:
             status_db.close()
     return _text_result({**state, **cache_status})
+
+
+async def _dispatch_mutation_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase,
+    remote: bool,
+    mutation_path: Path,
+) -> list[TextContent]:
+    store = ProposalStore(mutation_path)
+    try:
+        if name == "prepare_transaction_changes":
+            if set(arguments) != {"changes"}:
+                raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+            try:
+                result = prepare_transaction_changes(db, store, arguments["changes"])
+            except MutationStateError:
+                result = {"status": "rejected", "failure_code": "mutation_not_ready"}
+            except MutationValidationError:
+                result = {
+                    "status": "rejected",
+                    "failure_code": "invalid_transaction_change",
+                }
+            return _text_result(result)
+
+        if set(arguments) != {"proposal_id"} or not isinstance(
+            arguments.get("proposal_id"), str
+        ):
+            raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+        proposal_id = arguments["proposal_id"]
+        try:
+            if name == "get_transaction_change_proposal":
+                result = get_transaction_change_proposal(store, proposal_id)
+            elif remote:
+                result = store.request_apply(proposal_id)
+            else:
+                result = await execute_transaction_proposal(
+                    db, get_sync_engine(), store, proposal_id
+                )
+        except MutationStateError:
+            result = {"status": "rejected", "failure_code": "proposal_not_found"}
+        return _text_result(result)
+    finally:
+        store.close()
 
 
 async def _dispatch_tool(
@@ -1464,6 +1627,7 @@ async def call_tool(
     remote: bool = False,
     db_path: str | Path | None = None,
     control_path: str | Path | None = None,
+    mutation_path: str | Path | None = None,
 ) -> list[TextContent]:
     """Dispatch a tool with the appropriate local or remote database lifecycle."""
     if remote and name not in {tool.name for tool in await list_tools(remote=True)}:
@@ -1488,6 +1652,28 @@ async def call_tool(
             db = open_remote_db() if remote else get_db()
 
     try:
+        if name in MUTATION_TOOLS:
+            if mutation_path is None:
+                if remote:
+                    sync_path = (
+                        Path(control_path)
+                        if control_path is not None
+                        else DEFAULT_CONTROL_PATH
+                    )
+                    resolved_mutation_path = sync_path.with_name(
+                        "mutation-proposals.db"
+                    )
+                else:
+                    resolved_mutation_path = get_mutation_path()
+            else:
+                resolved_mutation_path = Path(mutation_path)
+            return await _dispatch_mutation_tool(
+                name,
+                arguments,
+                db=db,
+                remote=remote,
+                mutation_path=resolved_mutation_path,
+            )
         return await _dispatch_tool(name, arguments, db=db)
     finally:
         if owned_db:
@@ -1605,6 +1791,7 @@ def create_server(
     remote: bool = False,
     db_path: str | Path | None = None,
     control_path: str | Path | None = None,
+    mutation_path: str | Path | None = None,
 ) -> Server:
     """Create an MCP SDK v2 server backed by the shared registry."""
 
@@ -1619,6 +1806,7 @@ def create_server(
                 remote=remote,
                 db_path=db_path,
                 control_path=control_path,
+                mutation_path=mutation_path,
             )
         except MCPError:
             raise
