@@ -179,6 +179,38 @@ class HardenedSyncEngine:
         }
         timeout = 300.0 if force_full else 60.0
         attempts = 2 if force_full else 1
+        payload = await self._post_diff(request_body, timeout, attempts)
+
+        result = self.apply_diff_data(
+            payload,
+            force_full=force_full,
+            last_sync_time=int(time.time()),
+        )
+        result["sync_duration_ms"] = int((time.time() - started) * 1000)
+        return result
+
+    async def push_transactions(
+        self, transactions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Send complete changed transactions through the diff endpoint."""
+        if not transactions:
+            raise SyncError("transaction write batch must not be empty")
+        request_body = {
+            "currentClientTimestamp": int(time.time()),
+            "serverTimestamp": self.db.get_server_timestamp(),
+            "transaction": transactions,
+        }
+        payload = await self._post_diff(request_body, 60.0, 1)
+        return self.apply_diff_data(
+            payload, force_full=False, last_sync_time=int(time.time())
+        )
+
+    async def _post_diff(
+        self,
+        request_body: dict[str, Any],
+        timeout: float,
+        attempts: int,
+    ) -> dict[str, Any]:
         response: httpx.Response | None = None
 
         async with httpx.AsyncClient() as client:
@@ -209,14 +241,7 @@ class HardenedSyncEngine:
             payload = response.json()
         except ValueError as exc:
             raise SyncError(f"ZenMoney API returned invalid JSON: {exc}") from exc
-
-        result = self.apply_diff_data(
-            payload,
-            force_full=force_full,
-            last_sync_time=int(time.time()),
-        )
-        result["sync_duration_ms"] = int((time.time() - started) * 1000)
-        return result
+        return payload
 
 
 SyncEngine = HardenedSyncEngine

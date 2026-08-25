@@ -570,3 +570,108 @@ def get_transaction_change_proposal(
     if proposal is None:
         raise MutationStateError("proposal not found")
     return proposal
+
+
+async def execute_transaction_proposal(
+    db: HardenedDatabase,
+    engine: Any,
+    store: ProposalStore,
+    proposal_id: str,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Execute one exact confirmed proposal or return its current state."""
+    timestamp = _now(now)
+    current = store.get(proposal_id, timestamp)
+    if current is None:
+        raise MutationStateError("proposal not found")
+    if current["status"] not in {"prepared", "pending"}:
+        return current
+
+    proposal = store.claim(proposal_id, timestamp)
+    if proposal is None:
+        current = store.get(proposal_id, timestamp)
+        if current is None:
+            raise MutationStateError("proposal not found")
+        return current
+    items = store.execution_items(proposal_id)
+    unchanged = {item["transaction_id"]: "unchanged" for item in items}
+
+    try:
+        await engine.sync(force_full=False)
+    except Exception:
+        return store.finish(
+            proposal_id, "failed", unchanged, "preflight_sync_failed", timestamp
+        )
+
+    raw_objects: dict[str, dict[str, Any]] = {}
+    conflicts: dict[str, str] = {}
+    for item in items:
+        transaction_id = item["transaction_id"]
+        raw = db.get_transaction_raw(transaction_id)
+        if raw is None or raw.get("changed") != item["expected_changed"]:
+            conflicts[transaction_id] = "conflicted"
+        else:
+            raw_objects[transaction_id] = raw
+    if conflicts:
+        results = {**unchanged, **conflicts}
+        return store.finish(
+            proposal_id, "conflicted", results, "transaction_changed", timestamp
+        )
+
+    outgoing: list[dict[str, Any]] = []
+    try:
+        for item in items:
+            transaction = validate_transaction_patch(
+                db, raw_objects[item["transaction_id"]], item["patch"]
+            )
+            outgoing.append({**transaction, "changed": timestamp})
+    except MutationValidationError:
+        return store.finish(
+            proposal_id, "failed", unchanged, "transaction_invalid", timestamp
+        )
+
+    try:
+        await engine.push_transactions(outgoing)
+    except Exception:
+        unknown = {item["transaction_id"]: "unknown" for item in items}
+        return store.finish(
+            proposal_id,
+            "needs_review",
+            unknown,
+            "write_result_unknown",
+            timestamp,
+        )
+
+    try:
+        await engine.sync(force_full=False)
+    except Exception:
+        unknown = {item["transaction_id"]: "unknown" for item in items}
+        return store.finish(
+            proposal_id,
+            "needs_review",
+            unknown,
+            "verification_failed",
+            timestamp,
+        )
+
+    results: dict[str, str] = {}
+    for item in items:
+        raw = db.get_transaction_raw(item["transaction_id"])
+        if raw is None:
+            results[item["transaction_id"]] = "unknown"
+        elif all(raw.get(key) == value for key, value in item["patch"].items()):
+            results[item["transaction_id"]] = "applied"
+        elif raw.get("changed") != item["expected_changed"]:
+            results[item["transaction_id"]] = "conflicted"
+        else:
+            results[item["transaction_id"]] = "unknown"
+
+    if all(result == "applied" for result in results.values()):
+        return store.finish(proposal_id, "applied", results, None, timestamp)
+    return store.finish(
+        proposal_id,
+        "needs_review",
+        results,
+        "verification_mismatch",
+        timestamp,
+    )

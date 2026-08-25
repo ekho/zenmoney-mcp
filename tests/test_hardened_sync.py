@@ -154,6 +154,55 @@ async def test_incremental_http_sync_does_not_retry_protocol_errors(monkeypatch)
     assert ids == ["stale"]
 
 
+@pytest.mark.asyncio
+async def test_push_transactions_sends_full_objects_and_applies_response(monkeypatch):
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+    seen: dict = {}
+    transaction = {
+        "id": "tx",
+        "user": 1,
+        "changed": 100,
+        "created": 1,
+        "date": "2026-08-25",
+        "income": 0,
+        "outcome": 10,
+        "incomeAccount": "stale",
+        "outcomeAccount": "stale",
+        "incomeInstrument": 1,
+        "outcomeInstrument": 1,
+        "deleted": False,
+    }
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"serverTimestamp": 101, "transaction": [transaction]}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            seen.update({"url": url, **kwargs})
+            return Response()
+
+    monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient", Client)
+
+    result = await engine.push_transactions([transaction])
+
+    assert seen["json"]["serverTimestamp"] == 10
+    assert seen["json"]["transaction"] == [transaction]
+    assert seen["timeout"] == 60.0
+    assert result["new_server_timestamp"] == 101
+    assert db.get_transaction_raw("tx")["changed"] == 100
+
+
 def test_malformed_deletion_is_rejected_without_mutating_cache():
     db = base_db()
     engine = HardenedSyncEngine(db, "token")

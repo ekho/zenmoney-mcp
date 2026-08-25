@@ -10,6 +10,7 @@ from zenmoney_mcp.transaction_mutations import (
     MutationStateError,
     MutationValidationError,
     ProposalStore,
+    execute_transaction_proposal,
     get_transaction_change_proposal,
     prepare_transaction_changes,
 )
@@ -243,3 +244,138 @@ def test_store_recovers_running_and_removes_old_terminal_rows(financial_db, tmp_
     store.cleanup(now=4 + 30 * 24 * 60 * 60 + 1)
     assert store.get(prepared["proposal_id"], now=4 + 30 * 24 * 60 * 60 + 1) is None
     assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+class SuccessfulEngine:
+    def __init__(self, db):
+        self.db = db
+        self.sync_calls = 0
+        self.pushed: list[list[dict]] = []
+
+    async def sync(self, force_full=False):
+        assert force_full is False
+        self.sync_calls += 1
+        return {"status": "synced"}
+
+    async def push_transactions(self, transactions):
+        self.pushed.append(transactions)
+        self.db.upsert_transactions(transactions)
+        return {"status": "synced"}
+
+
+@pytest.mark.asyncio
+async def test_executor_syncs_checks_pushes_and_verifies_proposal(
+    financial_db, tmp_path
+):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_transaction_changes(
+        financial_db,
+        store,
+        [{"transaction_id": "tx", "set": {"comment": "fixed"}}],
+        now=90,
+    )
+    engine = SuccessfulEngine(financial_db)
+
+    result = await execute_transaction_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "applied"
+    assert result["failure_code"] is None
+    assert result["items"][0]["result"] == "applied"
+    assert engine.sync_calls == 2
+    assert len(engine.pushed) == 1
+    assert engine.pushed[0][0]["comment"] == "fixed"
+    assert engine.pushed[0][0]["changed"] == 100
+    assert engine.pushed[0][0]["source"] == "bank"
+
+    repeated = await execute_transaction_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=101
+    )
+    assert repeated == result
+    assert len(engine.pushed) == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_whole_stale_batch_before_push(financial_db, tmp_path):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_transaction_changes(
+        financial_db,
+        store,
+        [{"transaction_id": "tx", "set": {"comment": "fixed"}}],
+        now=90,
+    )
+    current = financial_db.get_transaction_raw("tx")
+    financial_db.upsert_transactions([{**current, "changed": 11, "comment": "external"}])
+    engine = SuccessfulEngine(financial_db)
+
+    result = await execute_transaction_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "conflicted"
+    assert result["failure_code"] == "transaction_changed"
+    assert result["items"][0]["result"] == "conflicted"
+    assert engine.pushed == []
+    assert engine.sync_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_marks_write_transport_failure_for_review(financial_db, tmp_path):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_transaction_changes(
+        financial_db,
+        store,
+        [{"transaction_id": "tx", "set": {"comment": "fixed"}}],
+        now=90,
+    )
+
+    class AmbiguousEngine(SuccessfulEngine):
+        async def push_transactions(self, transactions):
+            self.pushed.append(transactions)
+            raise RuntimeError("sensitive upstream response")
+
+    engine = AmbiguousEngine(financial_db)
+
+    result = await execute_transaction_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "write_result_unknown"
+    assert result["items"][0]["result"] == "unknown"
+    assert "sensitive" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_executor_marks_partial_verification_for_review(financial_db, tmp_path):
+    second = {**financial_db.get_transaction_raw("tx"), "id": "tx-2"}
+    financial_db.upsert_transactions([second])
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_transaction_changes(
+        financial_db,
+        store,
+        [
+            {"transaction_id": "tx", "set": {"comment": "first"}},
+            {"transaction_id": "tx-2", "set": {"comment": "second"}},
+        ],
+        now=90,
+    )
+
+    class PartialEngine(SuccessfulEngine):
+        async def push_transactions(self, transactions):
+            self.pushed.append(transactions)
+            self.db.upsert_transactions(transactions[:1])
+            return {"status": "synced"}
+
+    result = await execute_transaction_proposal(
+        financial_db,
+        PartialEngine(financial_db),
+        store,
+        prepared["proposal_id"],
+        now=100,
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "verification_mismatch"
+    assert [item["result"] for item in result["items"]] == ["applied", "unknown"]
