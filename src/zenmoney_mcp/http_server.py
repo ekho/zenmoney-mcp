@@ -18,11 +18,15 @@ from .server import create_server, get_database_path
 def create_app(
     db_path: str | Path | None = None,
     control_path: str | Path | None = None,
+    mutation_path: str | Path | None = None,
 ) -> Starlette:
     """Create the remote MCP ASGI application."""
     snapshot_path = Path(db_path) if db_path is not None else get_database_path()
     mcp_app = create_server(
-        remote=True, db_path=snapshot_path, control_path=control_path
+        remote=True,
+        db_path=snapshot_path,
+        control_path=control_path,
+        mutation_path=mutation_path,
     ).streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,

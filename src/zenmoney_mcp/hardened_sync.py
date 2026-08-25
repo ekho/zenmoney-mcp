@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from .entity_changes import DIFF_FIELDS
 from .hardened_database import HardenedDatabase
 
 ZENMONEY_API_URL = "https://api.zenmoney.ru/v8/diff/"
@@ -129,6 +130,11 @@ class HardenedSyncEngine:
         last_sync_time: int | None = None,
     ) -> dict[str, Any]:
         validated = self._validate_diff(diff_data)
+        if force_full and any(
+            not isinstance(validated.get(entity), list)
+            for entity in ENTITY_MAPPING
+        ):
+            raise SyncError("full sync response is missing entity arrays")
         if not force_full and any(
             deletion.get("object") == "budget"
             for deletion in validated.get("deletion") or []
@@ -145,6 +151,8 @@ class HardenedSyncEngine:
                 "last_sync_time",
                 str(last_sync_time if last_sync_time is not None else int(time.time())),
             )
+            if force_full:
+                staging.set_meta("user_entity_raw_complete", "1")
 
             # Keep a byte-for-byte SQLite snapshot so a publication error cannot
             # leave the live cache half replaced.
@@ -177,6 +185,43 @@ class HardenedSyncEngine:
         }
         timeout = 300.0 if force_full else 60.0
         attempts = 2 if force_full else 1
+        payload = await self._post_diff(request_body, timeout, attempts)
+
+        result = self.apply_diff_data(
+            payload,
+            force_full=force_full,
+            last_sync_time=int(time.time()),
+        )
+        result["sync_duration_ms"] = int((time.time() - started) * 1000)
+        return result
+
+    async def push_changes(
+        self, changes: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """Send one non-empty mixed user-entity change set."""
+        if (
+            not isinstance(changes, dict)
+            or not changes
+            or set(changes) - set(DIFF_FIELDS.values())
+            or any(not isinstance(items, list) or not items for items in changes.values())
+        ):
+            raise SyncError("user-entity write batch is invalid")
+        request_body = {
+            "currentClientTimestamp": int(time.time()),
+            "serverTimestamp": self.db.get_server_timestamp(),
+            **changes,
+        }
+        payload = await self._post_diff(request_body, 60.0, 1)
+        return self.apply_diff_data(
+            payload, force_full=False, last_sync_time=int(time.time())
+        )
+
+    async def _post_diff(
+        self,
+        request_body: dict[str, Any],
+        timeout: float,
+        attempts: int,
+    ) -> dict[str, Any]:
         response: httpx.Response | None = None
 
         async with httpx.AsyncClient() as client:
@@ -207,14 +252,7 @@ class HardenedSyncEngine:
             payload = response.json()
         except ValueError as exc:
             raise SyncError(f"ZenMoney API returned invalid JSON: {exc}") from exc
-
-        result = self.apply_diff_data(
-            payload,
-            force_full=force_full,
-            last_sync_time=int(time.time()),
-        )
-        result["sync_duration_ms"] = int((time.time() - started) * 1000)
-        return result
+        return payload
 
 
 SyncEngine = HardenedSyncEngine

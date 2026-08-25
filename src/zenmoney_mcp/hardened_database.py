@@ -10,7 +10,17 @@ from typing import Any
 
 from .database import Database
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+USER_ENTITY_TABLES = {
+    "account": "accounts",
+    "tag": "tags",
+    "merchant": "merchants",
+    "transaction": "transactions",
+    "budget": "budgets",
+    "reminder": "reminders",
+    "reminderMarker": "reminder_markers",
+}
+TABLE_USER_ENTITIES = {table: entity for entity, table in USER_ENTITY_TABLES.items()}
 SYNC_ENTITY_TABLES = (
     "instruments",
     "companies",
@@ -23,7 +33,26 @@ SYNC_ENTITY_TABLES = (
     "reminders",
     "reminder_markers",
 )
-REQUIRED_SNAPSHOT_TABLES = frozenset((*SYNC_ENTITY_TABLES, "sync_meta"))
+REQUIRED_SNAPSHOT_TABLES = frozenset(
+    (*SYNC_ENTITY_TABLES, "sync_meta", "entity_raw")
+)
+
+
+def _json(value: Any) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+
+def entity_key(entity_type: str, value: dict[str, Any]) -> str:
+    """Return the canonical stored identity for a supported user entity."""
+    if entity_type not in USER_ENTITY_TABLES:
+        raise ValueError("unsupported user entity type")
+    if entity_type == "budget":
+        identity = {field: value[field] for field in ("date", "tag", "user")}
+    else:
+        identity = value["id"]
+    return _json(identity)
 
 
 def validate_snapshot(conn: sqlite3.Connection) -> bool:
@@ -115,6 +144,31 @@ class HardenedDatabase(Database):
         self._add_column("reminder_markers", "income_instrument INTEGER")
         self._add_column("reminder_markers", "outcome_instrument INTEGER")
         self._add_column("budgets", "tag_key TEXT NOT NULL DEFAULT ''")
+        self._add_column("transactions", "raw_json TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_raw (
+                entity_type TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY(entity_type, entity_key)
+            )
+            """
+        )
+
+        for row in conn.execute(
+            "SELECT id,raw_json FROM transactions WHERE raw_json IS NOT NULL"
+        ).fetchall():
+            try:
+                raw = json.loads(row["raw_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(raw, dict):
+                conn.execute(
+                    "INSERT OR IGNORE INTO entity_raw(entity_type,entity_key,raw_json) "
+                    "VALUES ('transaction',?,?)",
+                    (entity_key("transaction", {"id": row["id"]}), _json(raw)),
+                )
 
         # Collapse duplicates that were possible because NULL values in the old
         # composite primary key were not unique in SQLite.
@@ -148,6 +202,84 @@ class HardenedDatabase(Database):
         )
         conn.commit()
 
+    def _merge_entity_raw(
+        self, entity_type: str, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                **(
+                    self.get_entity_raw(
+                        entity_type, entity_key(entity_type, item)
+                    )
+                    or {}
+                ),
+                **item,
+            }
+            for item in items
+        ]
+
+    def _store_entity_raw(
+        self, entity_type: str, items: list[dict[str, Any]]
+    ) -> None:
+        self.connect().executemany(
+            "INSERT OR REPLACE INTO entity_raw(entity_type,entity_key,raw_json) "
+            "VALUES (?,?,?)",
+            [
+                (entity_type, entity_key(entity_type, item), _json(item))
+                for item in items
+            ],
+        )
+        self.connect().commit()
+
+    def get_entity_raw(
+        self, entity_type: str, key: str
+    ) -> dict[str, Any] | None:
+        """Return one complete cached user-entity object."""
+        if entity_type not in USER_ENTITY_TABLES:
+            raise ValueError("unsupported user entity type")
+        row = self.connect().execute(
+            "SELECT raw_json FROM entity_raw WHERE entity_type=? AND entity_key=?",
+            (entity_type, key),
+        ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["raw_json"])
+        return value if isinstance(value, dict) else None
+
+    def upsert_tags(self, items: list[dict[str, Any]]) -> int:
+        merged = self._merge_entity_raw("tag", items)
+        count = super().upsert_tags(merged)
+        self._store_entity_raw("tag", merged)
+        return count
+
+    def upsert_merchants(self, items: list[dict[str, Any]]) -> int:
+        merged = self._merge_entity_raw("merchant", items)
+        count = super().upsert_merchants(merged)
+        self._store_entity_raw("merchant", merged)
+        return count
+
+    def upsert_transactions(self, items: list[dict[str, Any]]) -> int:
+        """Persist normalized and complete transaction objects."""
+        merged = self._merge_entity_raw("transaction", items)
+        count = super().upsert_transactions(merged)
+        self._store_entity_raw("transaction", merged)
+        return count
+
+    def get_transaction_raw(self, transaction_id: str) -> dict[str, Any] | None:
+        """Compatibility wrapper for the generic raw store."""
+        return self.get_entity_raw(
+            "transaction", entity_key("transaction", {"id": transaction_id})
+        )
+
+    def user_entity_mutations_ready(self) -> bool:
+        return self.get_meta("user_entity_raw_complete") == "1"
+
+    def transaction_mutations_ready(self) -> bool:
+        """Compatibility gate for the unreleased transaction-only surface."""
+        return self.user_entity_mutations_ready() or (
+            self.get_meta("transaction_raw_complete") == "1"
+        )
+
     def require_instrument_rate(self, instrument_id: int | None) -> float:
         """Return a positive exchange rate or fail explicitly."""
         if instrument_id is None:
@@ -166,6 +298,7 @@ class HardenedDatabase(Database):
         return self.require_instrument_rate(instrument_id)
 
     def upsert_accounts(self, items: list[dict[str, Any]]) -> int:
+        items = self._merge_entity_raw("account", items)
         conn = self.connect()
         for item in items:
             existing = conn.execute(
@@ -215,9 +348,11 @@ class HardenedDatabase(Database):
                 ),
             )
         conn.commit()
+        self._store_entity_raw("account", items)
         return len(items)
 
     def upsert_budgets(self, items: list[dict[str, Any]]) -> int:
+        items = self._merge_entity_raw("budget", items)
         conn = self.connect()
         for item in items:
             tag = item.get("tag")
@@ -248,9 +383,11 @@ class HardenedDatabase(Database):
                 ),
             )
         conn.commit()
+        self._store_entity_raw("budget", items)
         return len(items)
 
     def upsert_reminders(self, items: list[dict[str, Any]]) -> int:
+        items = self._merge_entity_raw("reminder", items)
         conn = self.connect()
         for item in items:
             existing = conn.execute(
@@ -330,10 +467,12 @@ class HardenedDatabase(Database):
                 ),
             )
         conn.commit()
+        self._store_entity_raw("reminder", items)
         return len(items)
 
     def upsert_reminder_markers(self, items: list[dict[str, Any]]) -> int:
         """Persist marker-side instruments needed for trustworthy forecasts."""
+        items = self._merge_entity_raw("reminderMarker", items)
         conn = self.connect()
         for item in items:
             existing = conn.execute(
@@ -401,4 +540,19 @@ class HardenedDatabase(Database):
                 ),
             )
         conn.commit()
+        self._store_entity_raw("reminderMarker", items)
         return len(items)
+
+    def delete_by_ids(self, table: str, ids: list[str | int]) -> int:
+        count = super().delete_by_ids(table, ids)
+        entity_type = TABLE_USER_ENTITIES.get(table)
+        if count and entity_type is not None and entity_type != "budget":
+            self.connect().executemany(
+                "DELETE FROM entity_raw WHERE entity_type=? AND entity_key=?",
+                [
+                    (entity_type, entity_key(entity_type, {"id": object_id}))
+                    for object_id in ids
+                ],
+            )
+            self.connect().commit()
+        return count

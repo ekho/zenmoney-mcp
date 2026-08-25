@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from zenmoney_mcp.hardened_database import HardenedDatabase
-from zenmoney_mcp.hardened_sync import HardenedSyncEngine, SyncError
+from zenmoney_mcp.hardened_sync import ENTITY_MAPPING, HardenedSyncEngine, SyncError
 
 
 def base_db():
@@ -16,12 +16,14 @@ def base_db():
 
 
 def full_snapshot():
-    return {
+    snapshot = {
         'serverTimestamp':20,
+        **{entity: [] for entity in ENTITY_MAPPING},
         'instrument':[{'id':1,'title':'RUB','shortTitle':'RUB','symbol':'₽','rate':1,'changed':2}],
         'user':[{'id':1,'login':'u','currency':1,'parent':None,'changed':2}],
         'account':[{'id':'fresh','title':'Fresh','type':'checking','instrument':1,'balance':20,'user':1,'changed':2}],
     }
+    return snapshot
 
 
 def test_force_full_replaces_cache_instead_of_leaving_stale_rows():
@@ -38,6 +40,33 @@ def test_incremental_keeps_existing_rows_and_adds_changes():
     engine.apply_diff_data(diff,force_full=False)
     ids={r['id'] for r in db.connect().execute('SELECT id FROM accounts').fetchall()}
     assert ids == {'stale','fresh'}
+
+
+def test_only_full_sync_enables_user_entity_mutations():
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+
+    engine.apply_diff_data(full_snapshot(), force_full=False)
+    assert db.user_entity_mutations_ready() is False
+
+    engine.apply_diff_data(full_snapshot(), force_full=True)
+    assert db.user_entity_mutations_ready() is True
+
+
+def test_incomplete_full_response_does_not_enable_mutations_or_replace_cache():
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+    partial = full_snapshot()
+    partial.pop("reminderMarker")
+
+    with pytest.raises(SyncError, match="full sync response"):
+        engine.apply_diff_data(partial, force_full=True)
+
+    assert db.user_entity_mutations_ready() is False
+    assert db.get_server_timestamp() == 10
+    assert [row["id"] for row in db.connect().execute("SELECT id FROM accounts")] == [
+        "stale"
+    ]
 
 
 def test_missing_timestamp_does_not_mutate_original_cache():
@@ -141,6 +170,64 @@ async def test_incremental_http_sync_does_not_retry_protocol_errors(monkeypatch)
     assert db.get_server_timestamp() == 10
     ids = [row["id"] for row in db.connect().execute("SELECT id FROM accounts")]
     assert ids == ["stale"]
+
+
+@pytest.mark.asyncio
+async def test_push_changes_sends_one_mixed_diff_and_applies_response(monkeypatch):
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+    seen: dict = {}
+    transaction = {
+        "id": "tx",
+        "user": 1,
+        "changed": 100,
+        "created": 1,
+        "date": "2026-08-25",
+        "income": 0,
+        "outcome": 10,
+        "incomeAccount": "stale",
+        "outcomeAccount": "stale",
+        "incomeInstrument": 1,
+        "outcomeInstrument": 1,
+        "deleted": False,
+    }
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"serverTimestamp": 101, "transaction": [transaction]}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            seen.update({"url": url, **kwargs})
+            return Response()
+
+    monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient", Client)
+
+    tag = {
+        "id": "tag",
+        "user": 1,
+        "title": "Food",
+        "changed": 100,
+    }
+    result = await engine.push_changes(
+        {"tag": [tag], "transaction": [transaction]}
+    )
+
+    assert seen["json"]["serverTimestamp"] == 10
+    assert seen["json"]["tag"] == [tag]
+    assert seen["json"]["transaction"] == [transaction]
+    assert seen["timeout"] == 60.0
+    assert result["new_server_timestamp"] == 101
+    assert db.get_transaction_raw("tx")["changed"] == 100
 
 
 def test_malformed_deletion_is_rejected_without_mutating_cache():

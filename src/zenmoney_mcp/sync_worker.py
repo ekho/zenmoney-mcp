@@ -23,6 +23,11 @@ from .sync_control import (
     claim_sync_request,
     finish_sync_request,
 )
+from .mutations import (
+    DEFAULT_MUTATION_PATH,
+    ProposalStore,
+    execute_proposal,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_INTERVAL = 900
@@ -74,11 +79,38 @@ async def sync_once(force_full: bool = False) -> dict[str, Any]:
         database.close()
 
 
+async def execute_next_mutation(
+    mutation_path: str | Path = DEFAULT_MUTATION_PATH,
+) -> bool:
+    """Execute at most one queued change proposal."""
+    database_path = get_database_path()
+    database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    database_path.parent.chmod(0o700)
+    database = HardenedDatabase(database_path, journal_mode="DELETE")
+    store = ProposalStore(mutation_path)
+    try:
+        database.init_schema()
+        store.recover_running()
+        proposal_id = store.next_pending_id()
+        if proposal_id is None:
+            return False
+        engine = HardenedSyncEngine(database, read_secret("ZENMONEY_TOKEN"))
+        await execute_proposal(
+            database, engine, store, proposal_id
+        )
+        return True
+    finally:
+        store.close()
+        database.close()
+
+
 async def run_worker(
     sync: Callable[[bool], Awaitable[Any]],
     interval: int,
     stop: asyncio.Event,
     control_path: Path = DEFAULT_CONTROL_PATH,
+    *,
+    mutation_step: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Synchronize now and then wait one interval between later attempts."""
     loop = asyncio.get_running_loop()
@@ -120,6 +152,9 @@ async def run_worker(
     else:
         await attempt(request["force_full"], request["request_id"])
 
+    if mutation_step is not None:
+        await mutation_step()
+
     if interval == 0:
         return
 
@@ -128,6 +163,10 @@ async def run_worker(
         request = claim()
         if request is not None:
             await attempt(request["force_full"], request["request_id"])
+            deadline = loop.time() + interval
+            continue
+
+        if mutation_step is not None and await mutation_step():
             deadline = loop.time() + interval
             continue
 
@@ -163,7 +202,14 @@ def main() -> None:
     try:
         interval = parse_interval(os.environ.get("ZENMONEY_SYNC_INTERVAL_SECONDS"))
         read_secret("ZENMONEY_TOKEN")
-        asyncio.run(run_worker(sync_once, interval, asyncio.Event()))
+        asyncio.run(
+            run_worker(
+                sync_once,
+                interval,
+                asyncio.Event(),
+                mutation_step=execute_next_mutation,
+            )
+        )
     except ValueError:
         _emit("failed")
         raise SystemExit(1) from None

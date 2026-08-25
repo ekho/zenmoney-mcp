@@ -51,7 +51,8 @@ async def test_call_tool_requires_and_accepts_hardened_database():
 
 @pytest.mark.asyncio
 async def test_tool_discovery_applies_hardening_without_registration_patch():
-    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
+    descriptors = {tool.name: tool for tool in await server.list_tools()}
+    tools = {name: tool.input_schema for name, tool in descriptors.items()}
 
     spending = tools["analyze_spending"]["properties"]
     assert "include_transfers" not in spending
@@ -59,6 +60,94 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert spending["top_n"]["maximum"] == 100
     assert spending["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
     assert not ({"force_sync", "get_sync_status"} & set(tools))
+    assert {
+        *server.PREPARE_TOOL_ENTITIES,
+        "prepare_mixed_changes",
+        "get_change_proposal",
+        "apply_changes",
+    } <= set(tools)
+    assert descriptors["prepare_transaction_changes"].annotations.read_only_hint is False
+    assert descriptors["prepare_transaction_changes"].annotations.destructive_hint is False
+    assert descriptors["get_change_proposal"].annotations.read_only_hint is True
+    assert descriptors["apply_changes"].annotations.destructive_hint is True
+    assert descriptors["apply_changes"].annotations.open_world_hint is True
+
+
+@pytest.mark.asyncio
+async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    for name in server.PREPARE_TOOL_ENTITIES:
+        schema = tools[name].input_schema
+        operations = schema["properties"]["operations"]
+        assert schema["additionalProperties"] is False
+        assert (operations["minItems"], operations["maxItems"]) == (1, 100)
+        assert all(
+            "entity" not in branch["properties"]
+            and branch["additionalProperties"] is False
+            for branch in operations["items"]["oneOf"]
+        )
+
+    mixed = tools["prepare_mixed_changes"].input_schema[
+        "properties"
+    ]["operations"]["items"]["oneOf"]
+    assert {branch["properties"]["entity"]["const"] for branch in mixed} == {
+        *server.PREPARE_TOOL_ENTITIES.values()
+    }
+    assert tools["apply_changes"].input_schema["required"] == ["proposal_id"]
+
+
+@pytest.mark.asyncio
+async def test_local_transaction_change_tools_prepare_and_apply_exact_proposal(
+    tmp_path, monkeypatch
+):
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_instruments([{"id": 1, "rate": 1, "changed": 1}])
+    db.upsert_users([{"id": 1, "currency": 1, "changed": 1}])
+    db.upsert_accounts(
+        [{"id": "cash", "type": "checking", "instrument": 1, "changed": 1}]
+    )
+    db.upsert_transactions(
+        [{
+            "id": "tx", "user": 1, "changed": 10, "created": 1,
+            "date": "2026-08-25", "income": 0, "outcome": 10,
+            "incomeAccount": "cash", "outcomeAccount": "cash",
+            "incomeInstrument": 1, "outcomeInstrument": 1,
+            "tag": [], "deleted": False,
+        }]
+    )
+    db.set_meta("user_entity_raw_complete", "1")
+    db.set_server_timestamp(10)
+
+    class Engine:
+        async def sync(self, force_full=False):
+            return {"status": "synced"}
+
+        async def push_changes(self, changes):
+            db.upsert_transactions(changes["transaction"])
+            return {"status": "synced"}
+
+    monkeypatch.setattr(server, "get_sync_engine", Engine)
+    mutation_path = tmp_path / "proposals.db"
+
+    prepared = await server.call_tool(
+        "prepare_transaction_changes",
+        {"operations": [{"operation": "update", "id": "tx",
+                          "set": {"comment": "fixed"}}]},
+        db=db,
+        mutation_path=mutation_path,
+    )
+    proposal_id = json.loads(prepared[0].text)["proposal_id"]
+    applied = await server.call_tool(
+        "apply_changes",
+        {"proposal_id": proposal_id},
+        db=db,
+        mutation_path=mutation_path,
+    )
+
+    assert json.loads(applied[0].text)["status"] == "applied"
+    assert db.get_transaction_raw("tx")["comment"] == "fixed"
 
 
 def test_server_cache_directory_uses_owner_only_permissions(tmp_path, monkeypatch):

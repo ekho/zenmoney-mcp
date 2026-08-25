@@ -3,8 +3,10 @@
 import json
 import logging
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from mcp.server import Server
 from mcp.shared.exceptions import MCPError
@@ -12,10 +14,12 @@ from mcp_types import (
     CallToolResult,
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    ListResourceTemplatesResult,
     ListResourcesResult,
     ListToolsResult,
     ReadResourceResult,
     Resource,
+    ResourceTemplate,
     TextContent,
     TextResourceContents,
     Tool,
@@ -25,11 +29,9 @@ from mcp_types import (
 from . import __version__
 from . import analytics as legacy_analytics
 from .analytics import (
-    get_accounts_resource,
     get_categories_resource,
     get_current_budgets_resource,
     get_instruments_resource,
-    get_merchants_resource,
     get_sync_status_resource,
     suggest_category,
 )
@@ -42,6 +44,7 @@ from .decision import (
     plan_multiple_goals,
     run_financial_scenario,
 )
+from .entity_changes import EDITABLE, SAFE_DELETE
 from .planning import (
     compare_periods,
     forecast_cash_flow,
@@ -72,11 +75,24 @@ from .financial_correctness import (
 from .financial_correctness import configure_legacy_analytics
 from .hardened_database import HardenedDatabase
 from .hardened_sync import HardenedSyncEngine
+from .entity_resources import (
+    EntityResourceError,
+    get_entity_resource,
+    list_entity_resource,
+)
 from .sync_control import (
     DEFAULT_CONTROL_PATH,
     InvalidSyncState,
     read_sync_state,
     request_sync,
+)
+from .mutations import (
+    MutationStateError,
+    MutationValidationError,
+    ProposalStore,
+    execute_proposal,
+    get_change_proposal,
+    prepare_changes,
 )
 
 
@@ -88,7 +104,33 @@ configure_legacy_analytics(legacy_analytics)
 
 REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
 REMOTE_CONTROL_TOOLS = frozenset({"force_sync", "get_sync_status"})
+PREPARE_TOOL_ENTITIES = {
+    "prepare_account_changes": "account",
+    "prepare_tag_changes": "tag",
+    "prepare_merchant_changes": "merchant",
+    "prepare_reminder_changes": "reminder",
+    "prepare_reminder_marker_changes": "reminderMarker",
+    "prepare_transaction_changes": "transaction",
+    "prepare_budget_changes": "budget",
+}
+MUTATION_TOOLS = frozenset(
+    {
+        *PREPARE_TOOL_ENTITIES,
+        "prepare_mixed_changes",
+        "get_change_proposal",
+        "apply_changes",
+    }
+)
 LOGGER = logging.getLogger(__name__)
+ENTITY_RESOURCE_NAMES = {
+    "accounts": "account",
+    "tags": "tag",
+    "merchants": "merchant",
+    "reminders": "reminder",
+    "reminder-markers": "reminderMarker",
+    "transactions": "transaction",
+    "budgets": "budget",
+}
 
 
 def get_database_path() -> Path:
@@ -97,6 +139,11 @@ def get_database_path() -> Path:
     if configured_path:
         return Path(configured_path)
     return Path.home() / ".cache" / "zenmoney-mcp" / "zenmoney.db"
+
+
+def get_mutation_path() -> Path:
+    """Return the local persistent transaction proposal path."""
+    return get_database_path().with_name("mutation-proposals.db")
 
 
 def get_db() -> HardenedDatabase:
@@ -628,6 +675,289 @@ def _decision_tools() -> list[Tool]:
         ),
     ]
 
+
+def _mutation_tools() -> list[Tool]:
+    def nullable(schema: dict[str, Any]) -> dict[str, Any]:
+        return {"anyOf": [schema, {"type": "null"}]}
+
+    string = {"type": "string", "minLength": 1}
+    number = {"type": "number"}
+    non_negative = {"type": "number", "minimum": 0}
+    integer = {"type": "integer"}
+    date_schema = {"type": "string", "pattern": _DATE_PATTERN}
+    ref = {
+        "anyOf": [
+            string,
+            {
+                "type": "object",
+                "properties": {"ref": string},
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+    fields = {
+        "title": string,
+        "type": {
+            "type": "string",
+            "enum": [
+                "cash", "ccard", "checking", "loan", "deposit", "emoney",
+                "debt",
+            ],
+        },
+        "instrument": integer,
+        "company": nullable(integer),
+        "role": nullable(integer),
+        "syncID": nullable({"type": "array", "items": {"type": "string"}}),
+        "startBalance": number,
+        "creditLimit": nullable(non_negative),
+        "inBalance": {"type": "boolean"},
+        "savings": {"type": "boolean"},
+        "enableCorrection": {"type": "boolean"},
+        "enableSMS": {"type": "boolean"},
+        "capitalization": nullable({"type": "boolean"}),
+        "percent": nullable(
+            {"type": "number", "minimum": 0, "exclusiveMaximum": 100}
+        ),
+        "startDate": nullable(date_schema),
+        "endDateOffset": nullable({"type": "integer", "minimum": 0}),
+        "endDateOffsetInterval": nullable(
+            {"type": "string", "enum": ["day", "week", "month", "year"]}
+        ),
+        "payoffStep": nullable({"type": "integer", "minimum": 0}),
+        "payoffInterval": nullable(
+            {"type": "string", "enum": ["month", "year"]}
+        ),
+        "parent": nullable(ref),
+        "icon": nullable(string),
+        "picture": nullable(string),
+        "color": nullable(
+            {"type": "integer", "minimum": 0, "maximum": 4294967295}
+        ),
+        "showIncome": {"type": "boolean"},
+        "showOutcome": {"type": "boolean"},
+        "budgetIncome": {"type": "boolean"},
+        "budgetOutcome": {"type": "boolean"},
+        "required": nullable({"type": "boolean"}),
+        "incomeInstrument": integer,
+        "incomeAccount": ref,
+        "income": non_negative,
+        "outcomeInstrument": integer,
+        "outcomeAccount": ref,
+        "outcome": non_negative,
+        "tag": nullable({"type": "array", "items": ref, "uniqueItems": True}),
+        "merchant": nullable(ref),
+        "payee": nullable(string),
+        "comment": nullable(string),
+        "interval": nullable(
+            {"type": "string", "enum": ["day", "week", "month", "year"]}
+        ),
+        "step": nullable({"type": "integer", "minimum": 1}),
+        "points": nullable(
+            {"type": "array", "items": {"type": "integer", "minimum": 0}}
+        ),
+        "endDate": nullable(date_schema),
+        "notify": {"type": "boolean"},
+        "date": date_schema,
+        "reminder": ref,
+        "state": {"type": "string", "enum": ["planned", "processed"]},
+        "opIncome": nullable(non_negative),
+        "opOutcome": nullable(non_negative),
+        "opIncomeInstrument": nullable(integer),
+        "opOutcomeInstrument": nullable(integer),
+        "latitude": nullable(
+            {"type": "number", "minimum": -90, "maximum": 90}
+        ),
+        "longitude": nullable(
+            {"type": "number", "minimum": -180, "maximum": 180}
+        ),
+        "incomeLock": {"type": "boolean"},
+        "outcomeLock": {"type": "boolean"},
+    }
+    create_required = {
+        "account": {"title", "type", "instrument", "startBalance"},
+        "tag": {"title"},
+        "merchant": {"title"},
+        "reminder": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "startDate",
+        },
+        "reminderMarker": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "date",
+            "reminder", "state",
+        },
+        "transaction": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "date",
+        },
+        "budget": {
+            "date", "tag", "income", "incomeLock", "outcome", "outcomeLock",
+        },
+    }
+
+    def field_schema(entity_type: str, name: str) -> dict[str, Any]:
+        if entity_type == "budget" and name == "tag":
+            return deepcopy(nullable(ref))
+        if entity_type == "reminder" and name == "startDate":
+            return deepcopy(date_schema)
+        return deepcopy(fields[name])
+
+    def operation_schemas(
+        entity_type: str, *, mixed: bool = False
+    ) -> list[dict[str, Any]]:
+        create_fields = set(EDITABLE[entity_type])
+        if entity_type == "account":
+            create_fields.add("startBalance")
+        elif entity_type == "budget":
+            create_fields.update({"date", "tag"})
+        identity_name = "key" if entity_type == "budget" else "id"
+        identity_schema = (
+            {
+                "type": "object",
+                "properties": {
+                    "owner_user_id": integer,
+                    "tag": nullable(string),
+                    "date": date_schema,
+                },
+                "required": ["owner_user_id", "tag", "date"],
+                "additionalProperties": False,
+            }
+            if entity_type == "budget"
+            else string
+        )
+        common = {"entity": {"const": entity_type}} if mixed else {}
+        required_common = ["entity"] if mixed else []
+        create_properties = {
+            **common,
+            "operation": {"const": "create"},
+            "owner_user_id": integer,
+            "value": {
+                "type": "object",
+                "properties": {
+                    name: field_schema(entity_type, name)
+                    for name in create_fields
+                },
+                "required": sorted(create_required[entity_type]),
+                "additionalProperties": False,
+            },
+        }
+        if entity_type != "budget":
+            create_properties["ref"] = string
+        operations = [
+            {
+                "type": "object",
+                "properties": create_properties,
+                "required": [*required_common, "operation", "value"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    **common,
+                    "operation": {"const": "update"},
+                    identity_name: identity_schema,
+                    "set": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "properties": {
+                            name: field_schema(entity_type, name)
+                            for name in EDITABLE[entity_type]
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "required": [*required_common, "operation", identity_name, "set"],
+                "additionalProperties": False,
+            },
+        ]
+        if entity_type in SAFE_DELETE:
+            operations.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        **common,
+                        "operation": {"const": "delete"},
+                        identity_name: identity_schema,
+                    },
+                    "required": [*required_common, "operation", identity_name],
+                    "additionalProperties": False,
+                }
+            )
+        return operations
+
+    def prepare_schema(entity_type: str | None) -> dict[str, Any]:
+        item_schemas = (
+            operation_schemas(entity_type)
+            if entity_type is not None
+            else [
+                schema
+                for current_type in PREPARE_TOOL_ENTITIES.values()
+                for schema in operation_schemas(current_type, mixed=True)
+            ]
+        )
+        return {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {"oneOf": item_schemas},
+                }
+            },
+            "required": ["operations"],
+            "additionalProperties": False,
+        }
+
+    proposal_schema = {
+        "type": "object",
+        "properties": {
+            "proposal_id": {"type": "string", "format": "uuid"},
+        },
+        "required": ["proposal_id"],
+        "additionalProperties": False,
+    }
+    prepare_tools = [
+        Tool(
+            name=name,
+            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney.",
+            inputSchema=prepare_schema(entity_type),
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, openWorldHint=False
+            ),
+        )
+        for name, entity_type in PREPARE_TOOL_ENTITIES.items()
+    ]
+    prepare_tools.append(
+        Tool(
+            name="prepare_mixed_changes",
+            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
+            inputSchema=prepare_schema(None),
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, openWorldHint=False
+            ),
+        )
+    )
+    return prepare_tools + [
+        Tool(
+            name="get_change_proposal",
+            description="Read a prepared or executed change proposal by ID.",
+            inputSchema=proposal_schema,
+            annotations=ToolAnnotations(
+                readOnlyHint=True, destructiveHint=False, openWorldHint=False
+            ),
+        ),
+        Tool(
+            name="apply_changes",
+            description="Apply the exact previously reviewed change proposal.",
+            inputSchema=proposal_schema,
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=True, openWorldHint=True
+            ),
+        ),
+    ]
+
 async def list_tools(remote: bool = False) -> list[Tool]:
     """List available tools."""
     tools = harden_tool_schemas([
@@ -1030,7 +1360,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                 },
             },
         ),
-    ] + _planning_tools() + _decision_tools())
+    ] + _planning_tools() + _decision_tools() + _mutation_tools())
     if not remote:
         return tools
     tools = [
@@ -1065,9 +1395,16 @@ async def list_tools(remote: bool = False) -> list[Tool]:
         tool.model_copy(
             update={
                 "annotations": ToolAnnotations(
-                    readOnlyHint=tool.name != "force_sync",
-                    destructiveHint=False,
-                    openWorldHint=tool.name == "force_sync",
+                    readOnlyHint=tool.name
+                    not in {
+                        "force_sync",
+                        *PREPARE_TOOL_ENTITIES,
+                        "prepare_mixed_changes",
+                        "apply_changes",
+                    },
+                    destructiveHint=tool.name == "apply_changes",
+                    openWorldHint=tool.name
+                    in {"force_sync", "apply_changes"},
                 )
             }
         )
@@ -1164,6 +1501,56 @@ def _dispatch_remote_control_tool(
         if owned_db:
             status_db.close()
     return _text_result({**state, **cache_status})
+
+
+async def _dispatch_mutation_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase,
+    remote: bool,
+    mutation_path: Path,
+) -> list[TextContent]:
+    store = ProposalStore(mutation_path)
+    try:
+        if name in PREPARE_TOOL_ENTITIES or name == "prepare_mixed_changes":
+            if set(arguments) != {"operations"}:
+                raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+            try:
+                result = prepare_changes(
+                    db,
+                    store,
+                    arguments["operations"],
+                    entity_type=PREPARE_TOOL_ENTITIES.get(name),
+                )
+            except MutationStateError:
+                result = {"status": "rejected", "failure_code": "mutation_not_ready"}
+            except MutationValidationError:
+                result = {
+                    "status": "rejected",
+                    "failure_code": "invalid_changes",
+                }
+            return _text_result(result)
+
+        if set(arguments) != {"proposal_id"} or not isinstance(
+            arguments.get("proposal_id"), str
+        ):
+            raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+        proposal_id = arguments["proposal_id"]
+        try:
+            if name == "get_change_proposal":
+                result = get_change_proposal(store, proposal_id)
+            elif remote:
+                result = store.request_apply(proposal_id)
+            else:
+                result = await execute_proposal(
+                    db, get_sync_engine(), store, proposal_id
+                )
+        except MutationStateError:
+            result = {"status": "rejected", "failure_code": "proposal_not_found"}
+        return _text_result(result)
+    finally:
+        store.close()
 
 
 async def _dispatch_tool(
@@ -1464,6 +1851,7 @@ async def call_tool(
     remote: bool = False,
     db_path: str | Path | None = None,
     control_path: str | Path | None = None,
+    mutation_path: str | Path | None = None,
 ) -> list[TextContent]:
     """Dispatch a tool with the appropriate local or remote database lifecycle."""
     if remote and name not in {tool.name for tool in await list_tools(remote=True)}:
@@ -1488,6 +1876,28 @@ async def call_tool(
             db = open_remote_db() if remote else get_db()
 
     try:
+        if name in MUTATION_TOOLS:
+            if mutation_path is None:
+                if remote:
+                    sync_path = (
+                        Path(control_path)
+                        if control_path is not None
+                        else DEFAULT_CONTROL_PATH
+                    )
+                    resolved_mutation_path = sync_path.with_name(
+                        "mutation-proposals.db"
+                    )
+                else:
+                    resolved_mutation_path = get_mutation_path()
+            else:
+                resolved_mutation_path = Path(mutation_path)
+            return await _dispatch_mutation_tool(
+                name,
+                arguments,
+                db=db,
+                remote=remote,
+                mutation_path=resolved_mutation_path,
+            )
         return await _dispatch_tool(name, arguments, db=db)
     finally:
         if owned_db:
@@ -1500,13 +1910,16 @@ async def call_tool(
 
 async def list_resources() -> list[Resource]:
     """List available resources."""
-    return [
+    entity_resources = [
         Resource(
-            uri="zenmoney://accounts",
-            name="Accounts",
-            description="Active accounts with balances",
+            uri=f"zenmoney://{name}",
+            name=name.replace("-", " ").title(),
+            description=f"Paginated ZenMoney {entity_type} entities",
             mimeType="application/json",
-        ),
+        )
+        for name, entity_type in ENTITY_RESOURCE_NAMES.items()
+    ]
+    return entity_resources + [
         Resource(
             uri="zenmoney://categories",
             name="Categories",
@@ -1517,12 +1930,6 @@ async def list_resources() -> list[Resource]:
             uri="zenmoney://budgets/current",
             name="Budgets",
             description="Budget limits for the current month",
-            mimeType="application/json",
-        ),
-        Resource(
-            uri="zenmoney://merchants",
-            name="Merchants",
-            description="Merchant directory",
             mimeType="application/json",
         ),
         Resource(
@@ -1546,18 +1953,44 @@ async def list_resources() -> list[Resource]:
     ]
 
 
+async def list_resource_templates() -> list[ResourceTemplate]:
+    """List collection and exact user-entity URI templates."""
+    templates: list[ResourceTemplate] = []
+    for name, entity_type in ENTITY_RESOURCE_NAMES.items():
+        templates.append(
+            ResourceTemplate(
+                name=f"{name}_collection",
+                uriTemplate=(
+                    f"zenmoney://{name}{{?limit,cursor,include_inactive}}"
+                ),
+                description=f"Paginated ZenMoney {entity_type} entities",
+                mimeType="application/json",
+            )
+        )
+        exact = (
+            f"zenmoney://{name}/{{owner_user_id}}/{{date}}/{{tag_key}}"
+            if entity_type == "budget"
+            else f"zenmoney://{name}/{{id}}"
+        )
+        templates.append(
+            ResourceTemplate(
+                name=f"{name}_exact",
+                uriTemplate=exact,
+                description=f"One exact ZenMoney {entity_type} entity",
+                mimeType="application/json",
+            )
+        )
+    return templates
+
+
 async def _dispatch_resource(
     uri: str, *, db: HardenedDatabase
 ) -> str:
     """Read resource content."""
-    if uri == "zenmoney://accounts":
-        result = get_accounts_resource(db)
-    elif uri == "zenmoney://categories":
+    if uri == "zenmoney://categories":
         result = get_categories_resource(db)
     elif uri == "zenmoney://budgets/current":
         result = get_current_budgets_resource(db)
-    elif uri == "zenmoney://merchants":
-        result = get_merchants_resource(db)
     elif uri == "zenmoney://instruments":
         result = get_instruments_resource(db)
     elif uri == "zenmoney://sync-status":
@@ -1565,7 +1998,57 @@ async def _dispatch_resource(
     elif uri == "zenmoney://financial-snapshot":
         result = get_financial_snapshot(db)
     else:
-        raise ValueError(f"Unknown resource: {uri}")
+        parsed = urlparse(uri)
+        entity_type = ENTITY_RESOURCE_NAMES.get(parsed.netloc)
+        if (
+            parsed.scheme != "zenmoney"
+            or entity_type is None
+            or parsed.fragment
+            or parsed.params
+        ):
+            raise EntityResourceError("entity_resource_uri_invalid")
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if any(len(values) != 1 for values in query.values()):
+            raise EntityResourceError("entity_resource_uri_invalid")
+        path = [unquote(part) for part in parsed.path.split("/") if part]
+        if not path:
+            if set(query) - {"limit", "cursor", "include_inactive"}:
+                raise EntityResourceError("entity_resource_uri_invalid")
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError as exc:
+                raise EntityResourceError("limit_invalid") from exc
+            include_value = query.get("include_inactive", ["false"])[0]
+            if include_value not in {"true", "false"}:
+                raise EntityResourceError("include_inactive_invalid")
+            result = list_entity_resource(
+                db,
+                entity_type,
+                limit=limit,
+                cursor=query.get("cursor", [None])[0],
+                include_inactive=include_value == "true",
+            )
+        else:
+            if query:
+                raise EntityResourceError("entity_resource_uri_invalid")
+            if entity_type == "budget":
+                if len(path) != 3:
+                    raise EntityResourceError("entity_resource_uri_invalid")
+                try:
+                    owner_user_id = int(path[0])
+                except ValueError as exc:
+                    raise EntityResourceError("entity_key_invalid") from exc
+                key: Any = {
+                    "owner_user_id": owner_user_id,
+                    "date": path[1],
+                    "tag": None if path[2] == "null" else path[2],
+                }
+            else:
+                if len(path) != 1:
+                    raise EntityResourceError("entity_resource_uri_invalid")
+                key = path[0]
+            result = get_entity_resource(db, entity_type, key)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1579,9 +2062,6 @@ async def read_resource(
 ) -> str:
     """Read a resource with the appropriate local or remote database lifecycle."""
     uri = str(uri)
-    if remote and uri not in {str(resource.uri) for resource in await list_resources()}:
-        raise MCPError(INVALID_PARAMS, "Remote resource is unavailable")
-
     owned_db = remote and db is None
     if db is None:
         if remote and db_path is not None:
@@ -1590,7 +2070,14 @@ async def read_resource(
             db = open_remote_db() if remote else get_db()
 
     try:
-        return await _dispatch_resource(uri, db=db)
+        try:
+            return await _dispatch_resource(uri, db=db)
+        except EntityResourceError as exc:
+            if remote:
+                raise MCPError(
+                    INVALID_PARAMS, "Remote resource is unavailable"
+                ) from None
+            raise
     finally:
         if owned_db:
             db.close()
@@ -1605,6 +2092,7 @@ def create_server(
     remote: bool = False,
     db_path: str | Path | None = None,
     control_path: str | Path | None = None,
+    mutation_path: str | Path | None = None,
 ) -> Server:
     """Create an MCP SDK v2 server backed by the shared registry."""
 
@@ -1619,6 +2107,7 @@ def create_server(
                 remote=remote,
                 db_path=db_path,
                 control_path=control_path,
+                mutation_path=mutation_path,
             )
         except MCPError:
             raise
@@ -1640,6 +2129,11 @@ def create_server(
 
     async def _on_list_resources(context, params):
         return ListResourcesResult(resources=await list_resources())
+
+    async def _on_list_resource_templates(context, params):
+        return ListResourceTemplatesResult(
+            resourceTemplates=await list_resource_templates()
+        )
 
     async def _on_read_resource(context, params):
         try:
@@ -1679,6 +2173,7 @@ def create_server(
         on_list_tools=_on_list_tools,
         on_call_tool=_on_call_tool,
         on_list_resources=_on_list_resources,
+        on_list_resource_templates=_on_list_resource_templates,
         on_read_resource=_on_read_resource,
     )
 
