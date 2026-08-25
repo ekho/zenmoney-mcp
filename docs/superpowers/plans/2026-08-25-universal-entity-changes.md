@@ -14,8 +14,9 @@
 
 - User entities are `account`, `tag`, `merchant`, `reminder`, `reminderMarker`, `transaction`, and `budget`; system entities remain read-only.
 - Every write is prepare -> review -> apply and contains one to 100 frozen operations.
-- One proposal produces exactly one mixed `/v8/diff/` write request; no staged fallback, retry, or rollback.
-- Create IDs come from `str(uuid.uuid4()).upper()` and are frozen during prepare; the live gate must prove this format for every UUID-backed type before delivery.
+- One proposal produces the minimum ordered dependency layers; each layer is one
+  mixed `/v8/diff/` request, with no retry or rollback.
+- Create IDs come from lowercase `str(uuid.uuid4())` and are frozen during prepare; the live gate must prove this format for every UUID-backed type before delivery.
 - Account `balance` is immutable and `startBalance` is create-only.
 - Safe delete is limited to account archive, transaction deletion, reminder-marker deletion, and budget clear; `purge` is absent.
 - Preserve complete upstream objects and fail closed on fields outside fixed allowlists.
@@ -190,7 +191,7 @@ sorter is needed. Safe delete rewrites the fixed fields from the spec.
 - [ ] **Step 4: Run validator tests**
 
 ```bash
-uv run pytest tests/test_entity_changes.py tests/test_transaction_mutations.py -q
+uv run pytest tests/test_entity_changes.py tests/test_mutations.py -q
 ```
 
 Expected: new tests PASS; old transaction tests still pass until the ledger replacement.
@@ -204,7 +205,7 @@ git commit -m "feat: validate user entity changes" -m "Co-Authored-By: OpenAI Co
 
 ---
 
-### Task 3: Entity-neutral proposal ledger and one-request executor
+### Task 3: Entity-neutral proposal ledger and dependency-layer executor
 
 **Files:**
 - Rename: `src/zenmoney_mcp/transaction_mutations.py` -> `src/zenmoney_mcp/mutations.py`
@@ -233,7 +234,7 @@ async def test_mixed_executor_sends_one_request_and_verifies_all_types(financial
     assert set(engine.pushed[0]) == {"tag", "transaction"}
 ```
 
-Retain lifecycle, file-mode, expiry, cleanup, idempotency, conflict, ambiguous transport, failed verification, and restart recovery coverage. Add create collision and mixed preflight rejection with zero write calls.
+Retain lifecycle, file-mode, expiry, cleanup, idempotency, conflict, ambiguous transport, failed verification, and restart recovery coverage. Add create collision, mixed preflight rejection with zero write calls, dependency-layer ordering, and partial-layer failure without retry.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -247,7 +248,7 @@ Expected: generic module and methods are missing.
 
 Rename any old `proposals` and `proposal_items` tables to `proposals_transaction_v1` and `proposal_items_transaction_v1` once, then create the generic schema from the spec. Public items use `entity`, `key`, `operation`, `expected_changed`, `changes`, and `result`; full raw objects never enter the proposal database.
 
-Implement `push_changes` by validating non-empty keys against `DIFF_FIELDS`, adding every entity array to one body, calling `_post_diff` once, and applying the response through staging. The executor performs preflight sync, whole-proposal concurrency checks, rebuild, one push, verification sync, and fixed terminal results. Any uncertainty after submission becomes `needs_review`.
+Implement `push_changes` by validating non-empty keys against `DIFF_FIELDS`, adding every entity array for one layer to one body, calling `_post_diff` once, and applying the response through staging. The executor performs preflight sync, whole-proposal concurrency checks, rebuild, ordered dependency-layer pushes, a full verification sync, and fixed terminal results. Any uncertainty after submission becomes `needs_review`.
 
 - [ ] **Step 4: Run mutation and sync regressions**
 

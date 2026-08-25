@@ -59,14 +59,16 @@ SAFE_DELETE = {
 }
 
 _ACCOUNT_DEFAULTS = {
+    "private": False,
+    "balanceCorrectionType": "request",
     "company": None,
     "role": None,
     "syncID": None,
     "startBalance": 0,
-    "creditLimit": None,
+    "creditLimit": 0,
     "inBalance": True,
     "savings": False,
-    "enableCorrection": False,
+    "enableCorrection": True,
     "enableSMS": False,
     "archive": False,
     "capitalization": None,
@@ -97,18 +99,24 @@ _MONEY_DEFAULTS = {
 _TRANSACTION_DEFAULTS = {
     **_MONEY_DEFAULTS,
     "deleted": False,
+    "hold": None,
+    "originalPayee": None,
+    "mcc": None,
+    "reminderMarker": None,
     "opIncome": None,
     "opOutcome": None,
     "opIncomeInstrument": None,
     "opOutcomeInstrument": None,
     "latitude": None,
     "longitude": None,
+    "incomeBankID": None,
+    "outcomeBankID": None,
 }
 _REMINDER_DEFAULTS = {
     **_MONEY_DEFAULTS,
     "interval": None,
-    "step": None,
-    "points": None,
+    "step": 0,
+    "points": [0],
     "endDate": None,
     "notify": False,
 }
@@ -431,7 +439,14 @@ def _validate_entity(
             ):
                 amount = value.get(amount_field)
                 instrument = value.get(instrument_field)
-                if (amount is None) != (instrument is None):
+                if amount is not None:
+                    _number(amount, amount_field)
+                if instrument is not None:
+                    _integer(instrument, instrument_field)
+                if (
+                    amount is None and instrument is not None
+                    or amount not in (None, 0) and instrument is None
+                ):
                     raise MutationValidationError(
                         f"{amount_field} and {instrument_field} must be paired"
                     )
@@ -458,8 +473,10 @@ def _validate_entity(
             step = value.get("step")
             points = value.get("points")
             if interval is None:
-                if step is not None or points is not None:
-                    raise MutationValidationError("step and points require interval")
+                if (step, points) not in ((None, None), (0, [0])):
+                    raise MutationValidationError(
+                        "step and points must use the non-recurring canonical values"
+                    )
             else:
                 step = _integer(step, "step", minimum=1)
                 if points is not None:
@@ -584,7 +601,7 @@ def normalize_operations(
             resolved["changed"] = timestamp
             entity_id = None
             if current_type in UUID_ENTITY_TYPES:
-                entity_id = str(uuid.uuid4()).upper()
+                entity_id = str(uuid.uuid4())
                 resolved["id"] = entity_id
             if current_type == "account":
                 resolved["balance"] = resolved["startBalance"]
@@ -696,9 +713,15 @@ def rebuild_after(
 def verify_after(item: dict[str, Any], raw: dict[str, Any] | None) -> bool:
     """Compare stable expected fields after a verification sync."""
     if raw is None:
-        return False
+        return (
+            item["entity_type"] == "reminderMarker"
+            and item["operation"] == "delete"
+        )
     expected = item["after"]
+    ignored = {"changed"}
+    if item["entity_type"] == "account" and item["operation"] == "create":
+        ignored.add("balance")
     return all(
-        key == "changed" or raw.get(key) == value
+        key in ignored or raw.get(key) == value
         for key, value in expected.items()
     )

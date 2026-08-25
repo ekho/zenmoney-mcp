@@ -1,7 +1,7 @@
 # Universal ZenMoney User-Entity Changes Design
 
 **Date:** 2026-08-25
-**Status:** Approved in chat; written review pending
+**Status:** Implemented on feature branch; live capability gate passed
 **Base:** PR #8, branch `codex/transaction-mutations`, commit `8682568`
 **Supersedes:** `2026-08-25-transaction-mutations-design.md`
 
@@ -45,7 +45,8 @@ The implementation must:
 - send complete objects for create and update;
 - allow only explicitly validated user-editable fields;
 - fail closed for unverified fields and operations;
-- use one mixed Diff request and never fall back to staged writes;
+- submit creates in ordered dependency layers, with one mixed Diff request per
+  layer;
 - verify every result through a subsequent sync;
 - require a disposable test-profile live gate before claiming an entity
   operation is supported by the live API.
@@ -310,18 +311,21 @@ The executor performs:
 6. Rebuild, resolve, and validate the entire mixed result against the fresh
    snapshot plus the proposal's planned creates.
 7. If any item fails, send nothing and finish `conflicted` or `failed`.
-8. Assign one client timestamp and send one `/v8/diff/` request containing all
-   affected entity arrays.
-9. Validate the response through the existing staging snapshot path.
-10. Run another incremental sync.
+8. Assign one proposal timestamp. Group creates into dependency layers and send
+   one mixed `/v8/diff/` request per layer; independent operations share layer
+   zero and therefore one request.
+9. Validate each response through the existing staging snapshot path.
+10. Run one full verification sync so entities omitted after semantic deletion
+    are removed from the snapshot.
 11. Verify every create/update/delete result by canonical identity and expected
     user-visible fields.
 
-The design does not claim server-side atomicity. One request prevents local
-staged submission but cannot prove the server applies all arrays atomically.
-Any transport failure after submission, malformed response, verification sync
-failure, missing created entity, or partial/mixed result becomes
-`needs_review`. It is never retried automatically.
+The live API returned HTTP 500 when dependent creates were submitted together
+and could still retain a prefix of that request. Dependency layers are therefore
+required, not a fallback. The design does not claim server-side atomicity or
+cross-layer rollback. Any transport failure after submission, malformed
+response, verification sync failure, missing created entity, or partial/mixed
+result becomes `needs_review`. No layer is retried automatically.
 
 ## Local and remote execution
 
@@ -341,8 +345,9 @@ previews never enter logs.
 
 Automated tests use synthetic full objects and fake the network only at the
 HTTP boundary. They cover schema migration, raw preservation, pagination,
-entity validation, refs, ownership, mixed preflight, one-request payloads,
-verification, recovery, MCP schemas, resources, and credential separation.
+entity validation, refs, ownership, mixed preflight, dependency-layer payloads,
+partial-layer failure, verification, recovery, MCP schemas, resources, and
+credential separation.
 
 Live tests use only the token path below plus an explicitly configured numeric
 test User ID:
@@ -368,6 +373,13 @@ payloads or the token.
 
 No live test runs against production data. Passing synthetic tests or local
 container checks does not substitute for the live capability matrix.
+
+The 2026-08-25 test-profile run confirmed create and update for all seven user
+entities plus the four safe-delete paths. It also established the live
+canonical defaults used by the adapters: lowercase UUIDv4 IDs, required Account
+and Transaction fields, non-recurring Reminder normalization, Account balance
+recalculation, zero-valued original-operation amounts without instruments, and
+ReminderMarker disappearance after `state=deleted`.
 
 ## Delivery
 

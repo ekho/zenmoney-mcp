@@ -170,11 +170,12 @@ class SuccessfulMixedEngine:
     def __init__(self, db):
         self.db = db
         self.sync_calls = 0
+        self.sync_modes: list[bool] = []
         self.pushed: list[dict[str, list[dict]]] = []
 
     async def sync(self, force_full=False):
-        assert force_full is False
         self.sync_calls += 1
+        self.sync_modes.append(force_full)
         return {"status": "synced"}
 
     async def push_changes(self, changes):
@@ -204,6 +205,7 @@ async def test_mixed_executor_sends_one_request_and_verifies_all_types(
 
     assert result["status"] == "applied"
     assert engine.sync_calls == 2
+    assert engine.sync_modes == [False, True]
     assert len(engine.pushed) == 1
     assert set(engine.pushed[0]) == {"tag", "transaction"}
     assert engine.pushed[0]["transaction"][0]["future"] == {"kept": True}
@@ -214,6 +216,75 @@ async def test_mixed_executor_sends_one_request_and_verifies_all_types(
     )
     assert repeated == result
     assert len(engine.pushed) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_references_are_sent_in_dependency_layers(
+    financial_db, tmp_path
+):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_changes(
+        financial_db,
+        store,
+        [
+            {"entity": "tag", "operation": "create", "ref": "new_tag",
+             "value": {"title": "MCP TEST Layered"}},
+            {"entity": "transaction", "operation": "create",
+             "value": {"date": "2026-08-25", "income": 0, "outcome": 1,
+                       "incomeAccount": "cash", "outcomeAccount": "cash",
+                       "incomeInstrument": 1, "outcomeInstrument": 1,
+                       "tag": [{"ref": "new_tag"}]}},
+        ],
+        now=90,
+    )
+    engine = SuccessfulMixedEngine(financial_db)
+
+    result = await execute_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "applied"
+    assert [set(batch) for batch in engine.pushed] == [
+        {"tag"}, {"transaction"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_later_dependency_layer_failure_is_not_retried(
+    financial_db, tmp_path
+):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_changes(
+        financial_db,
+        store,
+        [
+            {"entity": "tag", "operation": "create", "ref": "new_tag",
+             "value": {"title": "MCP TEST Layered Failure"}},
+            {"entity": "transaction", "operation": "create",
+             "value": {"date": "2026-08-25", "income": 0, "outcome": 1,
+                       "incomeAccount": "cash", "outcomeAccount": "cash",
+                       "incomeInstrument": 1, "outcomeInstrument": 1,
+                       "tag": [{"ref": "new_tag"}]}},
+        ],
+        now=90,
+    )
+
+    class FailSecondLayer(SuccessfulMixedEngine):
+        async def push_changes(self, changes):
+            if self.pushed:
+                self.pushed.append(changes)
+                raise RuntimeError("sensitive upstream response")
+            return await super().push_changes(changes)
+
+    engine = FailSecondLayer(financial_db)
+    result = await execute_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "write_result_unknown"
+    assert len(engine.pushed) == 2
+    assert [item["result"] for item in result["items"]] == ["unknown", "unknown"]
 
 
 @pytest.mark.asyncio

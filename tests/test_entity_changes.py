@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import uuid
 
 import pytest
 
@@ -243,8 +244,44 @@ def test_mixed_create_supports_all_seven_user_entity_types(financial_db):
         "tag", "merchant", "account", "reminder", "reminderMarker",
         "transaction", "budget",
     ]
+    for item in items[:-1]:
+        assert item["entity_id"] == item["entity_id"].lower()
+        assert uuid.UUID(item["entity_id"]).version == 4
     assert items[2]["resolved"]["balance"] == items[2]["resolved"]["startBalance"] == 0
+    assert items[2]["resolved"]["private"] is False
+    assert items[2]["resolved"]["balanceCorrectionType"] == "request"
+    assert items[2]["resolved"]["creditLimit"] == 0
+    assert items[2]["resolved"]["enableCorrection"] is True
+    assert items[3]["resolved"]["step"] == 0
+    assert items[3]["resolved"]["points"] == [0]
+    assert {
+        "hold", "originalPayee", "mcc", "reminderMarker", "incomeBankID",
+        "outcomeBankID",
+    } <= items[5]["resolved"].keys()
+    assert all(
+        items[5]["resolved"][field] is None
+        for field in (
+            "hold", "originalPayee", "mcc", "reminderMarker", "incomeBankID",
+            "outcomeBankID",
+        )
+    )
+    assert not ({"qrCode", "source", "viewed"} & items[5]["resolved"].keys())
     assert items[-1]["resolved"]["tag"] == items[0]["entity_id"]
+
+
+def test_account_create_verification_ignores_runtime_balance(financial_db):
+    item = normalize_operations(
+        financial_db,
+        [{"operation": "create", "value": {
+            "title": "MCP TEST Account", "type": "cash", "instrument": 1,
+            "startBalance": 0,
+        }}],
+        "account",
+        now=10,
+    )[0]
+    synchronized = {**item["after"], "balance": -1, "changed": 20}
+
+    assert verify_after(item, synchronized)
 
 
 def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_db):
@@ -571,6 +608,15 @@ def test_rebuild_preserves_unknown_raw_fields_and_verification_ignores_changed(f
     assert verify_after(item, {**rebuilt, "changed": 999}) is True
 
 
+def test_reminder_marker_delete_verifies_missing_entity(financial_db):
+    item = normalize_operations(
+        financial_db,
+        [{"entity": "reminderMarker", "operation": "delete", "id": "marker"}],
+    )[0]
+
+    assert verify_after(item, None)
+
+
 @pytest.mark.parametrize(
     ("entity", "raw", "expected"),
     [
@@ -587,6 +633,8 @@ def test_rebuild_preserves_unknown_raw_fields_and_verification_ignores_changed(f
             {"id": "delete-tx", "user": 1, "date": "2026-08-25", "income": 0,
              "outcome": 1, "incomeAccount": "cash", "outcomeAccount": "cash",
              "incomeInstrument": 1, "outcomeInstrument": 1, "deleted": False,
+             "opIncome": 0, "opIncomeInstrument": None,
+             "opOutcome": 0, "opOutcomeInstrument": None,
              "changed": 4},
             {"deleted": True},
         ),

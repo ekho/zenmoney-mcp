@@ -136,8 +136,8 @@ ID.
 **Tunnel** as its connection, select or paste this tunnel ID, then use **Scan
 Tools**. Confirm that `sync_data` and `suggest_category` are absent;
 `force_sync` is non-read-only, non-destructive, and open-world;
-`prepare_transaction_changes` is non-read-only, non-destructive, and
-closed-world; `apply_transaction_changes` is non-read-only, destructive, and
+all `prepare_*_changes` tools are non-read-only, non-destructive, and
+closed-world; `apply_changes` is non-read-only, destructive, and
 open-world; and analytical tools remain read-only and closed-world. Call
 `get_sync_status`, then make one read-only analytical call. This deployment has
 no public-plugin submission path.
@@ -154,7 +154,7 @@ docker compose --env-file deploy/remote-mcp/.env \
   --entrypoint zenmoney-sync-once zenmoney-sync
 ```
 
-### Remote synchronization and transaction-change control
+### Remote synchronization and entity-change control
 
 The remote `force_sync` tool accepts `force_full` (default `false`) and returns
 immediately with `accepted`, a request ID, mode, and request timestamp. It does
@@ -168,7 +168,7 @@ the fixed `sync_failed` code and leaves the previous snapshot readable. A full
 request may take longer than an incremental request; completion is determined
 only from `get_sync_status`, not from the initial `force_sync` response.
 
-The control volume contains no credentials. It does contain transaction-change
+The control volume contains no credentials. It does contain entity-change
 previews and results, so protect it as financial data and do not include it in
 diagnostics. If
 `get_sync_status` reports `invalid_sync_state`, inspect service health and
@@ -184,12 +184,13 @@ docker compose --env-file deploy/remote-mcp/.env \
 This does not delete or modify `/data/zenmoney.db`. A leftover `running`
 request after a worker restart is retried automatically.
 
-Transaction changes use a separate two-call confirmation. First call
-`prepare_transaction_changes` and review every returned before/after value.
-Then pass only its `proposal_id` to `apply_transaction_changes`. The remote MCP
+Entity changes use a separate two-call confirmation. First call the matching
+entity-specific `prepare_*_changes` tool, or `prepare_mixed_changes`, and review
+every returned before/after value. Then pass only its `proposal_id` to
+`apply_changes`. The remote MCP
 stores the confirmation and returns without calling ZenMoney; the credentialed
 worker processes one queued proposal at a time. Poll
-`get_transaction_change_proposal` until it reaches `applied`, `conflicted`,
+`get_change_proposal` until it reaches `applied`, `conflicted`,
 `failed`, or `needs_review`.
 
 Preparation requires a successful full sync. A proposal expires after 24 hours
@@ -198,6 +199,12 @@ never automatically replays a proposal left `running` after restart: it marks
 the result `needs_review` because the preceding ZenMoney write may have
 succeeded. Resolve that state by inspecting ZenMoney and preparing a new
 proposal for any remaining changes.
+
+Create and update cover Account, Tag, Merchant, Reminder, ReminderMarker,
+Transaction, and Budget. Safe delete is limited to Account archive, Transaction
+and ReminderMarker semantic deletion, and Budget clearing. Purge is unavailable.
+Related creates are sent in dependency layers; a failure after any layer leaves
+the whole proposal in `needs_review` and is never replayed automatically.
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
 database. Backups contain sensitive financial data: keep them encrypted at
