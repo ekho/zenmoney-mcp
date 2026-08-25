@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from mcp.server import Server
 from mcp.shared.exceptions import MCPError
@@ -25,11 +26,9 @@ from mcp_types import (
 from . import __version__
 from . import analytics as legacy_analytics
 from .analytics import (
-    get_accounts_resource,
     get_categories_resource,
     get_current_budgets_resource,
     get_instruments_resource,
-    get_merchants_resource,
     get_sync_status_resource,
     suggest_category,
 )
@@ -72,6 +71,11 @@ from .financial_correctness import (
 from .financial_correctness import configure_legacy_analytics
 from .hardened_database import HardenedDatabase
 from .hardened_sync import HardenedSyncEngine
+from .entity_resources import (
+    EntityResourceError,
+    get_entity_resource,
+    list_entity_resource,
+)
 from .sync_control import (
     DEFAULT_CONTROL_PATH,
     InvalidSyncState,
@@ -104,6 +108,15 @@ MUTATION_TOOLS = frozenset(
     }
 )
 LOGGER = logging.getLogger(__name__)
+ENTITY_RESOURCE_NAMES = {
+    "accounts": "account",
+    "tags": "tag",
+    "merchants": "merchant",
+    "reminders": "reminder",
+    "reminder-markers": "reminderMarker",
+    "transactions": "transaction",
+    "budgets": "budget",
+}
 
 
 def get_database_path() -> Path:
@@ -1696,13 +1709,16 @@ async def call_tool(
 
 async def list_resources() -> list[Resource]:
     """List available resources."""
-    return [
+    entity_resources = [
         Resource(
-            uri="zenmoney://accounts",
-            name="Accounts",
-            description="Active accounts with balances",
+            uri=f"zenmoney://{name}",
+            name=name.replace("-", " ").title(),
+            description=f"Paginated ZenMoney {entity_type} entities",
             mimeType="application/json",
-        ),
+        )
+        for name, entity_type in ENTITY_RESOURCE_NAMES.items()
+    ]
+    return entity_resources + [
         Resource(
             uri="zenmoney://categories",
             name="Categories",
@@ -1713,12 +1729,6 @@ async def list_resources() -> list[Resource]:
             uri="zenmoney://budgets/current",
             name="Budgets",
             description="Budget limits for the current month",
-            mimeType="application/json",
-        ),
-        Resource(
-            uri="zenmoney://merchants",
-            name="Merchants",
-            description="Merchant directory",
             mimeType="application/json",
         ),
         Resource(
@@ -1746,14 +1756,10 @@ async def _dispatch_resource(
     uri: str, *, db: HardenedDatabase
 ) -> str:
     """Read resource content."""
-    if uri == "zenmoney://accounts":
-        result = get_accounts_resource(db)
-    elif uri == "zenmoney://categories":
+    if uri == "zenmoney://categories":
         result = get_categories_resource(db)
     elif uri == "zenmoney://budgets/current":
         result = get_current_budgets_resource(db)
-    elif uri == "zenmoney://merchants":
-        result = get_merchants_resource(db)
     elif uri == "zenmoney://instruments":
         result = get_instruments_resource(db)
     elif uri == "zenmoney://sync-status":
@@ -1761,7 +1767,57 @@ async def _dispatch_resource(
     elif uri == "zenmoney://financial-snapshot":
         result = get_financial_snapshot(db)
     else:
-        raise ValueError(f"Unknown resource: {uri}")
+        parsed = urlparse(uri)
+        entity_type = ENTITY_RESOURCE_NAMES.get(parsed.netloc)
+        if (
+            parsed.scheme != "zenmoney"
+            or entity_type is None
+            or parsed.fragment
+            or parsed.params
+        ):
+            raise EntityResourceError("entity_resource_uri_invalid")
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if any(len(values) != 1 for values in query.values()):
+            raise EntityResourceError("entity_resource_uri_invalid")
+        path = [unquote(part) for part in parsed.path.split("/") if part]
+        if not path:
+            if set(query) - {"limit", "cursor", "include_inactive"}:
+                raise EntityResourceError("entity_resource_uri_invalid")
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError as exc:
+                raise EntityResourceError("limit_invalid") from exc
+            include_value = query.get("include_inactive", ["false"])[0]
+            if include_value not in {"true", "false"}:
+                raise EntityResourceError("include_inactive_invalid")
+            result = list_entity_resource(
+                db,
+                entity_type,
+                limit=limit,
+                cursor=query.get("cursor", [None])[0],
+                include_inactive=include_value == "true",
+            )
+        else:
+            if query:
+                raise EntityResourceError("entity_resource_uri_invalid")
+            if entity_type == "budget":
+                if len(path) != 3:
+                    raise EntityResourceError("entity_resource_uri_invalid")
+                try:
+                    owner_user_id = int(path[0])
+                except ValueError as exc:
+                    raise EntityResourceError("entity_key_invalid") from exc
+                key: Any = {
+                    "owner_user_id": owner_user_id,
+                    "date": path[1],
+                    "tag": None if path[2] == "null" else path[2],
+                }
+            else:
+                if len(path) != 1:
+                    raise EntityResourceError("entity_resource_uri_invalid")
+                key = path[0]
+            result = get_entity_resource(db, entity_type, key)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1775,9 +1831,6 @@ async def read_resource(
 ) -> str:
     """Read a resource with the appropriate local or remote database lifecycle."""
     uri = str(uri)
-    if remote and uri not in {str(resource.uri) for resource in await list_resources()}:
-        raise MCPError(INVALID_PARAMS, "Remote resource is unavailable")
-
     owned_db = remote and db is None
     if db is None:
         if remote and db_path is not None:
@@ -1786,7 +1839,14 @@ async def read_resource(
             db = open_remote_db() if remote else get_db()
 
     try:
-        return await _dispatch_resource(uri, db=db)
+        try:
+            return await _dispatch_resource(uri, db=db)
+        except EntityResourceError as exc:
+            if remote:
+                raise MCPError(
+                    INVALID_PARAMS, "Remote resource is unavailable"
+                ) from None
+            raise
     finally:
         if owned_db:
             db.close()

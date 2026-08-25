@@ -359,7 +359,7 @@ async def test_remote_resource_error_redacts_exception_response_and_logs(
     def fail(*args, **kwargs):
         raise RuntimeError(f"resource failure {sentinel}")
 
-    monkeypatch.setattr(server, "get_accounts_resource", fail)
+    monkeypatch.setattr(server, "list_entity_resource", fail)
     caplog.set_level(logging.WARNING)
     app = create_app(path)
 
@@ -417,7 +417,7 @@ async def test_local_resource_keeps_application_exception(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError(sentinel)
 
-    monkeypatch.setattr(server, "get_accounts_resource", fail)
+    monkeypatch.setattr(server, "list_entity_resource", fail)
     try:
         with pytest.raises(RuntimeError, match=sentinel):
             await server.read_resource("zenmoney://accounts", db=database)
