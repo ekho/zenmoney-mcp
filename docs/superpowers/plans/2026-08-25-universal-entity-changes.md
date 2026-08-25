@@ -120,7 +120,7 @@ git commit -m "feat: preserve raw user entities" -m "Co-Authored-By: OpenAI Code
 **Interfaces:**
 - Produces: `ENTITY_TYPES`, `DIFF_FIELDS`, `UUID_ENTITY_TYPES`
 - Produces: `normalize_operations(db, operations, entity_type=None, now=None) -> list[dict[str, Any]]`
-- Produces: `rebuild_after(db, item, raw, planned) -> dict[str, Any]`
+- Produces: `rebuild_after(db, item, raw) -> dict[str, Any]`
 - Produces: `verify_after(item, raw) -> bool`
 - Produces: `MutationValidationError` and `MutationStateError`.
 
@@ -161,7 +161,7 @@ Use one dict per entity, not classes. Exact editable fields:
 EDITABLE = {
     "account": {"title", "type", "instrument", "company", "role", "syncID",
                 "creditLimit", "inBalance", "savings", "enableCorrection",
-                "enableSMS", "archive", "capitalization", "percent", "startDate",
+                "enableSMS", "capitalization", "percent", "startDate",
                 "endDateOffset", "endDateOffsetInterval", "payoffStep", "payoffInterval"},
     "tag": {"title", "parent", "icon", "picture", "color", "showIncome",
             "showOutcome", "budgetIncome", "budgetOutcome", "required"},
@@ -176,7 +176,7 @@ EDITABLE = {
     "transaction": {"date", "income", "outcome", "incomeAccount", "outcomeAccount",
                     "incomeInstrument", "outcomeInstrument", "tag", "merchant", "payee",
                     "comment", "opIncome", "opOutcome", "opIncomeInstrument",
-                    "opOutcomeInstrument", "latitude", "longitude", "deleted"},
+                    "opOutcomeInstrument", "latitude", "longitude"},
     "budget": {"income", "incomeLock", "outcome", "outcomeLock"},
 }
 ```
