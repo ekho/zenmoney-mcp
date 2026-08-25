@@ -81,6 +81,7 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
         initialized = await client.initialize()
         tools = (await client.list_tools()).tools
         resources = (await client.list_resources()).resources
+        templates = (await client.list_resource_templates()).resource_templates
         result = await client.call_tool("get_net_worth", {})
 
     names = {tool.name for tool in tools}
@@ -90,10 +91,12 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert {
         "force_sync",
         "get_sync_status",
-        "prepare_transaction_changes",
-        "get_transaction_change_proposal",
-        "apply_transaction_changes",
+        *server.PREPARE_TOOL_ENTITIES,
+        "prepare_mixed_changes",
+        "get_change_proposal",
+        "apply_changes",
     } <= names
+    assert not {"get_transaction_change_proposal", "apply_transaction_changes"} & names
     assert not ({"sync_data", "suggest_category"} & names)
     assert {str(resource.uri) for resource in resources} >= {
         "zenmoney://accounts",
@@ -104,20 +107,24 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert tools_by_name["get_sync_status"].annotations.read_only_hint is True
     assert tools_by_name["prepare_transaction_changes"].annotations.read_only_hint is False
     assert tools_by_name["prepare_transaction_changes"].annotations.destructive_hint is False
-    assert tools_by_name["get_transaction_change_proposal"].annotations.read_only_hint is True
-    assert tools_by_name["apply_transaction_changes"].annotations.read_only_hint is False
-    assert tools_by_name["apply_transaction_changes"].annotations.destructive_hint is True
-    assert tools_by_name["apply_transaction_changes"].annotations.open_world_hint is True
+    assert tools_by_name["get_change_proposal"].annotations.read_only_hint is True
+    assert tools_by_name["apply_changes"].annotations.read_only_hint is False
+    assert tools_by_name["apply_changes"].annotations.destructive_hint is True
+    assert tools_by_name["apply_changes"].annotations.open_world_hint is True
     assert all(
         tool.annotations.open_world_hint is False
         for tool in tools
-        if tool.name not in {"force_sync", "apply_transaction_changes"}
+        if tool.name not in {"force_sync", "apply_changes"}
     )
+    assert len(templates) == 14
+    assert {template.name for template in templates} >= {
+        "accounts_collection", "accounts_exact", "budgets_exact"
+    }
     assert json.loads(result.content[0].text)["net_worth"] == 1000
 
 
 @pytest.mark.asyncio
-async def test_remote_transaction_changes_prepare_queue_and_read_status(tmp_path):
+async def test_remote_changes_prepare_queue_and_read_status(tmp_path):
     path = tmp_path / "snapshot.db"
     control_path = tmp_path / "sync-state.json"
     mutation_path = tmp_path / "proposals.db"
@@ -128,14 +135,15 @@ async def test_remote_transaction_changes_prepare_queue_and_read_status(tmp_path
         await client.initialize()
         prepared = await client.call_tool(
             "prepare_transaction_changes",
-            {"changes": [{"transaction_id": "tx", "set": {"comment": "fixed"}}]},
+            {"operations": [{"operation": "update", "id": "tx",
+                              "set": {"comment": "fixed"}}]},
         )
         proposal_id = json.loads(prepared.content[0].text)["proposal_id"]
         queued = await client.call_tool(
-            "apply_transaction_changes", {"proposal_id": proposal_id}
+            "apply_changes", {"proposal_id": proposal_id}
         )
         status = await client.call_tool(
-            "get_transaction_change_proposal", {"proposal_id": proposal_id}
+            "get_change_proposal", {"proposal_id": proposal_id}
         )
 
     assert json.loads(queued.content[0].text)["status"] == "pending"

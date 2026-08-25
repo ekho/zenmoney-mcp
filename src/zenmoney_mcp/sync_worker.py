@@ -82,7 +82,7 @@ async def sync_once(force_full: bool = False) -> dict[str, Any]:
 async def execute_next_mutation(
     mutation_path: str | Path = DEFAULT_MUTATION_PATH,
 ) -> bool:
-    """Execute at most one queued transaction proposal."""
+    """Execute at most one queued change proposal."""
     database_path = get_database_path()
     database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     database_path.parent.chmod(0o700)

@@ -61,15 +61,40 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert spending["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
     assert not ({"force_sync", "get_sync_status"} & set(tools))
     assert {
-        "prepare_transaction_changes",
-        "get_transaction_change_proposal",
-        "apply_transaction_changes",
+        *server.PREPARE_TOOL_ENTITIES,
+        "prepare_mixed_changes",
+        "get_change_proposal",
+        "apply_changes",
     } <= set(tools)
     assert descriptors["prepare_transaction_changes"].annotations.read_only_hint is False
     assert descriptors["prepare_transaction_changes"].annotations.destructive_hint is False
-    assert descriptors["get_transaction_change_proposal"].annotations.read_only_hint is True
-    assert descriptors["apply_transaction_changes"].annotations.destructive_hint is True
-    assert descriptors["apply_transaction_changes"].annotations.open_world_hint is True
+    assert descriptors["get_change_proposal"].annotations.read_only_hint is True
+    assert descriptors["apply_changes"].annotations.destructive_hint is True
+    assert descriptors["apply_changes"].annotations.open_world_hint is True
+
+
+@pytest.mark.asyncio
+async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    for name in server.PREPARE_TOOL_ENTITIES:
+        schema = tools[name].input_schema
+        operations = schema["properties"]["operations"]
+        assert schema["additionalProperties"] is False
+        assert (operations["minItems"], operations["maxItems"]) == (1, 100)
+        assert all(
+            "entity" not in branch["properties"]
+            and branch["additionalProperties"] is False
+            for branch in operations["items"]["oneOf"]
+        )
+
+    mixed = tools["prepare_mixed_changes"].input_schema[
+        "properties"
+    ]["operations"]["items"]["oneOf"]
+    assert {branch["properties"]["entity"]["const"] for branch in mixed} == {
+        *server.PREPARE_TOOL_ENTITIES.values()
+    }
+    assert tools["apply_changes"].input_schema["required"] == ["proposal_id"]
 
 
 @pytest.mark.asyncio
@@ -108,13 +133,14 @@ async def test_local_transaction_change_tools_prepare_and_apply_exact_proposal(
 
     prepared = await server.call_tool(
         "prepare_transaction_changes",
-        {"changes": [{"transaction_id": "tx", "set": {"comment": "fixed"}}]},
+        {"operations": [{"operation": "update", "id": "tx",
+                          "set": {"comment": "fixed"}}]},
         db=db,
         mutation_path=mutation_path,
     )
     proposal_id = json.loads(prepared[0].text)["proposal_id"]
     applied = await server.call_tool(
-        "apply_transaction_changes",
+        "apply_changes",
         {"proposal_id": proposal_id},
         db=db,
         mutation_path=mutation_path,

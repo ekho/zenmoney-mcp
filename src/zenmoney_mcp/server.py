@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -13,10 +14,12 @@ from mcp_types import (
     CallToolResult,
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    ListResourceTemplatesResult,
     ListResourcesResult,
     ListToolsResult,
     ReadResourceResult,
     Resource,
+    ResourceTemplate,
     TextContent,
     TextResourceContents,
     Tool,
@@ -41,6 +44,7 @@ from .decision import (
     plan_multiple_goals,
     run_financial_scenario,
 )
+from .entity_changes import EDITABLE, SAFE_DELETE
 from .planning import (
     compare_periods,
     forecast_cash_flow,
@@ -100,11 +104,21 @@ configure_legacy_analytics(legacy_analytics)
 
 REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
 REMOTE_CONTROL_TOOLS = frozenset({"force_sync", "get_sync_status"})
+PREPARE_TOOL_ENTITIES = {
+    "prepare_account_changes": "account",
+    "prepare_tag_changes": "tag",
+    "prepare_merchant_changes": "merchant",
+    "prepare_reminder_changes": "reminder",
+    "prepare_reminder_marker_changes": "reminderMarker",
+    "prepare_transaction_changes": "transaction",
+    "prepare_budget_changes": "budget",
+}
 MUTATION_TOOLS = frozenset(
     {
-        "prepare_transaction_changes",
-        "get_transaction_change_proposal",
-        "apply_transaction_changes",
+        *PREPARE_TOOL_ENTITIES,
+        "prepare_mixed_changes",
+        "get_change_proposal",
+        "apply_changes",
     }
 )
 LOGGER = logging.getLogger(__name__)
@@ -663,38 +677,239 @@ def _decision_tools() -> list[Tool]:
 
 
 def _mutation_tools() -> list[Tool]:
-    nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}]}
-    nullable_number = {"anyOf": [{"type": "number"}, {"type": "null"}]}
-    nullable_integer = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
-    patch_schema = {
-        "type": "object",
-        "minProperties": 1,
-        "properties": {
-            "date": {"type": "string", "pattern": _DATE_PATTERN},
-            "income": {"type": "number", "minimum": 0},
-            "outcome": {"type": "number", "minimum": 0},
-            "incomeAccount": {"type": "string", "minLength": 1},
-            "outcomeAccount": {"type": "string", "minLength": 1},
-            "incomeInstrument": {"type": "integer"},
-            "outcomeInstrument": {"type": "integer"},
-            "tag": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "uniqueItems": True,
+    def nullable(schema: dict[str, Any]) -> dict[str, Any]:
+        return {"anyOf": [schema, {"type": "null"}]}
+
+    string = {"type": "string", "minLength": 1}
+    number = {"type": "number"}
+    non_negative = {"type": "number", "minimum": 0}
+    integer = {"type": "integer"}
+    date_schema = {"type": "string", "pattern": _DATE_PATTERN}
+    ref = {
+        "anyOf": [
+            string,
+            {
+                "type": "object",
+                "properties": {"ref": string},
+                "required": ["ref"],
+                "additionalProperties": False,
             },
-            "merchant": nullable_string,
-            "payee": nullable_string,
-            "comment": nullable_string,
-            "opIncome": nullable_number,
-            "opOutcome": nullable_number,
-            "opIncomeInstrument": nullable_integer,
-            "opOutcomeInstrument": nullable_integer,
-            "latitude": nullable_number,
-            "longitude": nullable_number,
-            "deleted": {"type": "boolean", "const": True},
-        },
-        "additionalProperties": False,
+        ]
     }
+    fields = {
+        "title": string,
+        "type": {
+            "type": "string",
+            "enum": [
+                "cash", "ccard", "checking", "loan", "deposit", "emoney",
+                "debt",
+            ],
+        },
+        "instrument": integer,
+        "company": nullable(integer),
+        "role": nullable(integer),
+        "syncID": nullable({"type": "array", "items": {"type": "string"}}),
+        "startBalance": number,
+        "creditLimit": nullable(non_negative),
+        "inBalance": {"type": "boolean"},
+        "savings": {"type": "boolean"},
+        "enableCorrection": {"type": "boolean"},
+        "enableSMS": {"type": "boolean"},
+        "capitalization": nullable({"type": "boolean"}),
+        "percent": nullable(
+            {"type": "number", "minimum": 0, "exclusiveMaximum": 100}
+        ),
+        "startDate": nullable(date_schema),
+        "endDateOffset": nullable({"type": "integer", "minimum": 0}),
+        "endDateOffsetInterval": nullable(
+            {"type": "string", "enum": ["day", "week", "month", "year"]}
+        ),
+        "payoffStep": nullable({"type": "integer", "minimum": 0}),
+        "payoffInterval": nullable(
+            {"type": "string", "enum": ["month", "year"]}
+        ),
+        "parent": nullable(ref),
+        "icon": nullable(string),
+        "picture": nullable(string),
+        "color": nullable(
+            {"type": "integer", "minimum": 0, "maximum": 4294967295}
+        ),
+        "showIncome": {"type": "boolean"},
+        "showOutcome": {"type": "boolean"},
+        "budgetIncome": {"type": "boolean"},
+        "budgetOutcome": {"type": "boolean"},
+        "required": nullable({"type": "boolean"}),
+        "incomeInstrument": integer,
+        "incomeAccount": ref,
+        "income": non_negative,
+        "outcomeInstrument": integer,
+        "outcomeAccount": ref,
+        "outcome": non_negative,
+        "tag": nullable({"type": "array", "items": ref, "uniqueItems": True}),
+        "merchant": nullable(ref),
+        "payee": nullable(string),
+        "comment": nullable(string),
+        "interval": nullable(
+            {"type": "string", "enum": ["day", "week", "month", "year"]}
+        ),
+        "step": nullable({"type": "integer", "minimum": 1}),
+        "points": nullable(
+            {"type": "array", "items": {"type": "integer", "minimum": 0}}
+        ),
+        "endDate": nullable(date_schema),
+        "notify": {"type": "boolean"},
+        "date": date_schema,
+        "reminder": ref,
+        "state": {"type": "string", "enum": ["planned", "processed"]},
+        "opIncome": nullable(non_negative),
+        "opOutcome": nullable(non_negative),
+        "opIncomeInstrument": nullable(integer),
+        "opOutcomeInstrument": nullable(integer),
+        "latitude": nullable(
+            {"type": "number", "minimum": -90, "maximum": 90}
+        ),
+        "longitude": nullable(
+            {"type": "number", "minimum": -180, "maximum": 180}
+        ),
+        "incomeLock": {"type": "boolean"},
+        "outcomeLock": {"type": "boolean"},
+    }
+    create_required = {
+        "account": {"title", "type", "instrument", "startBalance"},
+        "tag": {"title"},
+        "merchant": {"title"},
+        "reminder": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "startDate",
+        },
+        "reminderMarker": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "date",
+            "reminder", "state",
+        },
+        "transaction": {
+            "incomeInstrument", "incomeAccount", "income",
+            "outcomeInstrument", "outcomeAccount", "outcome", "date",
+        },
+        "budget": {
+            "date", "tag", "income", "incomeLock", "outcome", "outcomeLock",
+        },
+    }
+
+    def field_schema(entity_type: str, name: str) -> dict[str, Any]:
+        if entity_type == "budget" and name == "tag":
+            return deepcopy(nullable(ref))
+        if entity_type == "reminder" and name == "startDate":
+            return deepcopy(date_schema)
+        return deepcopy(fields[name])
+
+    def operation_schemas(
+        entity_type: str, *, mixed: bool = False
+    ) -> list[dict[str, Any]]:
+        create_fields = set(EDITABLE[entity_type])
+        if entity_type == "account":
+            create_fields.add("startBalance")
+        elif entity_type == "budget":
+            create_fields.update({"date", "tag"})
+        identity_name = "key" if entity_type == "budget" else "id"
+        identity_schema = (
+            {
+                "type": "object",
+                "properties": {
+                    "owner_user_id": integer,
+                    "tag": nullable(string),
+                    "date": date_schema,
+                },
+                "required": ["owner_user_id", "tag", "date"],
+                "additionalProperties": False,
+            }
+            if entity_type == "budget"
+            else string
+        )
+        common = {"entity": {"const": entity_type}} if mixed else {}
+        required_common = ["entity"] if mixed else []
+        create_properties = {
+            **common,
+            "operation": {"const": "create"},
+            "owner_user_id": integer,
+            "value": {
+                "type": "object",
+                "properties": {
+                    name: field_schema(entity_type, name)
+                    for name in create_fields
+                },
+                "required": sorted(create_required[entity_type]),
+                "additionalProperties": False,
+            },
+        }
+        if entity_type != "budget":
+            create_properties["ref"] = string
+        operations = [
+            {
+                "type": "object",
+                "properties": create_properties,
+                "required": [*required_common, "operation", "value"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    **common,
+                    "operation": {"const": "update"},
+                    identity_name: identity_schema,
+                    "set": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "properties": {
+                            name: field_schema(entity_type, name)
+                            for name in EDITABLE[entity_type]
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "required": [*required_common, "operation", identity_name, "set"],
+                "additionalProperties": False,
+            },
+        ]
+        if entity_type in SAFE_DELETE:
+            operations.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        **common,
+                        "operation": {"const": "delete"},
+                        identity_name: identity_schema,
+                    },
+                    "required": [*required_common, "operation", identity_name],
+                    "additionalProperties": False,
+                }
+            )
+        return operations
+
+    def prepare_schema(entity_type: str | None) -> dict[str, Any]:
+        item_schemas = (
+            operation_schemas(entity_type)
+            if entity_type is not None
+            else [
+                schema
+                for current_type in PREPARE_TOOL_ENTITIES.values()
+                for schema in operation_schemas(current_type, mixed=True)
+            ]
+        )
+        return {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {"oneOf": item_schemas},
+                }
+            },
+            "required": ["operations"],
+            "additionalProperties": False,
+        }
+
     proposal_schema = {
         "type": "object",
         "properties": {
@@ -703,49 +918,39 @@ def _mutation_tools() -> list[Tool]:
         "required": ["proposal_id"],
         "additionalProperties": False,
     }
-    return [
+    prepare_tools = [
         Tool(
-            name="prepare_transaction_changes",
-            description="Prepare an immutable transaction change batch for review; does not write to ZenMoney.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "changes": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 100,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "transaction_id": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                },
-                                "set": patch_schema,
-                            },
-                            "required": ["transaction_id", "set"],
-                            "additionalProperties": False,
-                        },
-                    }
-                },
-                "required": ["changes"],
-                "additionalProperties": False,
-            },
+            name=name,
+            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney.",
+            inputSchema=prepare_schema(entity_type),
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
             ),
-        ),
+        )
+        for name, entity_type in PREPARE_TOOL_ENTITIES.items()
+    ]
+    prepare_tools.append(
         Tool(
-            name="get_transaction_change_proposal",
-            description="Read a prepared or executed transaction change proposal by ID.",
+            name="prepare_mixed_changes",
+            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
+            inputSchema=prepare_schema(None),
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, openWorldHint=False
+            ),
+        )
+    )
+    return prepare_tools + [
+        Tool(
+            name="get_change_proposal",
+            description="Read a prepared or executed change proposal by ID.",
             inputSchema=proposal_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=True, destructiveHint=False, openWorldHint=False
             ),
         ),
         Tool(
-            name="apply_transaction_changes",
-            description="Apply the exact previously reviewed transaction change proposal.",
+            name="apply_changes",
+            description="Apply the exact previously reviewed change proposal.",
             inputSchema=proposal_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=True, openWorldHint=True
@@ -1193,12 +1398,13 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                     readOnlyHint=tool.name
                     not in {
                         "force_sync",
-                        "prepare_transaction_changes",
-                        "apply_transaction_changes",
+                        *PREPARE_TOOL_ENTITIES,
+                        "prepare_mixed_changes",
+                        "apply_changes",
                     },
-                    destructiveHint=tool.name == "apply_transaction_changes",
+                    destructiveHint=tool.name == "apply_changes",
                     openWorldHint=tool.name
-                    in {"force_sync", "apply_transaction_changes"},
+                    in {"force_sync", "apply_changes"},
                 )
             }
         )
@@ -1307,27 +1513,22 @@ async def _dispatch_mutation_tool(
 ) -> list[TextContent]:
     store = ProposalStore(mutation_path)
     try:
-        if name == "prepare_transaction_changes":
-            if set(arguments) != {"changes"}:
+        if name in PREPARE_TOOL_ENTITIES or name == "prepare_mixed_changes":
+            if set(arguments) != {"operations"}:
                 raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
             try:
-                operations = [
-                    {
-                        "operation": "update",
-                        "id": change["transaction_id"],
-                        "set": change["set"],
-                    }
-                    for change in arguments["changes"]
-                ]
                 result = prepare_changes(
-                    db, store, operations, entity_type="transaction"
+                    db,
+                    store,
+                    arguments["operations"],
+                    entity_type=PREPARE_TOOL_ENTITIES.get(name),
                 )
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
             except MutationValidationError:
                 result = {
                     "status": "rejected",
-                    "failure_code": "invalid_transaction_change",
+                    "failure_code": "invalid_changes",
                 }
             return _text_result(result)
 
@@ -1337,7 +1538,7 @@ async def _dispatch_mutation_tool(
             raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
         proposal_id = arguments["proposal_id"]
         try:
-            if name == "get_transaction_change_proposal":
+            if name == "get_change_proposal":
                 result = get_change_proposal(store, proposal_id)
             elif remote:
                 result = store.request_apply(proposal_id)
@@ -1752,6 +1953,36 @@ async def list_resources() -> list[Resource]:
     ]
 
 
+async def list_resource_templates() -> list[ResourceTemplate]:
+    """List collection and exact user-entity URI templates."""
+    templates: list[ResourceTemplate] = []
+    for name, entity_type in ENTITY_RESOURCE_NAMES.items():
+        templates.append(
+            ResourceTemplate(
+                name=f"{name}_collection",
+                uriTemplate=(
+                    f"zenmoney://{name}{{?limit,cursor,include_inactive}}"
+                ),
+                description=f"Paginated ZenMoney {entity_type} entities",
+                mimeType="application/json",
+            )
+        )
+        exact = (
+            f"zenmoney://{name}/{{owner_user_id}}/{{date}}/{{tag_key}}"
+            if entity_type == "budget"
+            else f"zenmoney://{name}/{{id}}"
+        )
+        templates.append(
+            ResourceTemplate(
+                name=f"{name}_exact",
+                uriTemplate=exact,
+                description=f"One exact ZenMoney {entity_type} entity",
+                mimeType="application/json",
+            )
+        )
+    return templates
+
+
 async def _dispatch_resource(
     uri: str, *, db: HardenedDatabase
 ) -> str:
@@ -1899,6 +2130,11 @@ def create_server(
     async def _on_list_resources(context, params):
         return ListResourcesResult(resources=await list_resources())
 
+    async def _on_list_resource_templates(context, params):
+        return ListResourceTemplatesResult(
+            resourceTemplates=await list_resource_templates()
+        )
+
     async def _on_read_resource(context, params):
         try:
             text = await read_resource(
@@ -1937,6 +2173,7 @@ def create_server(
         on_list_tools=_on_list_tools,
         on_call_tool=_on_call_tool,
         on_list_resources=_on_list_resources,
+        on_list_resource_templates=_on_list_resource_templates,
         on_read_resource=_on_read_resource,
     )
 
