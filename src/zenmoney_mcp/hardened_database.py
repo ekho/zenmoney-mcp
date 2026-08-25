@@ -10,7 +10,7 @@ from typing import Any
 
 from .database import Database
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SYNC_ENTITY_TABLES = (
     "instruments",
     "companies",
@@ -115,6 +115,7 @@ class HardenedDatabase(Database):
         self._add_column("reminder_markers", "income_instrument INTEGER")
         self._add_column("reminder_markers", "outcome_instrument INTEGER")
         self._add_column("budgets", "tag_key TEXT NOT NULL DEFAULT ''")
+        self._add_column("transactions", "raw_json TEXT")
 
         # Collapse duplicates that were possible because NULL values in the old
         # composite primary key were not unique in SQLite.
@@ -147,6 +148,46 @@ class HardenedDatabase(Database):
             (str(SCHEMA_VERSION),),
         )
         conn.commit()
+
+    def upsert_transactions(self, items: list[dict[str, Any]]) -> int:
+        """Persist normalized fields while preserving the full API object."""
+        merged_items: list[dict[str, Any]] = []
+        for item in items:
+            previous = self.get_transaction_raw(str(item["id"])) or {}
+            merged_items.append({**previous, **item})
+
+        count = super().upsert_transactions(merged_items)
+        self.connect().executemany(
+            "UPDATE transactions SET raw_json = ? WHERE id = ?",
+            [
+                (
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    item["id"],
+                )
+                for item in merged_items
+            ],
+        )
+        self.connect().commit()
+        return count
+
+    def get_transaction_raw(self, transaction_id: str) -> dict[str, Any] | None:
+        """Return the complete cached API object for one transaction."""
+        row = self.connect().execute(
+            "SELECT raw_json FROM transactions WHERE id = ?", (transaction_id,)
+        ).fetchone()
+        if row is None or row["raw_json"] is None:
+            return None
+        value = json.loads(row["raw_json"])
+        return value if isinstance(value, dict) else None
+
+    def transaction_mutations_ready(self) -> bool:
+        """Return whether a full sync populated raw transaction objects."""
+        return self.get_meta("transaction_raw_complete") == "1"
 
     def require_instrument_rate(self, instrument_id: int | None) -> float:
         """Return a positive exchange rate or fail explicitly."""

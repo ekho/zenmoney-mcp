@@ -40,6 +40,17 @@ def test_incremental_keeps_existing_rows_and_adds_changes():
     assert ids == {'stale','fresh'}
 
 
+def test_only_full_sync_enables_transaction_mutations():
+    db = base_db()
+    engine = HardenedSyncEngine(db, "token")
+
+    engine.apply_diff_data(full_snapshot(), force_full=False)
+    assert db.transaction_mutations_ready() is False
+
+    engine.apply_diff_data(full_snapshot(), force_full=True)
+    assert db.transaction_mutations_ready() is True
+
+
 def test_missing_timestamp_does_not_mutate_original_cache():
     db=base_db(); engine=HardenedSyncEngine(db,'token')
     with pytest.raises(SyncError,match='serverTimestamp'):

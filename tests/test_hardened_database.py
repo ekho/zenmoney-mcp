@@ -135,6 +135,68 @@ def test_partial_account_diff_preserves_start_balance_when_field_is_omitted():
     )
 
 
+def test_transaction_raw_json_preserves_unknown_fields_across_partial_diff():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_transactions(
+        [
+            {
+                "id": "tx",
+                "user": 1,
+                "changed": 10,
+                "created": 1,
+                "date": "2026-08-25",
+                "income": 0,
+                "outcome": 10,
+                "incomeAccount": "cash",
+                "outcomeAccount": "cash",
+                "incomeInstrument": 1,
+                "outcomeInstrument": 1,
+                "deleted": False,
+                "source": "bank",
+                "futureField": {"x": 1},
+            }
+        ]
+    )
+
+    db.upsert_transactions(
+        [{"id": "tx", "changed": 11, "comment": "fixed"}]
+    )
+
+    assert db.get_transaction_raw("tx") == {
+        "id": "tx",
+        "user": 1,
+        "changed": 11,
+        "created": 1,
+        "date": "2026-08-25",
+        "income": 0,
+        "outcome": 10,
+        "incomeAccount": "cash",
+        "outcomeAccount": "cash",
+        "incomeInstrument": 1,
+        "outcomeInstrument": 1,
+        "deleted": False,
+        "source": "bank",
+        "futureField": {"x": 1},
+        "comment": "fixed",
+    }
+
+
+def test_migrated_transactions_require_full_raw_backfill(tmp_path):
+    path = tmp_path / "legacy-transactions.db"
+    legacy = Database(path)
+    legacy.init_schema()
+    legacy.upsert_transactions([{"id": "tx", "changed": 1}])
+    legacy.close()
+
+    db = HardenedDatabase(path)
+    db.init_schema()
+
+    assert "raw_json" in db._columns("transactions")
+    assert db.get_transaction_raw("tx") is None
+    assert db.transaction_mutations_ready() is False
+
+
 def test_partial_reminder_diff_preserves_schedule_and_currency_fields_when_omitted():
     db = HardenedDatabase(":memory:")
     db.init_schema()
