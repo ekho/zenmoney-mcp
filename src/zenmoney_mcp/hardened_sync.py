@@ -146,7 +146,7 @@ class HardenedSyncEngine:
                 str(last_sync_time if last_sync_time is not None else int(time.time())),
             )
             if force_full:
-                staging.set_meta("transaction_raw_complete", "1")
+                staging.set_meta("user_entity_raw_complete", "1")
 
             # Keep a byte-for-byte SQLite snapshot so a publication error cannot
             # leave the live cache half replaced.
