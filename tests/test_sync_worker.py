@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from zenmoney_mcp import sync_worker
+from zenmoney_mcp.sync_control import read_sync_state, request_sync
 from zenmoney_mcp.sync_worker import parse_interval, read_secret, run_worker, sync_once
 
 
@@ -146,71 +147,134 @@ async def test_sync_once_uses_file_secret_and_creates_the_configured_cache_paren
                 "PRAGMA journal_mode"
             ).fetchone()[0] == "delete"
 
-        async def sync(self):
+        async def sync(self, force_full=False):
+            assert force_full is True
             return {"status": "synced"}
 
     monkeypatch.setattr("zenmoney_mcp.sync_worker.HardenedSyncEngine", Engine)
 
-    assert await sync_once() == {"status": "synced"}
+    assert await sync_once(force_full=True) == {"status": "synced"}
     assert database_path.is_file()
 
 
 @pytest.mark.asyncio
-async def test_worker_syncs_immediately_then_exits_at_zero_interval():
-    calls: list[str] = []
+async def test_worker_syncs_immediately_then_exits_at_zero_interval(tmp_path):
+    calls: list[bool] = []
 
-    async def sync():
-        calls.append("sync")
+    async def sync(force_full):
+        calls.append(force_full)
 
-    await run_worker(sync, 0, asyncio.Event())
+    await run_worker(sync, 0, asyncio.Event(), tmp_path / "sync-state.json")
 
-    assert calls == ["sync"]
+    assert calls == [False]
 
 
 @pytest.mark.asyncio
-async def test_worker_waits_an_interval_before_next_sync():
+async def test_worker_claims_full_request_before_scheduled_sync(tmp_path):
+    control = tmp_path / "sync-state.json"
+    requested = request_sync(control, force_full=True)
+    calls: list[bool] = []
+
+    async def sync(force_full):
+        calls.append(force_full)
+
+    await run_worker(sync, 0, asyncio.Event(), control)
+
+    state = read_sync_state(control)
+    assert calls == [True]
+    assert state["request_id"] == requested["request_id"]
+    assert state["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_worker_records_requested_sync_failure(tmp_path):
+    control = tmp_path / "sync-state.json"
+    request_sync(control, force_full=False)
+
+    async def sync(force_full):
+        assert force_full is False
+        raise RuntimeError("sensitive response")
+
+    await run_worker(sync, 0, asyncio.Event(), control)
+
+    assert read_sync_state(control)["failure_code"] == "sync_failed"
+
+
+@pytest.mark.asyncio
+async def test_worker_picks_up_request_during_interval_wait(
+    monkeypatch, tmp_path
+):
+    control = tmp_path / "sync-state.json"
+    initial_sync_finished = asyncio.Event()
+    stop = asyncio.Event()
+    calls: list[bool] = []
+
+    async def sync(force_full):
+        calls.append(force_full)
+        if len(calls) == 1:
+            initial_sync_finished.set()
+        else:
+            stop.set()
+
+    monkeypatch.setattr(sync_worker, "CONTROL_POLL_INTERVAL", 0.01)
+    worker = asyncio.create_task(run_worker(sync, 60, stop, control))
+    await initial_sync_finished.wait()
+    request_sync(control, force_full=True)
+    await asyncio.wait_for(worker, timeout=0.5)
+
+    assert calls == [False, True]
+    assert read_sync_state(control)["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_worker_waits_an_interval_before_next_sync(tmp_path):
     calls: list[float] = []
     stop = asyncio.Event()
 
-    async def sync():
+    async def sync(force_full):
+        assert force_full is False
         calls.append(asyncio.get_running_loop().time())
         if len(calls) == 2:
             stop.set()
 
-    await run_worker(sync, 0.01, stop)
+    await run_worker(sync, 0.01, stop, tmp_path / "sync-state.json")
 
     assert len(calls) == 2
     assert calls[1] - calls[0] >= 0.009
 
 
 @pytest.mark.asyncio
-async def test_worker_stops_during_wait_without_a_second_sync():
+async def test_worker_stops_during_wait_without_a_second_sync(tmp_path):
     calls: list[str] = []
     stop = asyncio.Event()
 
-    async def sync():
+    async def sync(force_full):
+        assert force_full is False
         calls.append("sync")
         stop.set()
 
-    await run_worker(sync, 60, stop)
+    await run_worker(sync, 60, stop, tmp_path / "sync-state.json")
 
     assert calls == ["sync"]
 
 
 @pytest.mark.asyncio
-async def test_worker_waits_before_retry_and_does_not_log_secrets_or_exception_text(caplog):
+async def test_worker_waits_before_retry_and_does_not_log_secrets_or_exception_text(
+    caplog, tmp_path
+):
     calls: list[float] = []
     stop = asyncio.Event()
     token = "sentinel-token"
     body = "sensitive response body"
 
-    async def sync():
+    async def sync(force_full):
+        assert force_full is False
         calls.append(asyncio.get_running_loop().time())
         if len(calls) == 1:
             raise RuntimeError(f"{token}: {body}")
         stop.set()
 
-    await run_worker(sync, 0.01, stop)
+    await run_worker(sync, 0.01, stop, tmp_path / "sync-state.json")
 
     assert len(calls) == 2
     assert calls[1] - calls[0] >= 0.009

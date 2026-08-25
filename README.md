@@ -94,9 +94,13 @@ server through a runtime overlay.
 
 For a private remote deployment, `zenmoney-mcp-http` exposes Streamable HTTP
 at `/mcp` only inside Docker, and the OpenAI Secure MCP Tunnel client connects
-outbound to OpenAI. The remote registry is read-only and excludes
-`sync_data` and `suggest_category`; all remaining available tools are bounded
-financial analytics over the cache. See the [remote operations runbook](deploy/remote-mcp/README.md)
+outbound to OpenAI. The remote registry excludes the local API-dependent
+`sync_data` and `suggest_category` tools. Its financial tools remain
+read-only; remote-only `force_sync` can asynchronously request an
+incremental or full cache refresh from the separate credentialed worker, and
+`get_sync_status` reports progress and the last successful sync. The MCP
+container still receives no ZenMoney token and cannot write the financial
+snapshot directly. See the [remote operations runbook](deploy/remote-mcp/README.md)
 and [threat model](docs/remote-mcp-threat-model.md).
 
 ## Hardening in this fork
@@ -193,10 +197,12 @@ uv sync --extra dev
 
 ## Data flow
 
-1. `sync_data` reads `/v8/diff/` into a local SQLite cache at
-   `~/.cache/zenmoney-mcp/zenmoney.db`.
-2. Analytics run locally against SQLite.
-3. Only sync and category suggestion make read-only requests to ZenMoney.
+1. Local `sync_data` reads `/v8/diff/` directly through the local sync engine.
+2. In the remote deployment, the periodic worker reads `/v8/diff/`; remote
+   `force_sync` only asks that credentialed worker to run immediately.
+3. Both modes publish a SQLite cache at `~/.cache/zenmoney-mcp/zenmoney.db` or
+   the configured `ZENMONEY_DB_PATH`; analytics read that cache locally.
+4. Only sync and category suggestion make read-only requests to ZenMoney.
 
 ## Testing
 

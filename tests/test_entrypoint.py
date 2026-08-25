@@ -58,6 +58,7 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert spending["top_n"]["minimum"] == 1
     assert spending["top_n"]["maximum"] == 100
     assert spending["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
+    assert not ({"force_sync", "get_sync_status"} & set(tools))
 
 
 def test_server_cache_directory_uses_owner_only_permissions(tmp_path, monkeypatch):

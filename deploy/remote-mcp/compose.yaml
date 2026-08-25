@@ -18,6 +18,7 @@ services:
     expose: ["8000"]
     volumes:
       - zenmoney-data:/data:ro
+      - zenmoney-sync-control:/sync-control
     networks: [mcp_internal]
 
   zenmoney-sync:
@@ -30,6 +31,7 @@ services:
     secrets: [zenmoney-token]
     volumes:
       - zenmoney-data:/data
+      - zenmoney-sync-control:/sync-control
     networks: [egress]
     stop_grace_period: 70s
     healthcheck:
@@ -64,6 +66,7 @@ networks:
 
 volumes:
   zenmoney-data: {}
+  zenmoney-sync-control: {}
 
 secrets:
   zenmoney-token:

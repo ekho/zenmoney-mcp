@@ -72,6 +72,12 @@ from .financial_correctness import (
 from .financial_correctness import configure_legacy_analytics
 from .hardened_database import HardenedDatabase
 from .hardened_sync import HardenedSyncEngine
+from .sync_control import (
+    DEFAULT_CONTROL_PATH,
+    InvalidSyncState,
+    read_sync_state,
+    request_sync,
+)
 
 
 # Global state
@@ -81,6 +87,7 @@ _sync_engine: HardenedSyncEngine | None = None
 configure_legacy_analytics(legacy_analytics)
 
 REMOTE_EXCLUDED_TOOLS = frozenset({"sync_data", "suggest_category"})
+REMOTE_CONTROL_TOOLS = frozenset({"force_sync", "get_sync_status"})
 LOGGER = logging.getLogger(__name__)
 
 
@@ -1026,16 +1033,137 @@ async def list_tools(remote: bool = False) -> list[Tool]:
     ] + _planning_tools() + _decision_tools())
     if not remote:
         return tools
-    annotations = ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        openWorldHint=False,
-    )
-    return [
-        tool.model_copy(update={"annotations": annotations})
-        for tool in tools
-        if tool.name not in REMOTE_EXCLUDED_TOOLS
+    tools = [
+        tool for tool in tools if tool.name not in REMOTE_EXCLUDED_TOOLS
+    ] + [
+        Tool(
+            name="force_sync",
+            description="Request an immediate asynchronous ZenMoney synchronization.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "force_full": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Request a full snapshot instead of an incremental sync",
+                    }
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_sync_status",
+            description="Get the current sync request state and last successful cache sync time.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
     ]
+    return [
+        tool.model_copy(
+            update={
+                "annotations": ToolAnnotations(
+                    readOnlyHint=tool.name != "force_sync",
+                    destructiveHint=False,
+                    openWorldHint=tool.name == "force_sync",
+                )
+            }
+        )
+        for tool in tools
+    ]
+
+
+def _public_sync_state(state: dict[str, Any]) -> dict[str, Any]:
+    force_full = state["force_full"]
+    if force_full is None:
+        mode = None
+    elif force_full:
+        mode = "full"
+    else:
+        mode = "incremental"
+    return {
+        "state": state["state"],
+        "request_id": state["request_id"],
+        "mode": mode,
+        "requested_at": state["requested_at"],
+        "started_at": state["started_at"],
+        "finished_at": state["finished_at"],
+        "failure_code": state["failure_code"],
+    }
+
+
+def _text_result(result: dict[str, Any]) -> list[TextContent]:
+    return [
+        TextContent(
+            type="text", text=json.dumps(result, ensure_ascii=False, indent=2)
+        )
+    ]
+
+
+def _dispatch_remote_control_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    control_path: Path,
+    db: HardenedDatabase | None,
+    db_path: str | Path | None,
+) -> list[TextContent]:
+    if name == "force_sync":
+        if set(arguments) - {"force_full"} or type(
+            arguments.get("force_full", False)
+        ) is not bool:
+            raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+        try:
+            state = request_sync(
+                control_path, force_full=arguments.get("force_full", False)
+            )
+        except InvalidSyncState:
+            return _text_result(
+                {"status": "rejected", "failure_code": "invalid_sync_state"}
+            )
+        result = {
+            "status": state["status"],
+            "request_id": state["request_id"],
+            "mode": "full" if state["force_full"] else "incremental",
+            "requested_at": state["requested_at"],
+        }
+        return _text_result(result)
+
+    if arguments:
+        raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
+    try:
+        state = _public_sync_state(read_sync_state(control_path))
+    except InvalidSyncState:
+        state = {
+            "state": "failed",
+            "request_id": None,
+            "mode": None,
+            "requested_at": None,
+            "started_at": None,
+            "finished_at": None,
+            "failure_code": "invalid_sync_state",
+        }
+
+    cache_status = {
+        "last_server_timestamp": 0,
+        "last_sync_time": None,
+        "cache_stats": {},
+        "staleness": "never_synced",
+    }
+    owned_db = False
+    status_db = db
+    if status_db is None and db_path is not None and Path(db_path).is_file():
+        status_db = HardenedDatabase(db_path, read_only=True)
+        owned_db = True
+    try:
+        if status_db is not None:
+            cache_status = get_sync_status_resource(status_db)
+    finally:
+        if owned_db:
+            status_db.close()
+    return _text_result({**state, **cache_status})
 
 
 async def _dispatch_tool(
@@ -1335,10 +1463,22 @@ async def call_tool(
     db: HardenedDatabase | None = None,
     remote: bool = False,
     db_path: str | Path | None = None,
+    control_path: str | Path | None = None,
 ) -> list[TextContent]:
     """Dispatch a tool with the appropriate local or remote database lifecycle."""
     if remote and name not in {tool.name for tool in await list_tools(remote=True)}:
         raise MCPError(INVALID_PARAMS, "Remote tool is unavailable")
+
+    if remote and name in REMOTE_CONTROL_TOOLS:
+        return _dispatch_remote_control_tool(
+            name,
+            arguments,
+            control_path=(
+                Path(control_path) if control_path is not None else DEFAULT_CONTROL_PATH
+            ),
+            db=db,
+            db_path=db_path,
+        )
 
     owned_db = remote and db is None
     if db is None:
@@ -1461,7 +1601,10 @@ async def read_resource(
 # ============================================================================
 
 def create_server(
-    *, remote: bool = False, db_path: str | Path | None = None
+    *,
+    remote: bool = False,
+    db_path: str | Path | None = None,
+    control_path: str | Path | None = None,
 ) -> Server:
     """Create an MCP SDK v2 server backed by the shared registry."""
 
@@ -1475,6 +1618,7 @@ def create_server(
                 dict(params.arguments or {}),
                 remote=remote,
                 db_path=db_path,
+                control_path=control_path,
             )
         except MCPError:
             raise

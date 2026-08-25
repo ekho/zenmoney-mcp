@@ -128,9 +128,11 @@ ID.
 
 **Manual, not run:** in ChatGPT, create a developer-mode app, select
 **Tunnel** as its connection, select or paste this tunnel ID, then use **Scan
-Tools**. Confirm that every listed tool is read-only and that `sync_data` and
-`suggest_category` are absent. Finally make one read-only analytical call.
-This deployment has no public-plugin submission path.
+Tools**. Confirm that `sync_data` and `suggest_category` are absent;
+`force_sync` is non-read-only, non-destructive, and open-world; and every
+other listed tool is read-only and closed-world. Call `get_sync_status`, then
+make one read-only analytical call. This deployment has no public-plugin
+submission path.
 
 ## Sync, backup, restore, and rollback
 
@@ -143,6 +145,34 @@ docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml run --rm --no-deps \
   --entrypoint zenmoney-sync-once zenmoney-sync
 ```
+
+### Remote synchronization control
+
+The remote `force_sync` tool accepts `force_full` (default `false`) and returns
+immediately with `accepted`, a request ID, mode, and request timestamp. It does
+not hold the MCP call open while ZenMoney responds. If a request is already
+pending or running, another call returns `already_running` with that request
+ID instead of creating a queue.
+
+Use `get_sync_status` to observe `pending`, `running`, `completed`, or `failed`,
+plus the last successful cache sync time. A failed forced request reports only
+the fixed `sync_failed` code and leaves the previous snapshot readable. A full
+request may take longer than an incremental request; completion is determined
+only from `get_sync_status`, not from the initial `force_sync` response.
+
+The control volume contains no credentials or financial data. If
+`get_sync_status` reports `invalid_sync_state`, inspect service health and
+fixed-field logs first. To discard only the invalid control state and allow a
+new request, run:
+
+```bash
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml exec -T zenmoney-sync \
+  rm -f /sync-control/sync-state.json
+```
+
+This does not delete or modify `/data/zenmoney.db`. A leftover `running`
+request after a worker restart is retried automatically.
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
 database. Backups contain sensitive financial data: keep them encrypted at
