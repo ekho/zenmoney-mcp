@@ -9,6 +9,7 @@ import pytest
 from zenmoney_mcp import sync_worker
 from zenmoney_mcp.sync_control import read_sync_state, request_sync
 from zenmoney_mcp.sync_worker import parse_interval, read_secret, run_worker, sync_once
+from zenmoney_mcp.transaction_mutations import ProposalStore, prepare_transaction_changes
 
 
 def test_read_secret_prefers_nonblank_file(monkeypatch, tmp_path):
@@ -57,11 +58,12 @@ def test_parse_interval_rejects_negative_and_non_integer_values(value):
 
 
 def test_worker_main_reads_interval_seconds_environment_variable(monkeypatch):
-    observed: dict[str, int] = {}
+    observed: dict[str, object] = {}
 
-    async def worker(sync, interval, stop):
+    async def worker(sync, interval, stop, *, mutation_step=None):
         del sync, stop
         observed["interval"] = interval
+        observed["mutation_step"] = mutation_step
 
     monkeypatch.setenv("ZENMONEY_TOKEN", "token")
     monkeypatch.setenv("ZENMONEY_SYNC_INTERVAL_SECONDS", "0")
@@ -71,7 +73,8 @@ def test_worker_main_reads_interval_seconds_environment_variable(monkeypatch):
 
     sync_worker.main()
 
-    assert observed == {"interval": 0}
+    assert observed["interval"] == 0
+    assert callable(observed["mutation_step"])
 
 
 def test_worker_main_rejects_invalid_interval_seconds_environment_variable(
@@ -224,6 +227,120 @@ async def test_worker_picks_up_request_during_interval_wait(
 
     assert calls == [False, True]
     assert read_sync_state(control)["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_worker_processes_mutation_without_waiting_for_scheduled_sync(tmp_path):
+    stop = asyncio.Event()
+    sync_calls: list[bool] = []
+    mutation_calls = 0
+
+    async def sync(force_full):
+        sync_calls.append(force_full)
+
+    async def mutation_step():
+        nonlocal mutation_calls
+        mutation_calls += 1
+        stop.set()
+        return True
+
+    await run_worker(
+        sync,
+        60,
+        stop,
+        tmp_path / "sync-state.json",
+        mutation_step=mutation_step,
+    )
+
+    assert sync_calls == [False]
+    assert mutation_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_next_mutation_applies_one_pending_proposal(
+    monkeypatch, tmp_path
+):
+    database_path = tmp_path / "zenmoney.db"
+    proposal_path = tmp_path / "proposals.db"
+    db = sync_worker.HardenedDatabase(database_path, journal_mode="DELETE")
+    db.init_schema()
+    db.upsert_instruments([{"id": 1, "rate": 1, "changed": 1}])
+    db.upsert_users([{"id": 1, "currency": 1, "changed": 1}])
+    db.upsert_accounts(
+        [{"id": "cash", "type": "checking", "instrument": 1, "changed": 1}]
+    )
+    db.upsert_transactions(
+        [{
+            "id": "tx", "user": 1, "changed": 10, "created": 1,
+            "date": "2026-08-25", "income": 0, "outcome": 10,
+            "incomeAccount": "cash", "outcomeAccount": "cash",
+            "incomeInstrument": 1, "outcomeInstrument": 1,
+            "tag": [], "deleted": False,
+        }]
+    )
+    db.set_meta("transaction_raw_complete", "1")
+    store = ProposalStore(proposal_path)
+    prepared = prepare_transaction_changes(
+        db,
+        store,
+        [{"transaction_id": "tx", "set": {"comment": "fixed"}}],
+    )
+    store.request_apply(prepared["proposal_id"])
+    store.close()
+    db.close()
+
+    class Engine:
+        def __init__(self, database, token):
+            assert token == "token"
+            self.db = database
+
+        async def sync(self, force_full=False):
+            return {"status": "synced"}
+
+        async def push_transactions(self, transactions):
+            self.db.upsert_transactions(transactions)
+            return {"status": "synced"}
+
+    monkeypatch.setenv("ZENMONEY_TOKEN", "token")
+    monkeypatch.delenv("ZENMONEY_TOKEN_FILE", raising=False)
+    monkeypatch.setattr(sync_worker, "get_database_path", lambda: database_path)
+    monkeypatch.setattr(sync_worker, "HardenedSyncEngine", Engine)
+
+    assert await sync_worker.execute_next_mutation(proposal_path) is True
+    verified = ProposalStore(proposal_path)
+    assert verified.get(prepared["proposal_id"])["status"] == "applied"
+    verified.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_next_mutation_does_not_replay_leftover_running_proposal(
+    monkeypatch, tmp_path
+):
+    database_path = tmp_path / "zenmoney.db"
+    proposal_path = tmp_path / "proposals.db"
+    db = sync_worker.HardenedDatabase(database_path, journal_mode="DELETE")
+    db.init_schema()
+    store = ProposalStore(proposal_path)
+    proposal_id = store.create(
+        [{
+            "transaction_id": "tx",
+            "expected_changed": 1,
+            "patch": {"comment": "fixed"},
+            "before": {"comment": None},
+            "after": {"comment": "fixed"},
+        }]
+    )
+    store.request_apply(proposal_id)
+    store.claim(proposal_id)
+    store.close()
+    db.close()
+    monkeypatch.setenv("ZENMONEY_TOKEN", "token")
+    monkeypatch.setattr(sync_worker, "get_database_path", lambda: database_path)
+
+    assert await sync_worker.execute_next_mutation(proposal_path) is False
+    verified = ProposalStore(proposal_path)
+    assert verified.get(proposal_id)["status"] == "needs_review"
+    verified.close()
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,9 @@
 # ZenMoney MCP Server
 
-Read-only MCP server for trustworthy personal-finance analytics over the
-[ZenMoney](https://zenmoney.ru/) API. This fork keeps all data local, exposes no
-write tools, and adds financially conservative calculations and atomic sync.
+MCP server for trustworthy personal-finance analytics and explicitly confirmed
+transaction changes over the [ZenMoney](https://zenmoney.ru/) API. This fork
+keeps its working data local and adds financially conservative calculations,
+atomic sync, and a two-step write workflow.
 
 ## Analytics
 
@@ -33,6 +34,23 @@ write tools, and adds financially conservative calculations and atomic sync.
 The server also exposes resources for accounts, categories, budgets, merchants,
 currencies, synchronization status, and a cache-only financial snapshot at
 `zenmoney://financial-snapshot`. Reading a resource never starts synchronization.
+
+## Confirmed transaction changes
+
+Transaction changes always use two separate calls:
+
+1. `prepare_transaction_changes` validates 1–100 exact transaction IDs and
+   returns an immutable field-by-field preview without writing to ZenMoney.
+2. After reviewing that preview, `apply_transaction_changes` confirms the exact
+   proposal ID. `get_transaction_change_proposal` reports its state and results.
+
+Preparation requires a successful full sync so that untouched ZenMoney fields
+can be preserved. Apply refreshes the cache and rejects the whole batch if any
+transaction changed since preparation. Deletion is represented only by setting
+`deleted` to `true`; arbitrary fields and physical deletion are not exposed.
+Prepared proposals expire after 24 hours. Terminal proposals are retained for
+30 days, and an uncertain write or verification result becomes `needs_review`
+instead of being retried automatically.
 
 Planning analytics are deliberately conservative:
 
@@ -95,13 +113,14 @@ server through a runtime overlay.
 For a private remote deployment, `zenmoney-mcp-http` exposes Streamable HTTP
 at `/mcp` only inside Docker, and the OpenAI Secure MCP Tunnel client connects
 outbound to OpenAI. The remote registry excludes the local API-dependent
-`sync_data` and `suggest_category` tools. Its financial tools remain
-read-only; remote-only `force_sync` can asynchronously request an
-incremental or full cache refresh from the separate credentialed worker, and
-`get_sync_status` reports progress and the last successful sync. The MCP
+`sync_data` and `suggest_category` tools. Its analytical tools remain read-only.
+Remote `force_sync` can request a cache refresh, while confirmed transaction
+proposals are queued for the separate credentialed worker. `get_sync_status`
+and `get_transaction_change_proposal` report their respective progress. The MCP
 container still receives no ZenMoney token and cannot write the financial
-snapshot directly. See the [remote operations runbook](deploy/remote-mcp/README.md)
-and [threat model](docs/remote-mcp-threat-model.md).
+snapshot or call ZenMoney directly. See the
+[remote operations runbook](deploy/remote-mcp/README.md) and
+[threat model](docs/remote-mcp-threat-model.md).
 
 ## Hardening in this fork
 
@@ -202,7 +221,9 @@ uv sync --extra dev
    `force_sync` only asks that credentialed worker to run immediately.
 3. Both modes publish a SQLite cache at `~/.cache/zenmoney-mcp/zenmoney.db` or
    the configured `ZENMONEY_DB_PATH`; analytics read that cache locally.
-4. Only sync and category suggestion make read-only requests to ZenMoney.
+4. A local confirmed proposal is written synchronously. A remote confirmed
+   proposal is persisted on the control volume and written by the worker.
+5. Only the local process or credentialed worker can call ZenMoney.
 
 ## Testing
 

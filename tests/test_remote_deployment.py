@@ -124,6 +124,8 @@ def test_operations_and_ci_cover_sensitive_backups_pin_updates_and_runtime_smoke
 
     assert "ZENMONEY_TOKEN" not in env_example
     assert "sensitive financial data" in runbook
+    assert "previews and results" in runbook
+    assert "never automatically replays" in runbook
     assert "docker buildx imagetools inspect" in runbook
     assert "github.com/openai/tunnel-client/releases" in runbook
     assert "validate_snapshot" in runbook

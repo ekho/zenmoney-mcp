@@ -311,6 +311,13 @@ class ProposalStore:
             ).fetchall()
         ]
 
+    def next_pending_id(self) -> str | None:
+        row = self._connect().execute(
+            "SELECT id FROM proposals WHERE status='pending' "
+            "ORDER BY requested_at,id LIMIT 1"
+        ).fetchone()
+        return None if row is None else str(row["id"])
+
     def finish(
         self,
         proposal_id: str,
