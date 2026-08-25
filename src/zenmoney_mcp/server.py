@@ -78,13 +78,13 @@ from .sync_control import (
     read_sync_state,
     request_sync,
 )
-from .transaction_mutations import (
+from .mutations import (
     MutationStateError,
     MutationValidationError,
     ProposalStore,
-    execute_transaction_proposal,
-    get_transaction_change_proposal,
-    prepare_transaction_changes,
+    execute_proposal,
+    get_change_proposal,
+    prepare_changes,
 )
 
 
@@ -1298,7 +1298,17 @@ async def _dispatch_mutation_tool(
             if set(arguments) != {"changes"}:
                 raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
             try:
-                result = prepare_transaction_changes(db, store, arguments["changes"])
+                operations = [
+                    {
+                        "operation": "update",
+                        "id": change["transaction_id"],
+                        "set": change["set"],
+                    }
+                    for change in arguments["changes"]
+                ]
+                result = prepare_changes(
+                    db, store, operations, entity_type="transaction"
+                )
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
             except MutationValidationError:
@@ -1315,11 +1325,11 @@ async def _dispatch_mutation_tool(
         proposal_id = arguments["proposal_id"]
         try:
             if name == "get_transaction_change_proposal":
-                result = get_transaction_change_proposal(store, proposal_id)
+                result = get_change_proposal(store, proposal_id)
             elif remote:
                 result = store.request_apply(proposal_id)
             else:
-                result = await execute_transaction_proposal(
+                result = await execute_proposal(
                     db, get_sync_engine(), store, proposal_id
                 )
         except MutationStateError:

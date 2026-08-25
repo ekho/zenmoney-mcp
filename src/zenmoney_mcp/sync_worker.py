@@ -23,10 +23,10 @@ from .sync_control import (
     claim_sync_request,
     finish_sync_request,
 )
-from .transaction_mutations import (
+from .mutations import (
     DEFAULT_MUTATION_PATH,
     ProposalStore,
-    execute_transaction_proposal,
+    execute_proposal,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ async def execute_next_mutation(
         if proposal_id is None:
             return False
         engine = HardenedSyncEngine(database, read_secret("ZENMONEY_TOKEN"))
-        await execute_transaction_proposal(
+        await execute_proposal(
             database, engine, store, proposal_id
         )
         return True

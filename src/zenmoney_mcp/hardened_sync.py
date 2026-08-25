@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from .entity_changes import DIFF_FIELDS
 from .hardened_database import HardenedDatabase
 
 ZENMONEY_API_URL = "https://api.zenmoney.ru/v8/diff/"
@@ -189,16 +190,21 @@ class HardenedSyncEngine:
         result["sync_duration_ms"] = int((time.time() - started) * 1000)
         return result
 
-    async def push_transactions(
-        self, transactions: list[dict[str, Any]]
+    async def push_changes(
+        self, changes: dict[str, list[dict[str, Any]]]
     ) -> dict[str, Any]:
-        """Send complete changed transactions through the diff endpoint."""
-        if not transactions:
-            raise SyncError("transaction write batch must not be empty")
+        """Send one non-empty mixed user-entity change set."""
+        if (
+            not isinstance(changes, dict)
+            or not changes
+            or set(changes) - set(DIFF_FIELDS.values())
+            or any(not isinstance(items, list) or not items for items in changes.values())
+        ):
+            raise SyncError("user-entity write batch is invalid")
         request_body = {
             "currentClientTimestamp": int(time.time()),
             "serverTimestamp": self.db.get_server_timestamp(),
-            "transaction": transactions,
+            **changes,
         }
         payload = await self._post_diff(request_body, 60.0, 1)
         return self.apply_diff_data(

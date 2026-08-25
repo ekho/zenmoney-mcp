@@ -9,7 +9,7 @@ import pytest
 from zenmoney_mcp import sync_worker
 from zenmoney_mcp.sync_control import read_sync_state, request_sync
 from zenmoney_mcp.sync_worker import parse_interval, read_secret, run_worker, sync_once
-from zenmoney_mcp.transaction_mutations import ProposalStore, prepare_transaction_changes
+from zenmoney_mcp.mutations import ProposalStore, prepare_changes
 
 
 def test_read_secret_prefers_nonblank_file(monkeypatch, tmp_path):
@@ -278,12 +278,13 @@ async def test_execute_next_mutation_applies_one_pending_proposal(
             "tag": [], "deleted": False,
         }]
     )
-    db.set_meta("transaction_raw_complete", "1")
+    db.set_meta("user_entity_raw_complete", "1")
     store = ProposalStore(proposal_path)
-    prepared = prepare_transaction_changes(
+    prepared = prepare_changes(
         db,
         store,
-        [{"transaction_id": "tx", "set": {"comment": "fixed"}}],
+        [{"operation": "update", "id": "tx", "set": {"comment": "fixed"}}],
+        entity_type="transaction",
     )
     store.request_apply(prepared["proposal_id"])
     store.close()
@@ -297,8 +298,8 @@ async def test_execute_next_mutation_applies_one_pending_proposal(
         async def sync(self, force_full=False):
             return {"status": "synced"}
 
-        async def push_transactions(self, transactions):
-            self.db.upsert_transactions(transactions)
+        async def push_changes(self, changes):
+            self.db.upsert_transactions(changes["transaction"])
             return {"status": "synced"}
 
     monkeypatch.setenv("ZENMONEY_TOKEN", "token")
@@ -323,9 +324,10 @@ async def test_execute_next_mutation_does_not_replay_leftover_running_proposal(
     store = ProposalStore(proposal_path)
     proposal_id = store.create(
         [{
-            "transaction_id": "tx",
+            "entity_type": "transaction",
+            "entity_key": '"tx"',
+            "operation": "update",
             "expected_changed": 1,
-            "patch": {"comment": "fixed"},
             "before": {"comment": None},
             "after": {"comment": "fixed"},
         }]

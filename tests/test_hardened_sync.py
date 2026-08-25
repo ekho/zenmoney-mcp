@@ -155,7 +155,7 @@ async def test_incremental_http_sync_does_not_retry_protocol_errors(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_push_transactions_sends_full_objects_and_applies_response(monkeypatch):
+async def test_push_changes_sends_one_mixed_diff_and_applies_response(monkeypatch):
     db = base_db()
     engine = HardenedSyncEngine(db, "token")
     seen: dict = {}
@@ -194,9 +194,18 @@ async def test_push_transactions_sends_full_objects_and_applies_response(monkeyp
 
     monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient", Client)
 
-    result = await engine.push_transactions([transaction])
+    tag = {
+        "id": "tag",
+        "user": 1,
+        "title": "Food",
+        "changed": 100,
+    }
+    result = await engine.push_changes(
+        {"tag": [tag], "transaction": [transaction]}
+    )
 
     assert seen["json"]["serverTimestamp"] == 10
+    assert seen["json"]["tag"] == [tag]
     assert seen["json"]["transaction"] == [transaction]
     assert seen["timeout"] == 60.0
     assert result["new_server_timestamp"] == 101

@@ -49,7 +49,7 @@ def _write_snapshot(
             "tag": [], "deleted": False,
         }]
     )
-    database.set_meta("transaction_raw_complete", "1")
+    database.set_meta("user_entity_raw_complete", "1")
     database.set_meta("server_timestamp", str(timestamp))
     database.close()
 

@@ -92,15 +92,15 @@ async def test_local_transaction_change_tools_prepare_and_apply_exact_proposal(
             "tag": [], "deleted": False,
         }]
     )
-    db.set_meta("transaction_raw_complete", "1")
+    db.set_meta("user_entity_raw_complete", "1")
     db.set_server_timestamp(10)
 
     class Engine:
         async def sync(self, force_full=False):
             return {"status": "synced"}
 
-        async def push_transactions(self, transactions):
-            db.upsert_transactions(transactions)
+        async def push_changes(self, changes):
+            db.upsert_transactions(changes["transaction"])
             return {"status": "synced"}
 
     monkeypatch.setattr(server, "get_sync_engine", Engine)

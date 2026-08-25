@@ -1,18 +1,24 @@
-"""Persistent two-step transaction mutation proposals."""
+"""Persistent two-step proposals for ZenMoney user-entity changes."""
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
+from .entity_changes import (
+    DIFF_FIELDS,
+    MutationStateError,
+    MutationValidationError,
+    normalize_operations,
+    rebuild_after,
+    verify_after,
+)
 from .hardened_database import HardenedDatabase
 
 DEFAULT_MUTATION_PATH = Path("/sync-control/mutation-proposals.db")
@@ -23,36 +29,6 @@ TERMINAL_STATUSES = frozenset(
     {"applied", "conflicted", "failed", "needs_review", "expired"}
 )
 ITEM_RESULTS = frozenset({"applied", "unchanged", "conflicted", "unknown"})
-EDITABLE_FIELDS = frozenset(
-    {
-        "date",
-        "income",
-        "outcome",
-        "incomeAccount",
-        "outcomeAccount",
-        "incomeInstrument",
-        "outcomeInstrument",
-        "tag",
-        "merchant",
-        "payee",
-        "comment",
-        "opIncome",
-        "opOutcome",
-        "opIncomeInstrument",
-        "opOutcomeInstrument",
-        "latitude",
-        "longitude",
-        "deleted",
-    }
-)
-
-
-class MutationValidationError(ValueError):
-    """Raised when a proposed transaction result is unsafe or invalid."""
-
-
-class MutationStateError(ValueError):
-    """Raised when proposal or snapshot state cannot be used safely."""
 
 
 def _now(value: int | None) -> int:
@@ -65,12 +41,23 @@ def _json(value: Any) -> str:
     )
 
 
-def _decode(value: str) -> Any:
-    return json.loads(value)
+def _decode(value: str | None) -> Any:
+    return None if value is None else json.loads(value)
+
+
+def _public_key(entity_type: str, value: str) -> Any:
+    key = _decode(value)
+    if entity_type == "budget":
+        return {
+            "owner_user_id": key["user"],
+            "tag": key["tag"],
+            "date": key["date"],
+        }
+    return key
 
 
 class ProposalStore:
-    """SQLite ledger for immutable transaction change proposals."""
+    """Private SQLite ledger for immutable mixed change proposals."""
 
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -104,7 +91,23 @@ class ProposalStore:
         return self._conn
 
     def _init_schema(self) -> None:
-        self._connect().executescript(
+        conn = self._connect()
+        old_items = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proposal_items'"
+        ).fetchone()
+        if old_items is not None:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(proposal_items)")
+            }
+            if "transaction_id" in columns:
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.execute(
+                    "ALTER TABLE proposal_items RENAME TO proposal_items_transaction_v1"
+                )
+                conn.execute("ALTER TABLE proposals RENAME TO proposals_transaction_v1")
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS proposals (
                 id TEXT PRIMARY KEY,
@@ -119,20 +122,21 @@ class ProposalStore:
             CREATE TABLE IF NOT EXISTS proposal_items (
                 proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
-                transaction_id TEXT NOT NULL,
-                expected_changed INTEGER NOT NULL,
-                patch_json TEXT NOT NULL,
-                before_json TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_key_json TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                expected_changed INTEGER,
+                before_json TEXT,
                 after_json TEXT NOT NULL,
                 result TEXT,
-                PRIMARY KEY (proposal_id, position),
-                UNIQUE (proposal_id, transaction_id)
+                PRIMARY KEY(proposal_id, position),
+                UNIQUE(proposal_id, entity_type, entity_key_json)
             );
             CREATE INDEX IF NOT EXISTS idx_proposals_status_created
             ON proposals(status, created_at);
             """
         )
-        self._connect().commit()
+        conn.commit()
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -156,11 +160,9 @@ class ProposalStore:
         cutoff = timestamp - TERMINAL_RETENTION_SECONDS
         with self._write() as conn:
             conn.execute(
-                """
-                UPDATE proposals
-                SET status='expired', finished_at=?, failure_code='proposal_expired'
-                WHERE status='prepared' AND expires_at <= ?
-                """,
+                "UPDATE proposals SET status='expired',finished_at=?,"
+                "failure_code='proposal_expired' "
+                "WHERE status='prepared' AND expires_at <= ?",
                 (timestamp, timestamp),
             )
             placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
@@ -177,28 +179,24 @@ class ProposalStore:
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO proposals(id,status,created_at,expires_at) VALUES (?,?,?,?)",
-                (
-                    proposal_id,
-                    "prepared",
-                    timestamp,
-                    timestamp + PREPARED_TTL_SECONDS,
-                ),
+                (proposal_id, "prepared", timestamp, timestamp + PREPARED_TTL_SECONDS),
             )
             conn.executemany(
                 """
                 INSERT INTO proposal_items(
-                    proposal_id,position,transaction_id,expected_changed,
-                    patch_json,before_json,after_json
-                ) VALUES (?,?,?,?,?,?,?)
+                    proposal_id,position,entity_type,entity_key_json,operation,
+                    expected_changed,before_json,after_json
+                ) VALUES (?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
                         proposal_id,
                         position,
-                        item["transaction_id"],
+                        item["entity_type"],
+                        item["entity_key"],
+                        item["operation"],
                         item["expected_changed"],
-                        _json(item["patch"]),
-                        _json(item["before"]),
+                        _json(item["before"]) if item["before"] is not None else None,
                         _json(item["after"]),
                     )
                     for position, item in enumerate(items)
@@ -208,10 +206,9 @@ class ProposalStore:
 
     def _public(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         item_rows = conn.execute(
-            """
-            SELECT transaction_id,expected_changed,before_json,after_json,result
-            FROM proposal_items WHERE proposal_id=? ORDER BY position
-            """,
+            "SELECT position,entity_type,entity_key_json,operation,expected_changed,"
+            "before_json,after_json,result FROM proposal_items "
+            "WHERE proposal_id=? ORDER BY position",
             (row["id"],),
         ).fetchall()
         items = []
@@ -220,11 +217,19 @@ class ProposalStore:
             after = _decode(item["after_json"])
             items.append(
                 {
-                    "transaction_id": item["transaction_id"],
+                    "entity": item["entity_type"],
+                    "key": _public_key(
+                        item["entity_type"], item["entity_key_json"]
+                    ),
+                    "operation": item["operation"],
                     "expected_changed": item["expected_changed"],
                     "changes": {
-                        key: {"before": before[key], "after": after[key]}
+                        key: {
+                            "before": None if before is None else before.get(key),
+                            "after": after[key],
+                        }
                         for key in sorted(after)
+                        if key not in {"changed", "created", "user"}
                     },
                     "result": item["result"],
                 }
@@ -247,11 +252,10 @@ class ProposalStore:
         except (AttributeError, TypeError, ValueError):
             return None
         self.cleanup(now)
-        conn = self._connect()
-        row = conn.execute(
+        row = self._connect().execute(
             "SELECT * FROM proposals WHERE id=?", (proposal_id,)
         ).fetchone()
-        return None if row is None else self._public(conn, row)
+        return None if row is None else self._public(self._connect(), row)
 
     def request_apply(
         self, proposal_id: str, now: int | None = None
@@ -287,7 +291,8 @@ class ProposalStore:
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT * FROM proposals WHERE id=? AND status IN ('prepared','pending')",
+                    "SELECT * FROM proposals WHERE id=? "
+                    "AND status IN ('prepared','pending')",
                     (proposal_id,),
                 ).fetchone()
             if row is None:
@@ -304,9 +309,12 @@ class ProposalStore:
     def execution_items(self, proposal_id: str) -> list[dict[str, Any]]:
         return [
             {
-                "transaction_id": row["transaction_id"],
+                "position": row["position"],
+                "entity_type": row["entity_type"],
+                "entity_key": row["entity_key_json"],
+                "operation": row["operation"],
                 "expected_changed": row["expected_changed"],
-                "patch": _decode(row["patch_json"]),
+                "before": _decode(row["before_json"]),
                 "after": _decode(row["after_json"]),
             }
             for row in self._connect().execute(
@@ -326,7 +334,7 @@ class ProposalStore:
         self,
         proposal_id: str,
         status: str,
-        item_results: dict[str, str],
+        item_results: dict[int, str],
         failure_code: str | None,
         now: int | None = None,
     ) -> dict[str, Any]:
@@ -346,11 +354,10 @@ class ProposalStore:
                 (status, timestamp, failure_code, proposal_id),
             )
             conn.executemany(
-                "UPDATE proposal_items SET result=? "
-                "WHERE proposal_id=? AND transaction_id=?",
+                "UPDATE proposal_items SET result=? WHERE proposal_id=? AND position=?",
                 [
-                    (result, proposal_id, transaction_id)
-                    for transaction_id, result in item_results.items()
+                    (result, proposal_id, position)
+                    for position, result in item_results.items()
                 ],
             )
             proposal = conn.execute(
@@ -381,202 +388,25 @@ class ProposalStore:
             return len(ids)
 
 
-def _reference_exists(
-    db: HardenedDatabase, table: str, object_id: str | int
-) -> bool:
-    return (
-        db.connect()
-        .execute(f"SELECT 1 FROM {table} WHERE id=?", (object_id,))
-        .fetchone()
-        is not None
-    )
-
-
-def _number(value: Any, field: str, *, nullable: bool = False) -> float | None:
-    if value is None and nullable:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise MutationValidationError(f"{field} must be a number")
-    if not math.isfinite(value):
-        raise MutationValidationError(f"{field} must be finite")
-    if value < 0:
-        raise MutationValidationError(f"{field} must be non-negative")
-    return value
-
-
-def validate_transaction_patch(
-    db: HardenedDatabase, raw: dict[str, Any], patch: Any
-) -> dict[str, Any]:
-    """Return a validated full transaction with the patch applied."""
-    if not isinstance(patch, dict) or not patch:
-        raise MutationValidationError("set must be a non-empty object")
-    forbidden = set(patch) - EDITABLE_FIELDS
-    if forbidden:
-        raise MutationValidationError(
-            f"field {sorted(forbidden)[0]} is not editable"
-        )
-    if "deleted" in patch and patch["deleted"] is not True:
-        raise MutationValidationError("deleted can only be set to true")
-
-    result = {**raw, **patch}
-    if raw.get("deleted") and patch.get("deleted") is True:
-        raise MutationValidationError("deleted transaction cannot be restored or deleted again")
-
-    if "date" in patch:
-        try:
-            parsed = date.fromisoformat(patch["date"])
-        except (TypeError, ValueError) as exc:
-            raise MutationValidationError("date must be a real ISO date") from exc
-        if parsed.isoformat() != patch["date"]:
-            raise MutationValidationError("date must be a real ISO date")
-
-    for field in ("income", "outcome"):
-        _number(result.get(field), field)
-    if not result.get("deleted") and not (
-        result.get("income", 0) > 0 or result.get("outcome", 0) > 0
-    ):
-        raise MutationValidationError("income or outcome must be positive")
-
-    for field in ("opIncome", "opOutcome"):
-        _number(result.get(field), field, nullable=True)
-    for amount_field, instrument_field in (
-        ("opIncome", "opIncomeInstrument"),
-        ("opOutcome", "opOutcomeInstrument"),
-    ):
-        if (result.get(amount_field) is None) != (
-            result.get(instrument_field) is None
-        ):
-            raise MutationValidationError(
-                f"{amount_field} and {instrument_field} must be paired"
-            )
-
-    for field in ("incomeInstrument", "outcomeInstrument"):
-        value = result.get(field)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise MutationValidationError(f"{field} must be an instrument id")
-        if not _reference_exists(db, "instruments", value):
-            raise MutationValidationError(f"{field} instrument does not exist")
-
-    for field in ("opIncomeInstrument", "opOutcomeInstrument"):
-        value = result.get(field)
-        if value is not None and (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not _reference_exists(db, "instruments", value)
-        ):
-            raise MutationValidationError(f"{field} instrument does not exist")
-
-    for side in ("income", "outcome"):
-        account_field = f"{side}Account"
-        instrument_field = f"{side}Instrument"
-        account_id = result.get(account_field)
-        if not isinstance(account_id, str) or not account_id:
-            raise MutationValidationError(f"{account_field} must be an account id")
-        account = db.connect().execute(
-            "SELECT type,instrument FROM accounts WHERE id=?", (account_id,)
-        ).fetchone()
-        if account is None:
-            raise MutationValidationError(f"{account_field} account does not exist")
-        if account["type"] != "debt" and account["instrument"] != result.get(
-            instrument_field
-        ):
-            raise MutationValidationError(
-                f"{account_field} and {instrument_field} do not match"
-            )
-
-    tags = result.get("tag")
-    if tags is not None:
-        if (
-            not isinstance(tags, list)
-            or any(not isinstance(tag, str) or not tag for tag in tags)
-            or len(tags) != len(set(tags))
-        ):
-            raise MutationValidationError("tag must contain unique tag ids")
-        for tag in tags:
-            if not _reference_exists(db, "tags", tag):
-                raise MutationValidationError(f"tag {tag} does not exist")
-
-    merchant = result.get("merchant")
-    if merchant is not None and (
-        not isinstance(merchant, str)
-        or not merchant
-        or not _reference_exists(db, "merchants", merchant)
-    ):
-        raise MutationValidationError("merchant does not exist")
-
-    for field in ("payee", "comment"):
-        if result.get(field) is not None and not isinstance(result[field], str):
-            raise MutationValidationError(f"{field} must be a string or null")
-
-    for field, minimum, maximum in (
-        ("latitude", -90, 90),
-        ("longitude", -180, 180),
-    ):
-        value = result.get(field)
-        if value is not None:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise MutationValidationError(f"{field} must be a number")
-            _number(abs(value), field)
-            if value < minimum or value > maximum:
-                raise MutationValidationError(f"{field} is out of range")
-
-    return result
-
-
-def prepare_transaction_changes(
+def prepare_changes(
     db: HardenedDatabase,
     store: ProposalStore,
-    changes: Any,
+    operations: Any,
+    entity_type: str | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
-    """Validate and persist one immutable batch for later confirmation."""
-    if not isinstance(changes, list) or not 1 <= len(changes) <= MAX_PROPOSAL_ITEMS:
-        raise MutationValidationError("changes must contain 1 to 100 items")
-    if not db.transaction_mutations_ready():
+    """Validate and store one immutable ordered proposal."""
+    if not db.user_entity_mutations_ready():
         raise MutationStateError("a successful full sync is required")
-
-    ids: list[str] = []
-    prepared: list[dict[str, Any]] = []
-    for change in changes:
-        if not isinstance(change, dict) or set(change) != {"transaction_id", "set"}:
-            raise MutationValidationError(
-                "each change requires transaction_id and set"
-            )
-        transaction_id = change["transaction_id"]
-        if not isinstance(transaction_id, str) or not transaction_id:
-            raise MutationValidationError("transaction_id must be a string")
-        ids.append(transaction_id)
-        if len(ids) != len(set(ids)):
-            raise MutationValidationError("duplicate transaction_id")
-        raw = db.get_transaction_raw(transaction_id)
-        if raw is None:
-            raise MutationValidationError("transaction does not have full raw data")
-        result = validate_transaction_patch(db, raw, change["set"])
-        before = {key: raw.get(key) for key in change["set"]}
-        after = {key: result.get(key) for key in change["set"]}
-        if before == after:
-            raise MutationValidationError("set does not change the transaction")
-        changed = raw.get("changed")
-        if isinstance(changed, bool) or not isinstance(changed, int):
-            raise MutationValidationError("transaction changed timestamp is invalid")
-        prepared.append(
-            {
-                "transaction_id": transaction_id,
-                "expected_changed": changed,
-                "patch": change["set"],
-                "before": before,
-                "after": after,
-            }
-        )
-
     timestamp = _now(now)
-    proposal_id = store.create(prepared, timestamp)
+    items = normalize_operations(db, operations, entity_type, timestamp)
+    proposal_id = store.create(items, timestamp)
     proposal = store.get(proposal_id, timestamp)
     assert proposal is not None
     return proposal
 
 
-def get_transaction_change_proposal(
+def get_change_proposal(
     store: ProposalStore, proposal_id: str, now: int | None = None
 ) -> dict[str, Any]:
     proposal = store.get(proposal_id, now)
@@ -585,14 +415,18 @@ def get_transaction_change_proposal(
     return proposal
 
 
-async def execute_transaction_proposal(
+def _results(items: list[dict[str, Any]], result: str) -> dict[int, str]:
+    return {item["position"]: result for item in items}
+
+
+async def execute_proposal(
     db: HardenedDatabase,
     engine: Any,
     store: ProposalStore,
     proposal_id: str,
     now: int | None = None,
 ) -> dict[str, Any]:
-    """Execute one exact confirmed proposal or return its current state."""
+    """Execute one exact proposal once, failing closed around ambiguous writes."""
     timestamp = _now(now)
     current = store.get(proposal_id, timestamp)
     if current is None:
@@ -607,7 +441,7 @@ async def execute_transaction_proposal(
             raise MutationStateError("proposal not found")
         return current
     items = store.execution_items(proposal_id)
-    unchanged = {item["transaction_id"]: "unchanged" for item in items}
+    unchanged = _results(items, "unchanged")
 
     try:
         await engine.sync(force_full=False)
@@ -615,42 +449,50 @@ async def execute_transaction_proposal(
         return store.finish(
             proposal_id, "failed", unchanged, "preflight_sync_failed", timestamp
         )
-
-    raw_objects: dict[str, dict[str, Any]] = {}
-    conflicts: dict[str, str] = {}
-    for item in items:
-        transaction_id = item["transaction_id"]
-        raw = db.get_transaction_raw(transaction_id)
-        if raw is None or raw.get("changed") != item["expected_changed"]:
-            conflicts[transaction_id] = "conflicted"
-        else:
-            raw_objects[transaction_id] = raw
-    if conflicts:
-        results = {**unchanged, **conflicts}
+    if not db.user_entity_mutations_ready():
         return store.finish(
-            proposal_id, "conflicted", results, "transaction_changed", timestamp
+            proposal_id, "failed", unchanged, "mutation_not_ready", timestamp
         )
 
-    outgoing: list[dict[str, Any]] = []
+    raw_objects: dict[int, dict[str, Any] | None] = {}
+    conflicts: dict[int, str] = {}
+    collision = False
+    for item in items:
+        raw = db.get_entity_raw(item["entity_type"], item["entity_key"])
+        raw_objects[item["position"]] = raw
+        if item["operation"] == "create":
+            if raw is not None:
+                conflicts[item["position"]] = "conflicted"
+                collision = True
+        elif raw is None or raw.get("changed") != item["expected_changed"]:
+            conflicts[item["position"]] = "conflicted"
+    if conflicts:
+        return store.finish(
+            proposal_id,
+            "conflicted",
+            {**unchanged, **conflicts},
+            "create_identity_exists" if collision else "entity_changed",
+            timestamp,
+        )
+
+    outgoing: dict[str, list[dict[str, Any]]] = {}
     try:
         for item in items:
-            transaction = validate_transaction_patch(
-                db, raw_objects[item["transaction_id"]], item["patch"]
-            )
-            outgoing.append({**transaction, "changed": timestamp})
+            value = rebuild_after(db, item, raw_objects[item["position"]])
+            value["changed"] = timestamp
+            outgoing.setdefault(DIFF_FIELDS[item["entity_type"]], []).append(value)
     except MutationValidationError:
         return store.finish(
-            proposal_id, "failed", unchanged, "transaction_invalid", timestamp
+            proposal_id, "failed", unchanged, "entity_invalid", timestamp
         )
 
     try:
-        await engine.push_transactions(outgoing)
+        await engine.push_changes(outgoing)
     except Exception:
-        unknown = {item["transaction_id"]: "unknown" for item in items}
         return store.finish(
             proposal_id,
             "needs_review",
-            unknown,
+            _results(items, "unknown"),
             "write_result_unknown",
             timestamp,
         )
@@ -658,26 +500,27 @@ async def execute_transaction_proposal(
     try:
         await engine.sync(force_full=False)
     except Exception:
-        unknown = {item["transaction_id"]: "unknown" for item in items}
         return store.finish(
             proposal_id,
             "needs_review",
-            unknown,
+            _results(items, "unknown"),
             "verification_failed",
             timestamp,
         )
 
-    results: dict[str, str] = {}
+    results: dict[int, str] = {}
     for item in items:
-        raw = db.get_transaction_raw(item["transaction_id"])
-        if raw is None:
-            results[item["transaction_id"]] = "unknown"
-        elif all(raw.get(key) == value for key, value in item["patch"].items()):
-            results[item["transaction_id"]] = "applied"
-        elif raw.get("changed") != item["expected_changed"]:
-            results[item["transaction_id"]] = "conflicted"
+        raw = db.get_entity_raw(item["entity_type"], item["entity_key"])
+        if verify_after(item, raw):
+            results[item["position"]] = "applied"
+        elif (
+            item["operation"] != "create"
+            and raw is not None
+            and raw.get("changed") != item["expected_changed"]
+        ):
+            results[item["position"]] = "conflicted"
         else:
-            results[item["transaction_id"]] = "unknown"
+            results[item["position"]] = "unknown"
 
     if all(result == "applied" for result in results.values()):
         return store.finish(proposal_id, "applied", results, None, timestamp)
