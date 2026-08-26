@@ -111,6 +111,27 @@ def test_release_workflow_publishes_fresh_distributions_with_oidc():
     assert "run: uv publish" in workflow
 
 
+def test_release_image_uses_the_built_wheel_with_locked_dependencies():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    docker_job = workflow[
+        workflow.index("  docker-compose:") : workflow.index("  remote-mcp-smoke:")
+    ]
+    publish_job = workflow[
+        workflow.index("  publish-image:") : workflow.index("  publish-pypi:")
+    ]
+
+    assert docker_job.index("uv build --wheel --no-sources") < docker_job.index(
+        "docker build -t zenmoney-mcp:remote-test ."
+    )
+    assert "name: dist" in publish_job
+    assert "path: dist/" in publish_job
+    assert "COPY dist/*.whl" in dockerfile
+    assert "uv sync --frozen --no-dev --no-install-project" in dockerfile
+    assert "uv pip install --no-deps" in dockerfile
+    assert "COPY src" not in dockerfile
+
+
 def test_readme_uses_the_pypi_distribution_for_uvx():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
