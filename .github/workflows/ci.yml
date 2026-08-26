@@ -88,3 +88,36 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Exercise local Streamable HTTP MCP
         run: python -m pytest tests/test_remote_http.py -q
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [python, docker-compose, remote-mcp-smoke]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+      - name: Use the tested revision
+        run: git reset --hard "${{ github.sha }}"
+      - name: Require the v0.2.0 release baseline
+        run: >-
+          git merge-base --is-ancestor
+          "refs/tags/v0.2.0^{commit}"
+          "${{ github.sha }}"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+      - name: Create semantic release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # ponytail: GitPython 3.1.59 avoids PSR #1476; remove the pin after a fixed PSR release.
+        run: >-
+          uvx --from python-semantic-release==10.6.1
+          --with GitPython==3.1.59
+          semantic-release version --no-changelog
