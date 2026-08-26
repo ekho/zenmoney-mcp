@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 def test_semantic_release_manages_every_version_source():
@@ -19,3 +20,32 @@ def test_semantic_release_manages_every_version_source():
     assert release["tag_format"] == "v{version}"
     assert 'uv lock --upgrade-package "$PACKAGE_NAME"' in release["build_command"]
     assert "git add uv.lock" in release["build_command"]
+
+
+def test_release_publishes_versioned_and_latest_ghcr_images():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    release_job = workflow[
+        workflow.index("  release:") : workflow.index("  publish-image:")
+    ]
+    publish_job = workflow[workflow.index("  publish-image:") :]
+
+    assert "packages: write" not in release_job
+    assert "version: ${{ steps.release.outputs.version }}" in release_job
+    assert 'if [ "$(git rev-parse HEAD)" = "$original_head" ]' in release_job
+    assert 'version="$(uv version --short)"' in release_job
+
+    assert "needs: release" in publish_job
+    assert "if: needs.release.outputs.version != ''" in publish_job
+    assert "group: publish-image" in publish_job
+    assert "queue: max" in publish_job
+    assert "packages: write" in publish_job
+    assert "ref: v${{ needs.release.outputs.version }}" in publish_job
+    assert "docker login ghcr.io" in publish_job
+    assert (
+        "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+        in publish_job
+    )
+    assert '--tag "$image:$VERSION"' in publish_job
+    assert '--tag "$image:latest"' in publish_job
+    assert 'docker push "$image:$VERSION"' in publish_job
+    assert 'docker push "$image:latest"' in publish_job
