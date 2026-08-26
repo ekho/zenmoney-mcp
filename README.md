@@ -1,5 +1,7 @@
 # ZenMoney MCP Server
 
+[Документация на русском](README.ru.md)
+
 MCP server for trustworthy personal-finance analytics and explicitly confirmed
 user-entity changes over the [ZenMoney](https://zenmoney.ru/) API. The project
 started as a fork of [nnslvp/zenmoney-mcp](https://github.com/nnslvp/zenmoney-mcp)
