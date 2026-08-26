@@ -230,7 +230,7 @@ secret in `.env`. Then pull and start the deployment:
 
 ```bash
 docker compose --env-file deploy/remote-mcp/.env \
-  -f deploy/remote-mcp/compose.yaml pull zenmoney-mcp zenmoney-sync
+  -f deploy/remote-mcp/compose.yaml pull
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml up -d --no-build --pull never
 docker compose --env-file deploy/remote-mcp/.env \

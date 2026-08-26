@@ -22,15 +22,17 @@ GHCR_IMAGE = "ghcr.io/ekho/zenmoney-mcp:0.4.0"
 
 
 def _compose_config() -> dict:
+    environment = {
+        **os.environ,
+        "CONTROL_PLANE_TUNNEL_ID": "tunnel_0123456789abcdef0123456789abcdef",
+    }
+    environment.pop("ZENMONEY_IMAGE", None)
     result = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
         cwd=ROOT,
         check=True,
         capture_output=True,
-        env={
-            **os.environ,
-            "CONTROL_PLANE_TUNNEL_ID": "tunnel_0123456789abcdef0123456789abcdef",
-        },
+        env=environment,
         text=True,
     )
     return json.loads(result.stdout)
@@ -129,6 +131,7 @@ def test_deployment_uses_the_versioned_ghcr_image():
     assert f"ZENMONEY_IMAGE={GHCR_IMAGE}" in env_example
     assert "docker compose --env-file deploy/remote-mcp/.env" in runbook
     assert "-f deploy/remote-mcp/compose.yaml pull" in runbook
+    assert "pull zenmoney-mcp zenmoney-sync" not in runbook
     assert "ZENMONEY_IMAGE: zenmoney-mcp:remote-test" in workflow
 
 
