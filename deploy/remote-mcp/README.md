@@ -70,7 +70,7 @@ docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml ps
 ```
 
-The application image is `ghcr.io/ekho/zenmoney-mcp:0.4.0`. The pinned base
+The application image is `ghcr.io/ekho/zenmoney-mcp:0.4.1`. The pinned base
 images are `python:3.12.14-slim-bookworm@sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134`,
 `ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1`,
 and `ghcr.io/openai/tunnel-client:v0.0.12@sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e`.

@@ -1,5 +1,5 @@
 x-app: &app
-  image: ${ZENMONEY_IMAGE:-ghcr.io/ekho/zenmoney-mcp:0.4.0}
+  image: ${ZENMONEY_IMAGE:-ghcr.io/ekho/zenmoney-mcp:0.4.1}
   user: "10001:10001"
   read_only: true
   cap_drop: [ALL]

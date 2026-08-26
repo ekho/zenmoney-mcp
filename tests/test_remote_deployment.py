@@ -18,7 +18,7 @@ TUNNEL_IMAGE = (
     "ghcr.io/openai/tunnel-client:v0.0.12@"
     "sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e"
 )
-GHCR_IMAGE = "ghcr.io/ekho/zenmoney-mcp:0.4.0"
+GHCR_IMAGE = "ghcr.io/ekho/zenmoney-mcp:0.4.1"
 
 
 def _compose_config() -> dict:
