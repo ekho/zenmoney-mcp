@@ -126,6 +126,9 @@ def test_no_release_does_not_republish_the_previous_version(tmp_path):
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text('#!/bin/sh\nprintf "v0.5.1\\n"\n', encoding="utf-8")
+    fake_git.chmod(0o755)
     fake_uvx = fake_bin / "uvx"
     fake_uvx.write_text(
         '#!/bin/sh\nprintf "version=0.5.1\\n" >> "$GITHUB_OUTPUT"\n',
