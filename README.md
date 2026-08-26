@@ -192,6 +192,9 @@ More detail is available in
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
 the server directly from GitHub:
 
+Get a personal API token at [zerro.app/token](https://zerro.app/token), as
+documented in the [official ZenMoney API wiki](https://github.com/zenmoney/ZenPlugins/wiki/ZenMoney-API).
+
 ```bash
 export ZENMONEY_TOKEN="replace-with-your-token"
 uvx --from git+https://github.com/ekho/zenmoney-mcp.git zenmoney-mcp
