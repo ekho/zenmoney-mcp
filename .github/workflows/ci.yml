@@ -96,6 +96,8 @@ jobs:
     concurrency:
       group: release-main
       cancel-in-progress: false
+    outputs:
+      version: ${{ steps.release.outputs.version }}
     permissions:
       contents: write
     steps:
@@ -114,10 +116,48 @@ jobs:
         with:
           version: "0.12.5"
       - name: Create semantic release
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # ponytail: GitPython 3.1.59 avoids PSR #1476; remove the pin after a fixed PSR release.
-        run: >-
-          uvx --from python-semantic-release==10.6.1
-          --with GitPython==3.1.59
-          semantic-release version --no-changelog
+        run: |
+          original_head="$(git rev-parse HEAD)"
+          uvx --from python-semantic-release==10.6.1 \
+            --with GitPython==3.1.59 \
+            semantic-release version --no-changelog
+          if [ "$(git rev-parse HEAD)" = "$original_head" ]; then
+            exit 0
+          fi
+          version="$(uv version --short)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish-image:
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: v${{ needs.release.outputs.version }}
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and publish image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          image="$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          docker build \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --tag "$image:$VERSION" \
+            --tag "$image:latest" \
+            .
+          docker push "$image:$VERSION"
+          docker push "$image:latest"
