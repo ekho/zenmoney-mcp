@@ -1,9 +1,29 @@
 # ZenMoney MCP Server
 
 MCP server for trustworthy personal-finance analytics and explicitly confirmed
-user-entity changes over the [ZenMoney](https://zenmoney.ru/) API. This fork
-keeps its working data local and adds financially conservative calculations,
-atomic sync, and a two-step write workflow.
+user-entity changes over the [ZenMoney](https://zenmoney.ru/) API. The project
+started as a fork of [nnslvp/zenmoney-mcp](https://github.com/nnslvp/zenmoney-mcp)
+and is maintained here as a substantially extended version. It keeps its working
+data local and adds financially conservative calculations, atomic sync, and a
+two-step write workflow.
+
+## Complete tool catalog
+
+Both local and remote modes expose 56 tools. They share 54 tools and use two
+mode-specific tools for synchronization and category suggestions.
+
+| Area | Tools |
+|---|---|
+| Financial analytics | `get_net_worth`, `get_liquidity`, `analyze_spending`, `analyze_income`, `analyze_merchants`, `check_budget_health`, `get_upcoming_payments`, `analyze_trends`, `detect_recurring`, `get_account_flow`, `analyze_transfers`, `detect_anomalies`, `get_debts`, `convert_currency`, `get_exchange_rates`, `search_transactions` |
+| Planning analytics | `get_financial_snapshot`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
+| Decision support | `plan_emergency_fund`, `plan_debt_payoff`, `compare_debt_strategies`, `plan_financial_goal`, `plan_multiple_goals`, `run_financial_scenario`, `build_financial_plan` |
+| Entity reads | `list_accounts`, `get_account`, `list_tags`, `get_tag`, `list_merchants`, `get_merchant`, `list_reminders`, `get_reminder`, `list_reminder_markers`, `get_reminder_marker`, `list_transactions`, `get_transaction`, `list_budgets`, `get_budget` |
+| Confirmed entity changes | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_mixed_changes`, `get_change_proposal`, `apply_changes` |
+
+| Mode | Mode-specific tools |
+|---|---|
+| Local stdio | `sync_data`, `suggest_category` |
+| Remote through OpenAI Secure MCP Tunnel | `force_sync`, `get_sync_status` |
 
 ## Analytics
 
@@ -13,6 +33,7 @@ atomic sync, and a two-step write workflow.
 | Can I afford a purchase? | `get_liquidity` |
 | Where does my money go? | `analyze_spending` |
 | Where does my income come from? | `analyze_income` |
+| Which merchants receive my money? | `analyze_merchants` |
 | Am I within budget? | `check_budget_health` |
 | What subscriptions do I have? | `detect_recurring` |
 | How are income and spending changing? | `analyze_trends` |
@@ -166,7 +187,7 @@ Key semantics:
 More detail is available in
 [`README-HARDENING.md`](README-HARDENING.md).
 
-## Installation
+## Local installation with uvx
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
 the server directly from GitHub:
@@ -182,6 +203,42 @@ repository or creating a virtual environment is not required.
 The first hardened start performs additive SQLite migrations. Back up
 `~/.cache/zenmoney-mcp/zenmoney.db` before the first run when preserving an
 existing cache matters. A full sync can recreate the cache from ZenMoney.
+
+## Private ChatGPT installation with OpenAI Secure MCP Tunnel
+
+ChatGPT web cannot start the local stdio command. For private remote access,
+run the included Docker Compose deployment and connect it through
+[OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+The MCP endpoint stays inside the Docker network; only the tunnel client makes
+an outbound connection to OpenAI.
+
+This mode requires Docker Engine with Compose v2, a ZenMoney token, an OpenAI
+tunnel runtime API key, and a tunnel ID associated with the target ChatGPT
+workspace. Clone the repository and create the non-secret environment file:
+
+```bash
+git clone https://github.com/ekho/zenmoney-mcp.git ~/zenmoney-mcp
+cd ~/zenmoney-mcp
+cp deploy/remote-mcp/.env.example deploy/remote-mcp/.env
+```
+
+Set `CONTROL_PLANE_TUNNEL_ID` in `deploy/remote-mcp/.env`. Provision the
+ZenMoney token and OpenAI key as separate file-backed Compose secrets using the
+ownership and permission commands in the
+[remote operations runbook](deploy/remote-mcp/README.md); do not put either
+secret in `.env`. Then build and start the deployment:
+
+```bash
+docker build -t zenmoney-mcp:remote-test .
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml up -d
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml ps
+```
+
+Complete the health checks and `tunnel-client doctor` from the runbook, then add
+the MCP app in ChatGPT Developer Mode with **Connection = Tunnel** and scan its
+tools.
 
 ## ChatGPT Desktop and Codex
 
