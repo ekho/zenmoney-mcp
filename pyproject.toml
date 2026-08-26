@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zenmoney-mcp"
+name = "zenmoney-mcp-server"
 version = "0.4.1"
 description = "MCP server for trustworthy ZenMoney analytics and confirmed user-entity changes"
 readme = "README.md"
@@ -27,8 +27,15 @@ zenmoney-sync-once = "zenmoney_mcp.sync_worker:sync_once_main"
 zenmoney-sync-worker = "zenmoney_mcp.sync_worker:main"
 zenmoney-db-backup = "zenmoney_mcp.backup:main"
 
+[project.urls]
+Repository = "https://github.com/ekho/zenmoney-mcp"
+Issues = "https://github.com/ekho/zenmoney-mcp/issues"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/zenmoney_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src"]
 
 [tool.semantic_release]
 allow_zero_version = true

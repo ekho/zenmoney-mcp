@@ -190,18 +190,21 @@ More detail is available in
 ## Local installation with uvx
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
-the server directly from GitHub:
+the server from PyPI:
 
 Get a personal API token at [zerro.app/token](https://zerro.app/token), as
 documented in the [official ZenMoney API wiki](https://github.com/zenmoney/ZenPlugins/wiki/ZenMoney-API).
 
 ```bash
 export ZENMONEY_TOKEN="replace-with-your-token"
-uvx --from git+https://github.com/ekho/zenmoney-mcp.git zenmoney-mcp
+uvx --from zenmoney-mcp-server zenmoney-mcp
 ```
 
 `uvx` downloads the package into an isolated cached environment; cloning the
 repository or creating a virtual environment is not required.
+
+To run the current `main` branch before its next PyPI release, use
+`uvx --from git+https://github.com/ekho/zenmoney-mcp.git zenmoney-mcp`.
 
 The first hardened start performs additive SQLite migrations. Back up
 `~/.cache/zenmoney-mcp/zenmoney.db` before the first run when preserving an
