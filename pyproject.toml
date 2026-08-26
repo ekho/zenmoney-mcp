@@ -30,6 +30,19 @@ zenmoney-db-backup = "zenmoney_mcp.backup:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/zenmoney_mcp"]
 
+[tool.semantic_release]
+allow_zero_version = true
+major_on_zero = true
+build_command = """
+uv lock --upgrade-package "$PACKAGE_NAME"
+git add uv.lock
+"""
+commit_author = "github-actions <actions@github.com>"
+commit_message = "chore(release): v{version} [skip ci]"
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["src/zenmoney_mcp/__init__.py:__version__"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
