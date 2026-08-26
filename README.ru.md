@@ -1,5 +1,11 @@
 # ZenMoney MCP Server
 
+[![CI](https://github.com/ekho/zenmoney-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ekho/zenmoney-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/zenmoney-mcp-server.svg)](https://pypi.org/project/zenmoney-mcp-server/)
+[![Python](https://img.shields.io/pypi/pyversions/zenmoney-mcp-server.svg)](https://pypi.org/project/zenmoney-mcp-server/)
+[![Container](https://img.shields.io/badge/container-ghcr.io%2Fekho%2Fzenmoney--mcp-2496ED?logo=docker&logoColor=white)](https://github.com/ekho/zenmoney-mcp/pkgs/container/zenmoney-mcp)
+[![License: MIT](https://img.shields.io/github/license/ekho/zenmoney-mcp.svg)](LICENSE)
+
 [Documentation in English](README.md)
 
 MCP-сервер для надёжной аналитики личных финансов и явно подтверждённых
