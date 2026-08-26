@@ -42,10 +42,25 @@ def test_release_publishes_versioned_and_latest_ghcr_images():
     assert "ref: v${{ needs.release.outputs.version }}" in publish_job
     assert "docker login ghcr.io" in publish_job
     assert (
+        "docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8"
+        in publish_job
+    )
+    assert (
+        "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e"
+        in publish_job
+    )
+    assert (
+        "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+        in publish_job
+    )
+    assert "platforms: linux/amd64,linux/arm64" in publish_job
+    assert "push: true" in publish_job
+    assert (
         "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
         in publish_job
     )
-    assert '--tag "$image:$VERSION"' in publish_job
-    assert '--tag "$image:latest"' in publish_job
-    assert 'docker push "$image:$VERSION"' in publish_job
-    assert 'docker push "$image:latest"' in publish_job
+    assert (
+        "${{ steps.image.outputs.image }}:${{ needs.release.outputs.version }}"
+        in publish_job
+    )
+    assert "${{ steps.image.outputs.image }}:latest" in publish_job
