@@ -6,6 +6,13 @@ ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
+def test_documentation_only_pushes_do_not_start_the_workflow():
+    trigger = WORKFLOW.read_text(encoding="utf-8").split("permissions:", 1)[0]
+
+    assert 'push:\n    paths-ignore:\n      - "**/*.md"\n      - "docs/**"' in trigger
+    assert "\n  pull_request:\n" in trigger
+
+
 def test_semantic_release_manages_every_version_source():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     release = project.get("tool", {}).get("semantic_release")
@@ -31,8 +38,11 @@ def test_release_publishes_versioned_and_latest_ghcr_images():
 
     assert "packages: write" not in release_job
     assert "version: ${{ steps.release.outputs.version }}" in release_job
-    assert 'if [ "$(git rev-parse HEAD)" = "$original_head" ]' in release_job
-    assert 'version="$(uv version --short)"' in release_job
+    assert 'previous_tag="$(git describe --tags --abbrev=0)"' in release_job
+    assert 'released_tag="$(git describe --tags --abbrev=0)"' in release_job
+    assert 'if [ "$released_tag" = "$previous_tag" ]' in release_job
+    assert 'version="${released_tag#v}"' in release_job
+    assert "original_head" not in release_job
 
     assert "needs: release" in publish_job
     assert "if: needs.release.outputs.version != ''" in publish_job
