@@ -226,12 +226,13 @@ Set `CONTROL_PLANE_TUNNEL_ID` in `deploy/remote-mcp/.env`. Provision the
 ZenMoney token and OpenAI key as separate file-backed Compose secrets using the
 ownership and permission commands in the
 [remote operations runbook](deploy/remote-mcp/README.md); do not put either
-secret in `.env`. Then build and start the deployment:
+secret in `.env`. Then pull and start the deployment:
 
 ```bash
-docker build -t zenmoney-mcp:remote-test .
 docker compose --env-file deploy/remote-mcp/.env \
-  -f deploy/remote-mcp/compose.yaml up -d
+  -f deploy/remote-mcp/compose.yaml pull
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml up -d --no-build --pull never
 docker compose --env-file deploy/remote-mcp/.env \
   -f deploy/remote-mcp/compose.yaml ps
 ```
