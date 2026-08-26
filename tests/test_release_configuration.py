@@ -6,6 +6,27 @@ ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
+def test_pypi_distribution_keeps_the_existing_cli_name():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+
+    assert project["project"]["name"] == "zenmoney-mcp-server"
+    assert project["project"]["scripts"]["zenmoney-mcp"] == (
+        "zenmoney_mcp.entrypoint:main"
+    )
+    assert project["project"]["urls"] == {
+        "Repository": "https://github.com/ekho/zenmoney-mcp",
+        "Issues": "https://github.com/ekho/zenmoney-mcp/issues",
+    }
+
+
+def test_source_distribution_limits_selected_files_to_package_sources():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+
+    assert project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"] == [
+        "/src"
+    ]
+
+
 def test_semantic_release_manages_every_version_source():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     release = project.get("tool", {}).get("semantic_release")
@@ -64,3 +85,23 @@ def test_release_publishes_versioned_and_latest_ghcr_images():
         in publish_job
     )
     assert "${{ steps.image.outputs.image }}:latest" in publish_job
+
+
+def test_release_workflow_publishes_fresh_distributions_with_oidc():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    assert "version: ${{ steps.release.outputs.version }}" in workflow
+    assert "uv build --no-sources" in workflow
+    assert "uses: actions/upload-artifact@" in workflow
+    assert "publish-pypi:" in workflow
+    assert "if: needs.release.outputs.version != ''" in workflow
+    assert "name: pypi" in workflow
+    assert "id-token: write" in workflow
+    assert "uses: actions/download-artifact@" in workflow
+    assert "run: uv publish" in workflow
+
+
+def test_readme_uses_the_pypi_distribution_for_uvx():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "uvx --from zenmoney-mcp-server zenmoney-mcp" in readme
