@@ -18,6 +18,7 @@ TUNNEL_IMAGE = (
     "ghcr.io/openai/tunnel-client:v0.0.12@"
     "sha256:b1e9eb675e6a64775685c323c2af8c2810ea14e1a27c8ce4c68f2994cd7c5e8e"
 )
+GHCR_IMAGE = "ghcr.io/ekho/zenmoney-mcp:0.4.0"
 
 
 def _compose_config() -> dict:
@@ -115,6 +116,20 @@ def test_compose_uses_pinned_tunnel_contract_and_hardened_roles():
     assert services["zenmoney-mcp"]["user"] == "10001:10001"
     assert services["zenmoney-sync"]["user"] == "10001:10001"
     assert services["zenmoney-sync"]["stop_grace_period"] in {"1m10s", "70s"}
+
+
+def test_deployment_uses_the_versioned_ghcr_image():
+    services = _compose_config()["services"]
+    env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert services["zenmoney-mcp"]["image"] == GHCR_IMAGE
+    assert services["zenmoney-sync"]["image"] == GHCR_IMAGE
+    assert f"ZENMONEY_IMAGE={GHCR_IMAGE}" in env_example
+    assert "docker compose --env-file deploy/remote-mcp/.env" in runbook
+    assert "-f deploy/remote-mcp/compose.yaml pull" in runbook
+    assert "ZENMONEY_IMAGE: zenmoney-mcp:remote-test" in workflow
 
 
 def test_operations_and_ci_cover_sensitive_backups_pin_updates_and_runtime_smoke():

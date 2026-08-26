@@ -32,6 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CONTROL_PLANE_TUNNEL_ID: tunnel_0123456789abcdef0123456789abcdef
+      ZENMONEY_IMAGE: zenmoney-mcp:remote-test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
