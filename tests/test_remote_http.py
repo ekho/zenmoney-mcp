@@ -35,10 +35,21 @@ def _write_snapshot(
         "INSERT INTO users(id,login,currency,parent,month_start_day,changed) "
         "VALUES (1,'user',1,NULL,1,1)"
     )
-    conn.execute(
-        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
-        "VALUES ('cash','Cash','checking',1,?,1,0,0,1,1)",
-        (balance,),
+    database.upsert_accounts(
+        [
+            {
+                "id": "cash",
+                "title": "Cash",
+                "type": "checking",
+                "instrument": 1,
+                "balance": balance,
+                "inBalance": True,
+                "savings": False,
+                "archive": False,
+                "user": 1,
+                "changed": 1,
+            }
+        ]
     )
     database.upsert_transactions(
         [{
@@ -83,6 +94,8 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
         resources = (await client.list_resources()).resources
         templates = (await client.list_resource_templates()).resource_templates
         result = await client.call_tool("get_net_worth", {})
+        accounts = await client.call_tool("list_accounts", {"limit": 1})
+        account = await client.call_tool("get_account", {"id": "cash"})
 
     names = {tool.name for tool in tools}
     tools_by_name = {tool.name: tool for tool in tools}
@@ -91,6 +104,13 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert {
         "force_sync",
         "get_sync_status",
+        "list_accounts", "get_account",
+        "list_tags", "get_tag",
+        "list_merchants", "get_merchant",
+        "list_reminders", "get_reminder",
+        "list_reminder_markers", "get_reminder_marker",
+        "list_transactions", "get_transaction",
+        "list_budgets", "get_budget",
         *server.PREPARE_TOOL_ENTITIES,
         "prepare_mixed_changes",
         "get_change_proposal",
@@ -121,6 +141,8 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
         "accounts_collection", "accounts_exact", "budgets_exact"
     }
     assert json.loads(result.content[0].text)["net_worth"] == 1000
+    assert json.loads(accounts.content[0].text)["items"][0]["id"] == "cash"
+    assert json.loads(account.content[0].text)["id"] == "cash"
 
 
 @pytest.mark.asyncio

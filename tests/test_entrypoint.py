@@ -74,6 +74,40 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
 
 
 @pytest.mark.asyncio
+async def test_entity_read_tools_are_discoverable_locally_and_remotely():
+    expected = {
+        "list_accounts", "get_account",
+        "list_tags", "get_tag",
+        "list_merchants", "get_merchant",
+        "list_reminders", "get_reminder",
+        "list_reminder_markers", "get_reminder_marker",
+        "list_transactions", "get_transaction",
+        "list_budgets", "get_budget",
+    }
+
+    for remote in (False, True):
+        descriptors = {
+            tool.name: tool for tool in await server.list_tools(remote=remote)
+        }
+        assert expected <= descriptors.keys()
+        assert all(
+            descriptors[name].annotations.read_only_hint is True
+            and descriptors[name].annotations.destructive_hint is False
+            and descriptors[name].annotations.open_world_hint is False
+            for name in expected
+        )
+
+    list_schema = descriptors["list_tags"].input_schema
+    assert set(list_schema["properties"]) == {
+        "limit", "cursor", "include_inactive"
+    }
+    assert list_schema["additionalProperties"] is False
+    assert list_schema["properties"]["limit"]["maximum"] == 200
+    assert descriptors["get_tag"].input_schema["required"] == ["id"]
+    assert descriptors["get_budget"].input_schema["required"] == ["key"]
+
+
+@pytest.mark.asyncio
 async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
     tools = {tool.name: tool for tool in await server.list_tools()}
 
