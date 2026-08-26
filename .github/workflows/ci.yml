@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   pull_request:
 
 permissions:
@@ -122,14 +125,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # ponytail: GitPython 3.1.59 avoids PSR #1476; remove the pin after a fixed PSR release.
         run: |
-          original_head="$(git rev-parse HEAD)"
+          previous_tag="$(git describe --tags --abbrev=0)"
           uvx --from python-semantic-release==10.6.1 \
             --with GitPython==3.1.59 \
             semantic-release version --no-changelog
-          if [ "$(git rev-parse HEAD)" = "$original_head" ]; then
+          released_tag="$(git describe --tags --abbrev=0)"
+          if [ "$released_tag" = "$previous_tag" ]; then
             exit 0
           fi
-          version="$(uv version --short)"
+          version="${released_tag#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Build distributions
         if: steps.release.outputs.version != ''
