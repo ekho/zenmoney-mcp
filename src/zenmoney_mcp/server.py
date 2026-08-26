@@ -131,6 +131,24 @@ ENTITY_RESOURCE_NAMES = {
     "transactions": "transaction",
     "budgets": "budget",
 }
+ENTITY_READ_TOOL_NAMES = {
+    "account": ("list_accounts", "get_account"),
+    "tag": ("list_tags", "get_tag"),
+    "merchant": ("list_merchants", "get_merchant"),
+    "reminder": ("list_reminders", "get_reminder"),
+    "reminderMarker": ("list_reminder_markers", "get_reminder_marker"),
+    "transaction": ("list_transactions", "get_transaction"),
+    "budget": ("list_budgets", "get_budget"),
+}
+LIST_ENTITY_TOOLS = {
+    names[0]: entity_type
+    for entity_type, names in ENTITY_READ_TOOL_NAMES.items()
+}
+GET_ENTITY_TOOLS = {
+    names[1]: entity_type
+    for entity_type, names in ENTITY_READ_TOOL_NAMES.items()
+}
+ENTITY_READ_TOOLS = frozenset({*LIST_ENTITY_TOOLS, *GET_ENTITY_TOOLS})
 
 
 def get_database_path() -> Path:
@@ -958,6 +976,78 @@ def _mutation_tools() -> list[Tool]:
         ),
     ]
 
+
+def _entity_read_tools() -> list[Tool]:
+    """Expose existing entity resources as ChatGPT-visible read tools."""
+    tools: list[Tool] = []
+    for entity_type, (list_name, get_name) in ENTITY_READ_TOOL_NAMES.items():
+        tools.append(
+            Tool(
+                name=list_name,
+                description=f"List paginated ZenMoney {entity_type} entities.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "description": "Page size from 1 to 200",
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "description": "Opaque cursor from the previous page",
+                        },
+                        "include_inactive": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Include archived or deleted entities",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                annotations=ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                ),
+            )
+        )
+        identity = (
+            {
+                "type": "object",
+                "properties": {
+                    "owner_user_id": {"type": "integer"},
+                    "tag": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                    "date": {"type": "string", "pattern": _DATE_PATTERN},
+                },
+                "required": ["owner_user_id", "tag", "date"],
+                "additionalProperties": False,
+            }
+            if entity_type == "budget"
+            else {"type": "string", "minLength": 1}
+        )
+        identity_name = "key" if entity_type == "budget" else "id"
+        tools.append(
+            Tool(
+                name=get_name,
+                description=f"Get one exact ZenMoney {entity_type} entity.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {identity_name: identity},
+                    "required": [identity_name],
+                    "additionalProperties": False,
+                },
+                annotations=ToolAnnotations(
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    openWorldHint=False,
+                ),
+            )
+        )
+    return tools
+
 async def list_tools(remote: bool = False) -> list[Tool]:
     """List available tools."""
     tools = harden_tool_schemas([
@@ -1360,7 +1450,8 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                 },
             },
         ),
-    ] + _planning_tools() + _decision_tools() + _mutation_tools())
+    ] + _planning_tools() + _decision_tools() + _entity_read_tools()
+        + _mutation_tools())
     if not remote:
         return tools
     tools = [
@@ -1437,6 +1528,36 @@ def _text_result(result: dict[str, Any]) -> list[TextContent]:
             type="text", text=json.dumps(result, ensure_ascii=False, indent=2)
         )
     ]
+
+
+def _dispatch_entity_read_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    db: HardenedDatabase,
+) -> list[TextContent]:
+    try:
+        if name in LIST_ENTITY_TOOLS:
+            if set(arguments) - {"limit", "cursor", "include_inactive"}:
+                raise EntityResourceError("entity_tool_arguments_invalid")
+            result = list_entity_resource(
+                db,
+                LIST_ENTITY_TOOLS[name],
+                limit=arguments.get("limit", 50),
+                cursor=arguments.get("cursor"),
+                include_inactive=arguments.get("include_inactive", False),
+            )
+        else:
+            entity_type = GET_ENTITY_TOOLS[name]
+            identity_name = "key" if entity_type == "budget" else "id"
+            if set(arguments) != {identity_name}:
+                raise EntityResourceError("entity_tool_arguments_invalid")
+            result = get_entity_resource(
+                db, entity_type, arguments[identity_name]
+            )
+    except EntityResourceError:
+        raise MCPError(INVALID_PARAMS, "Invalid tool arguments") from None
+    return _text_result(result)
 
 
 def _dispatch_remote_control_tool(
@@ -1560,6 +1681,9 @@ async def _dispatch_tool(
     db: HardenedDatabase,
 ) -> list[TextContent]:
     """Handle tool calls."""
+    if name in ENTITY_READ_TOOLS:
+        return _dispatch_entity_read_tool(name, arguments, db=db)
+
     if name == "sync_data":
         engine = get_sync_engine()
         force_full = arguments.get("force_full", False)
