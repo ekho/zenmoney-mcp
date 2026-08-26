@@ -131,7 +131,9 @@ jobs:
         # ponytail: GitPython 3.1.59 avoids PSR #1476; remove the pin after a fixed PSR release.
         run: |
           previous_tag="$(git describe --tags --abbrev=0)"
-          uvx --from python-semantic-release==10.6.1 \
+          semantic_release_output="$(mktemp)"
+          trap 'rm -f "$semantic_release_output"' EXIT
+          GITHUB_OUTPUT="$semantic_release_output" uvx --from python-semantic-release==10.6.1 \
             --with GitPython==3.1.59 \
             semantic-release version --no-changelog
           released_tag="$(git describe --tags --abbrev=0)"

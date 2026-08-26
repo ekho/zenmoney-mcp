@@ -1,3 +1,6 @@
+import os
+import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -109,6 +112,43 @@ def test_release_workflow_publishes_fresh_distributions_with_oidc():
     assert "id-token: write" in workflow
     assert "uses: actions/download-artifact@" in workflow
     assert "run: uv publish" in workflow
+
+
+def test_no_release_does_not_republish_the_previous_version(tmp_path):
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    release_job = workflow[
+        workflow.index("  release:") : workflow.index("  publish-image:")
+    ]
+    release_script = textwrap.dedent(
+        release_job.split("        run: |\n", 1)[1].split(
+            "      - name: Build distributions", 1
+        )[0]
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uvx = fake_bin / "uvx"
+    fake_uvx.write_text(
+        '#!/bin/sh\nprintf "version=0.5.1\\n" >> "$GITHUB_OUTPUT"\n',
+        encoding="utf-8",
+    )
+    fake_uvx.chmod(0o755)
+    step_output = tmp_path / "step-output"
+    environment = os.environ | {
+        "GITHUB_OUTPUT": str(step_output),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+
+    result = subprocess.run(
+        ["bash", "-e", "-c", release_script],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not step_output.exists()
 
 
 def test_release_image_uses_the_built_wheel_with_locked_dependencies():
