@@ -35,6 +35,9 @@ def test_release_publishes_versioned_and_latest_ghcr_images():
     assert 'version="$(uv version --short)"' in release_job
 
     assert "needs: release" in publish_job
+    assert "if: needs.release.outputs.version != ''" in publish_job
+    assert "group: publish-image" in publish_job
+    assert "queue: max" in publish_job
     assert "packages: write" in publish_job
     assert "ref: v${{ needs.release.outputs.version }}" in publish_job
     assert "docker login ghcr.io" in publish_job
@@ -42,5 +45,7 @@ def test_release_publishes_versioned_and_latest_ghcr_images():
         "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
         in publish_job
     )
+    assert '--tag "$image:$VERSION"' in publish_job
+    assert '--tag "$image:latest"' in publish_job
     assert 'docker push "$image:$VERSION"' in publish_job
     assert 'docker push "$image:latest"' in publish_job

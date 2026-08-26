@@ -135,6 +135,9 @@ jobs:
     needs: release
     if: needs.release.outputs.version != ''
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish-image
+      queue: max
     permissions:
       contents: read
       packages: write
