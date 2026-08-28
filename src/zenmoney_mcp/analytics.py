@@ -2231,7 +2231,7 @@ def detect_anomalies(
         category_cte = """
             WITH RECURSIVE selected_categories(id) AS (
                 SELECT id FROM tags WHERE id = ?
-                UNION ALL
+                UNION
                 SELECT tags.id FROM tags JOIN selected_categories ON tags.parent = selected_categories.id
             )
         """
@@ -2294,47 +2294,43 @@ def detect_anomalies(
     exact_duplicates = []
     same_merchant_amount_close_timestamp = []
     near_duplicates = []
-    classified_pairs = set()
-    pairs = [
-        (first, second, tuple(sorted((first["id"], second["id"]))))
-        for index, first in enumerate(selected_records)
-        for second in selected_records[index + 1:]
-    ]
-    for first, second, pair_key in pairs:
-        if (
-            first["normalized_payee"]
-            and first["date"] == second["date"]
-            and first["amount_cents"] == second["amount_cents"]
-            and first["normalized_payee"] == second["normalized_payee"]
-            and first["category_id"] == second["category_id"]
-            and first["outcome_account"] == second["outcome_account"]
-        ):
-            exact_duplicates.append(pair_details(first, second))
-            classified_pairs.add(pair_key)
-    for first, second, pair_key in pairs:
-        if pair_key in classified_pairs:
-            continue
-        if (
-            first["normalized_payee"]
-            and first["normalized_payee"] == second["normalized_payee"]
-            and first["amount_cents"] == second["amount_cents"]
-            and abs((first["date"] - second["date"]).days) <= 1
-        ):
-            same_merchant_amount_close_timestamp.append(pair_details(first, second))
-            classified_pairs.add(pair_key)
-    for first, second, pair_key in pairs:
-        if pair_key in classified_pairs:
-            continue
-        largest_amount = max(first["amount"], second["amount"])
-        if (
-            first["normalized_payee"]
-            and first["normalized_payee"] == second["normalized_payee"]
-            and first["category_id"] == second["category_id"]
-            and abs((first["date"] - second["date"]).days) <= 2
-            and abs(first["amount"] - second["amount"]) / largest_amount <= 0.05
-        ):
-            near_duplicates.append(pair_details(first, second))
-            classified_pairs.add(pair_key)
+    exact_duplicates_count = 0
+    same_merchant_amount_close_timestamp_count = 0
+    near_duplicates_count = 0
+    for index, first in enumerate(selected_records):
+        for second in selected_records[index + 1:]:
+            if (second["date"] - first["date"]).days > 2:
+                break
+            if (
+                first["normalized_payee"]
+                and first["date"] == second["date"]
+                and first["amount_cents"] == second["amount_cents"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["category_id"] == second["category_id"]
+                and first["outcome_account"] == second["outcome_account"]
+            ):
+                exact_duplicates_count += 1
+                if len(exact_duplicates) < 15:
+                    exact_duplicates.append(pair_details(first, second))
+            elif (
+                first["normalized_payee"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["amount_cents"] == second["amount_cents"]
+                and abs((first["date"] - second["date"]).days) <= 1
+            ):
+                same_merchant_amount_close_timestamp_count += 1
+                if len(same_merchant_amount_close_timestamp) < 15:
+                    same_merchant_amount_close_timestamp.append(pair_details(first, second))
+            elif (
+                first["normalized_payee"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["category_id"] == second["category_id"]
+                and abs((first["date"] - second["date"]).days) <= 2
+                and abs(first["amount"] - second["amount"]) / max(first["amount"], second["amount"]) <= 0.05
+            ):
+                near_duplicates_count += 1
+                if len(near_duplicates) < 15:
+                    near_duplicates.append(pair_details(first, second))
 
     recurrence_groups: dict[tuple[str | None, float], list[dict[str, Any]]] = {}
     for record in records:
@@ -2391,33 +2387,34 @@ def detect_anomalies(
                     "severity": "high" if z_score >= 3.0 else ("medium" if z_score >= 2.0 else "low"),
                 })
 
-    combined_duplicates = exact_duplicates + same_merchant_amount_close_timestamp + near_duplicates
     counts = {
-        "exact_duplicates_count": len(exact_duplicates),
-        "same_merchant_amount_close_timestamp_count": len(same_merchant_amount_close_timestamp),
-        "near_duplicates_count": len(near_duplicates),
+        "exact_duplicates_count": exact_duplicates_count,
+        "same_merchant_amount_close_timestamp_count": same_merchant_amount_close_timestamp_count,
+        "near_duplicates_count": near_duplicates_count,
         "periodic_recurrences_count": len(periodic_recurrences),
         "unusually_large_one_off_count": len(unusually_large_one_off),
     }
-    results_truncated = any(count > 15 for count in (*counts.values(), len(combined_duplicates)))
+    duplicates_count = exact_duplicates_count + same_merchant_amount_close_timestamp_count + near_duplicates_count
+    results_truncated = any(count > 15 for count in (*counts.values(), duplicates_count))
     outliers = unusually_large_one_off[:15]
+    possible_duplicates = (exact_duplicates + same_merchant_amount_close_timestamp + near_duplicates)[:15]
     return {
         "period": {"start": start_date, "end": end_date},
         "currency": currency_code,
         "summary": {
             **counts,
             "outliers_count": len(unusually_large_one_off),
-            "duplicates_count": len(combined_duplicates),
+            "duplicates_count": duplicates_count,
             "total_transactions_analyzed": len(selected_records),
             "results_truncated": results_truncated,
         },
-        "exact_duplicates": exact_duplicates[:15],
-        "same_merchant_amount_close_timestamp": same_merchant_amount_close_timestamp[:15],
-        "near_duplicates": near_duplicates[:15],
+        "exact_duplicates": exact_duplicates,
+        "same_merchant_amount_close_timestamp": same_merchant_amount_close_timestamp,
+        "near_duplicates": near_duplicates,
         "periodic_recurrences": periodic_recurrences[:15],
         "unusually_large_one_off": outliers,
         "outliers": outliers,
-        "possible_duplicates": combined_duplicates[:15],
+        "possible_duplicates": possible_duplicates,
     }
 
 

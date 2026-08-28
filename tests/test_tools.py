@@ -2305,6 +2305,119 @@ class TestAuditFixSearchAmountCurrency:
 class TestAnomalySignals:
     """Structured anomaly signals retain one classification per pair."""
 
+    @pytest.mark.parametrize(
+        ("tags", "category_id"),
+        [
+            (("cycle-self", "Cycle", "cycle-self"), "cycle-self"),
+            (
+                (
+                    ("cycle-parent", "Cycle parent", "cycle-child"),
+                    ("cycle-child", "Cycle child", "cycle-parent"),
+                ),
+                "cycle-parent",
+            ),
+        ],
+        ids=("self-cycle", "two-node-cycle"),
+    )
+    def test_anomaly_category_filter_returns_selected_records_with_cycles(
+        self, populated_db: Database, tags: tuple[tuple[str, str, str], ...] | tuple[str, str, str], category_id: str,
+    ):
+        """Recursive category filtering must terminate for malformed parent cycles."""
+        conn = populated_db.connect()
+        if isinstance(tags[0], str):
+            tags = (tags,)
+        conn.executemany(
+            """INSERT INTO tags
+            (id, title, parent, show_income, show_outcome, budget_income, budget_outcome, required, user, changed)
+            VALUES (?, ?, ?, 0, 1, 0, 1, 0, 1, 1)""",
+            tags,
+        )
+        _insert_tx(
+            populated_db,
+            id="cycle-selected",
+            date="2026-08-10",
+            outcome=777.0,
+            tag=json.dumps([tags[-1][0]]),
+            payee="cycle-selected",
+        )
+
+        steps = 0
+
+        def stop_runaway_query() -> int:
+            nonlocal steps
+            steps += 1
+            return int(steps > 1_000)
+
+        conn.set_progress_handler(stop_runaway_query, 1)
+        try:
+            result = detect_anomalies(
+                populated_db,
+                category_id=category_id,
+                start_date="2026-08-01",
+                end_date="2026-08-31",
+            )
+        finally:
+            conn.set_progress_handler(None, 0)
+
+        assert result["summary"]["total_transactions_analyzed"] == 1
+        assert result["summary"]["unusually_large_one_off_count"] == 0
+
+    def test_anomaly_duplicate_results_are_bounded_but_counts_are_complete(self, populated_db: Database):
+        """Duplicate result arrays retain their precedence while summary counts remain complete."""
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        for index in range(3):
+            for suffix in ("a", "b"):
+                _insert_tx(
+                    populated_db,
+                    id=f"exact-{index}-{suffix}",
+                    date="2026-08-10",
+                    outcome=1_000.0 + index,
+                    tag=json.dumps(["tag-grocery"]),
+                    payee=f"exact-{index}",
+                )
+        for index in range(16):
+            for suffix, tx_date, tag, account in (
+                ("a", "2026-08-11", "tag-grocery", "acc-rub"),
+                ("b", "2026-08-12", "tag-transport", "acc-usd"),
+            ):
+                _insert_tx(
+                    populated_db,
+                    id=f"merchant-{index}-{suffix}",
+                    date=tx_date,
+                    outcome=2_000.0 + index,
+                    tag=json.dumps([tag]),
+                    payee=f"merchant-{index}",
+                    outcome_account=account,
+                )
+        for index in range(16):
+            for suffix, tx_date, amount in (
+                ("a", "2026-08-20", 3_000.0 + index * 10),
+                ("b", "2026-08-22", 3_090.0 + index * 10),
+            ):
+                _insert_tx(
+                    populated_db,
+                    id=f"near-{index}-{suffix}",
+                    date=tx_date,
+                    outcome=amount,
+                    tag=json.dumps(["tag-restaurant"]),
+                    payee=f"near-{index}",
+                )
+
+        result = detect_anomalies(populated_db, **period)
+
+        summary = result["summary"]
+        assert summary["exact_duplicates_count"] == 3
+        assert summary["same_merchant_amount_close_timestamp_count"] == 16
+        assert summary["near_duplicates_count"] == 16
+        assert summary["duplicates_count"] == 35
+        assert summary["results_truncated"] is True
+        assert len(result["exact_duplicates"]) == 3
+        assert len(result["same_merchant_amount_close_timestamp"]) == 15
+        assert len(result["near_duplicates"]) == 15
+        assert len(result["possible_duplicates"]) == 15
+        assert all(item["transactions"][0].startswith("exact-") for item in result["possible_duplicates"][:3])
+        assert all(item["transactions"][0].startswith("merchant-") for item in result["possible_duplicates"][3:])
+
     def test_anomaly_pair_classification_uses_precedence_and_day_precision(self, populated_db: Database):
         period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
         transactions = [
