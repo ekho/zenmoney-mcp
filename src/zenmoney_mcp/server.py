@@ -1628,6 +1628,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "default": "desc",
                     },
                 },
+                "additionalProperties": False,
             },
         ),
     ] + _planning_tools() + _decision_tools() + _entity_read_tools()

@@ -6,10 +6,11 @@ import json
 import statistics
 import time
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from .financial_correctness import get_debts, get_liquidity, get_net_worth
-from .money import CurrencyContext, convert, user_currency
+from .money import CurrencyContext, convert, convert_decimal, user_currency
 from .periods import (
     Period,
     comparison_periods as resolve_comparison_periods,
@@ -37,6 +38,15 @@ _VALID_OBLIGATION_CLASSES = {
     "personal_debt",
     "other",
 }
+_CENT = Decimal("0.01")
+
+
+def _money(value: Any) -> Decimal:
+    return Decimal(str(value)).quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _number(value: Any) -> float:
+    return float(_money(value))
 
 
 def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
@@ -204,6 +214,7 @@ def _cash_flow_for_dates(
     start: date,
     end: date,
     category_ids: set[str] | None = None,
+    raw: bool = False,
 ) -> dict[str, Any]:
     currency = user_currency(db)
     obligation_ids = {row["id"] for row in _financial_obligation_accounts(db)}
@@ -227,7 +238,7 @@ def _cash_flow_for_dates(
         (start.isoformat(), end.isoformat()),
     ).fetchall()
     components = {
-        name: {"amount": 0.0, "count": 0}
+        name: {"amount": Decimal(0), "count": 0}
         for name in (
             "income",
             "operating_expense",
@@ -241,7 +252,7 @@ def _cash_flow_for_dates(
     categories: dict[str, dict[str, Any]] = {}
     uncertain: list[dict[str, Any]] = []
 
-    def add_component(name: str, amount: float) -> None:
+    def add_component(name: str, amount: Decimal) -> None:
         components[name]["amount"] += amount
         components[name]["count"] += 1
 
@@ -249,7 +260,7 @@ def _cash_flow_for_dates(
         category_id: str | None,
         category: str | None,
         side: str,
-        amount: float,
+        amount: Decimal,
     ) -> None:
         key = category_id or "uncategorized"
         item = categories.setdefault(
@@ -257,8 +268,8 @@ def _cash_flow_for_dates(
             {
                 "category_id": category_id,
                 "category": category or "Uncategorized",
-                "income": 0.0,
-                "outcome": 0.0,
+                "income": Decimal(0),
+                "outcome": Decimal(0),
             },
         )
         item[side] += amount
@@ -274,8 +285,8 @@ def _cash_flow_for_dates(
         if category_ids is not None and category_id not in category_ids:
             continue
 
-        income = float(row["income"] or 0)
-        outcome = float(row["outcome"] or 0)
+        income = Decimal(str(row["income"] or 0))
+        outcome = Decimal(str(row["outcome"] or 0))
         income_obligation = row["income_account_id"] in obligation_ids
         outcome_obligation = row["outcome_account_id"] in obligation_ids
         income_asset = bool(
@@ -296,13 +307,17 @@ def _cash_flow_for_dates(
             continue
 
         if income > 0 and outcome == 0 and income_asset:
-            amount = convert(db, income, row["income_instrument"], currency)
+            amount = convert_decimal(
+                db, income, row["income_instrument"], currency
+            )
             add_component("income", amount)
             add_category(category_id, row["category"], "income", amount)
             continue
 
         if outcome > 0 and income == 0 and (outcome_asset or outcome_obligation):
-            amount = convert(db, outcome, row["outcome_instrument"], currency)
+            amount = convert_decimal(
+                db, outcome, row["outcome_instrument"], currency
+            )
             add_component("operating_expense", amount)
             add_category(category_id, row["category"], "outcome", amount)
             if outcome_obligation:
@@ -313,19 +328,25 @@ def _cash_flow_for_dates(
             if outcome_asset and income_obligation:
                 add_component(
                     "debt_service_outflow",
-                    convert(db, outcome, row["outcome_instrument"], currency),
+                    convert_decimal(
+                        db, outcome, row["outcome_instrument"], currency
+                    ),
                 )
                 continue
             if outcome_obligation and income_asset:
                 add_component(
                     "financing_inflow",
-                    convert(db, income, row["income_instrument"], currency),
+                    convert_decimal(
+                        db, income, row["income_instrument"], currency
+                    ),
                 )
                 continue
             if outcome_obligation and income_obligation:
                 add_component(
                     "internal_transfer",
-                    convert(db, outcome, row["outcome_instrument"], currency),
+                    convert_decimal(
+                        db, outcome, row["outcome_instrument"], currency
+                    ),
                 )
                 continue
             if outcome_asset and income_asset:
@@ -337,17 +358,21 @@ def _cash_flow_for_dates(
                 )
                 add_component(
                     "asset_transfer" if is_asset_transfer else "internal_transfer",
-                    convert(db, outcome, row["outcome_instrument"], currency),
+                    convert_decimal(
+                        db, outcome, row["outcome_instrument"], currency
+                    ),
                 )
                 continue
 
-        unknown_amount = 0.0
+        unknown_amount = Decimal(0)
         if outcome > 0 and (outcome_asset or outcome_obligation):
-            unknown_amount = convert(
+            unknown_amount = convert_decimal(
                 db, outcome, row["outcome_instrument"], currency
             )
         elif income > 0 and (income_asset or income_obligation):
-            unknown_amount = convert(db, income, row["income_instrument"], currency)
+            unknown_amount = convert_decimal(
+                db, income, row["income_instrument"], currency
+            )
         add_component("unknown", unknown_amount)
         if len(uncertain) < 50:
             uncertain.append(
@@ -359,29 +384,41 @@ def _cash_flow_for_dates(
                 }
             )
 
-    for item in categories.values():
-        item["income"] = round(item["income"], 2)
-        item["outcome"] = round(item["outcome"], 2)
     income = components["income"]["amount"]
     operating_expenses = components["operating_expense"]["amount"]
     financing_inflow = components["financing_inflow"]["amount"]
     debt_service = components["debt_service_outflow"]["amount"]
-    for component in components.values():
-        component["amount"] = round(component["amount"], 2)
-    return {
+    result = {
         "currency": currency.code,
-        "income": round(income, 2),
-        "operating_expenses": round(operating_expenses, 2),
-        "operating_net_cash_flow": round(income - operating_expenses, 2),
-        "financing_inflow": round(financing_inflow, 2),
-        "debt_service_cash_outflow": round(debt_service, 2),
-        "net_cash_flow_after_debt_service": round(
-            income - operating_expenses + financing_inflow - debt_service, 2
+        "income": income,
+        "operating_expenses": operating_expenses,
+        "operating_net_cash_flow": income - operating_expenses,
+        "financing_inflow": financing_inflow,
+        "debt_service_cash_outflow": debt_service,
+        "net_cash_flow_after_debt_service": (
+            income - operating_expenses + financing_inflow - debt_service
         ),
         "flow_components": components,
         "uncertain_transactions": uncertain,
         "categories": categories,
     }
+    if raw:
+        return result
+    for item in categories.values():
+        item["income"] = _number(item["income"])
+        item["outcome"] = _number(item["outcome"])
+    for component in components.values():
+        component["amount"] = _number(component["amount"])
+    for field in (
+        "income",
+        "operating_expenses",
+        "operating_net_cash_flow",
+        "financing_inflow",
+        "debt_service_cash_outflow",
+        "net_cash_flow_after_debt_service",
+    ):
+        result[field] = _number(result[field])
+    return result
 
 
 def get_cash_flow(
@@ -705,14 +742,16 @@ def get_financial_position(
     """Return one economic position using common obligation and flow rules."""
     today = as_of or date.today()
     currency = user_currency(db)
-    liquid_assets = restricted_assets = 0.0
+    liquid_assets = restricted_assets = Decimal(0)
     rows = db.connect().execute(
         """SELECT type,instrument,balance,savings
            FROM accounts
            WHERE COALESCE(archive,0)=0 AND balance>0"""
     ).fetchall()
     for row in rows:
-        balance = convert(db, row["balance"], row["instrument"], currency)
+        balance = convert_decimal(
+            db, row["balance"], row["instrument"], currency
+        )
         if row["type"] in {"cash", "checking", "emoney", "ccard"} or bool(
             row["savings"]
         ) and row["type"] != "deposit":
@@ -724,10 +763,10 @@ def get_financial_position(
         db, currency, obligation_overrides, as_of=today
     )
     liabilities = {
-        "loans": 0.0,
-        "credit_cards": 0.0,
-        "installments": 0.0,
-        "personal_debts": 0.0,
+        "loans": Decimal(0),
+        "credit_cards": Decimal(0),
+        "installments": Decimal(0),
+        "personal_debts": Decimal(0),
     }
     bucket_by_class = {
         "loan": "loans",
@@ -736,39 +775,55 @@ def get_financial_position(
         "personal_debt": "personal_debts",
         "other": "personal_debts",
     }
-    for obligation in obligations:
-        liabilities[bucket_by_class[obligation["classification"]]] += obligation[
-            "balance"
-        ]
+    classifications = {
+        obligation["account_id"]: obligation["classification"]
+        for obligation in obligations
+    }
+    for row in _financial_obligation_accounts(db):
+        liabilities[bucket_by_class[classifications[row["id"]]]] -= convert_decimal(
+            db, row["balance"], row["instrument"], currency
+        )
 
     flows = [
-        _cash_flow_for_dates(db, period.start, period.end)
+        _cash_flow_for_dates(db, period.start, period.end, raw=True)
         for period in completed_periods(db, 3, today)
     ]
-    income = statistics.fmean(item["income"] for item in flows)
-    expenses = statistics.fmean(item["operating_expenses"] for item in flows)
-    debt_service = statistics.fmean(
-        item["debt_service_cash_outflow"] for item in flows
+    period_count = Decimal(len(flows))
+    income = _money(
+        sum((item["income"] for item in flows), Decimal(0)) / period_count
     )
+    expenses = _money(
+        sum((item["operating_expenses"] for item in flows), Decimal(0))
+        / period_count
+    )
+    debt_service = _money(
+        sum((item["debt_service_cash_outflow"] for item in flows), Decimal(0))
+        / period_count
+    )
+    liquid_assets = _money(liquid_assets)
+    restricted_assets = _money(restricted_assets)
+    liabilities = {
+        name: _money(value) for name, value in liabilities.items()
+    }
     total_assets = liquid_assets + restricted_assets
-    total_liabilities = sum(liabilities.values())
+    total_liabilities = sum(liabilities.values(), Decimal(0))
     data_quality = _data_quality(db, today)
     if any(item["flow_components"]["unknown"]["count"] for item in flows):
         data_quality["warnings"].append("unknown_transaction_flows_excluded")
     return {
         "as_of": today.isoformat(),
         "currency": currency.code,
-        "liquid_assets": round(liquid_assets, 2),
-        "restricted_assets": round(restricted_assets, 2),
-        "total_assets": round(total_assets, 2),
-        **{name: round(value, 2) for name, value in liabilities.items()},
-        "total_liabilities": round(total_liabilities, 2),
-        "net_worth": round(total_assets - total_liabilities, 2),
-        "operating_monthly_income": round(income, 2),
-        "operating_monthly_expenses": round(expenses, 2),
-        "monthly_debt_service": round(debt_service, 2),
-        "free_cash_flow_after_debt_service": round(
-            income - expenses - debt_service, 2
+        "liquid_assets": float(liquid_assets),
+        "restricted_assets": float(restricted_assets),
+        "total_assets": float(total_assets),
+        **{name: float(value) for name, value in liabilities.items()},
+        "total_liabilities": float(total_liabilities),
+        "net_worth": float(total_assets - total_liabilities),
+        "operating_monthly_income": float(income),
+        "operating_monthly_expenses": float(expenses),
+        "monthly_debt_service": float(debt_service),
+        "free_cash_flow_after_debt_service": float(
+            _money(income - expenses - debt_service)
         ),
         "monthly_basis": "trailing_3_complete_months_average",
         "in_balance_semantics": (

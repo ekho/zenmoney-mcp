@@ -187,6 +187,14 @@ principal = payment - interest
 ending balance = max(0, opening balance + interest - payment)
 ```
 
+A grace or installment payment due later in the current calendar month creates
+a leading partial-month row dated at that month end. That row contains only the
+explicitly dated payments: recurring minimums on unrelated liabilities, monthly
+extra payment, and the next monthly interest charge begin in the following full
+month. This leading partial row is outside the 120-full-month planning horizon,
+so a result may contain at most 121 rows and counts that partial row in
+`estimated_payoff_months`.
+
 `minimum_only` pays only the model's fixed, minimum, grace, or scheduled amount.
 `avalanche` applies the remaining monthly budget to highest APR, breaking ties by
 smaller balance and then account ID. `snowball` applies it to smallest balance,

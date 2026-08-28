@@ -125,6 +125,7 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert search["category_ids"]["maxItems"] == 100
     assert search["account_ids"]["maxItems"] == 100
     assert search["cursor"]["maxLength"] == 2048
+    assert tools["search_transactions"]["additionalProperties"] is False
     assert not ({"force_sync", "get_sync_status"} & set(tools))
     assert {
         *server.PREPARE_TOOL_ENTITIES,

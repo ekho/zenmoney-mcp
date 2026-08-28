@@ -211,7 +211,7 @@ def test_split_normalizes_exact_parts_and_preserves_bank_metadata(financial_db):
         [{
             **raw,
             "outcome": 100,
-            "opOutcome": 50,
+            "opOutcome": 1,
             "opOutcomeInstrument": 1,
             "outcomeBankID": "bank-operation",
             "originalPayee": "Original shop",
@@ -227,7 +227,7 @@ def test_split_normalizes_exact_parts_and_preserves_bank_metadata(financial_db):
             "operation": "split",
             "transaction_id": "transaction",
             "parts": [
-                {"amount": 30, "category_id": "food"},
+                {"amount": 25, "category_id": "food"},
                 {"amount": "remainder", "category_id": "other"},
             ],
         }],
@@ -239,21 +239,21 @@ def test_split_normalizes_exact_parts_and_preserves_bank_metadata(financial_db):
     assert items[0]["entity_id"] == "transaction"
     assert items[0]["expected_changed"] == 10
     assert items[0]["after"] == {
-        "outcome": 30.0,
-        "opOutcome": 15.0,
+        "outcome": 25.0,
+        "opOutcome": 0.25,
         "tag": ["food"],
     }
     created = items[1]["after"]
     assert uuid.UUID(created["id"]).version == 4
-    assert created["outcome"] == 70
-    assert created["opOutcome"] == 35
+    assert created["outcome"] == 75
+    assert created["opOutcome"] == 0.75
     assert created["tag"] == ["other"]
     assert created["outcomeBankID"] == "bank-operation"
     assert created["originalPayee"] == "Original shop"
     assert created["future"] == {"kept": True}
     assert created["created"] == 2
     assert sum(item["after"]["outcome"] for item in items) == 100
-    assert sum(item["after"]["opOutcome"] for item in items) == 50
+    assert sum(item["after"]["opOutcome"] for item in items) == 1
 
 
 def test_split_keeps_rounded_operation_amounts_non_negative(financial_db):

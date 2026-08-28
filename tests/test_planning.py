@@ -1136,6 +1136,69 @@ def test_financial_position_unifies_assets_liabilities_and_monthly_flow(planning
     }
 
 
+def test_financial_position_rounds_buckets_before_reconciling_totals(planning_db):
+    planning_db.connect().execute("UPDATE accounts SET balance=0")
+    planning_db.connect().execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) "
+        "VALUES (3,'Small unit','SMU','s',0.004,1)"
+    )
+    planning_db.connect().executemany(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES (?,?,?,?,1,1,0,0,1,1)",
+        [
+            ("tiny-liquid", "Tiny liquid", "checking", 3),
+            ("tiny-restricted", "Tiny restricted", "deposit", 3),
+        ],
+    )
+
+    result = planning.get_financial_position(
+        planning_db, as_of=date(2026, 8, 23)
+    )
+
+    assert result["liquid_assets"] == 0
+    assert result["restricted_assets"] == 0
+    assert result["total_assets"] == 0
+    assert result["net_worth"] == 0
+
+
+def test_financial_position_aggregates_liabilities_before_rounding(planning_db):
+    planning_db.connect().execute("UPDATE accounts SET balance=0")
+    planning_db.connect().execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) "
+        "VALUES (3,'Small unit','SMU','s',0.004,1)"
+    )
+    planning_db.connect().executemany(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES (?,?,'loan',3,-1,0,0,0,1,1)",
+        [("tiny-loan-1", "Tiny loan 1"), ("tiny-loan-2", "Tiny loan 2")],
+    )
+
+    result = planning.get_financial_position(
+        planning_db, as_of=date(2026, 8, 23)
+    )
+
+    assert result["loans"] == 0.01
+    assert result["total_liabilities"] == 0.01
+    assert result["net_worth"] == -0.01
+
+
+def test_financial_position_rounds_average_flow_half_up_once(planning_db):
+    for month in (5, 6, 7):
+        add_transaction(
+            planning_db,
+            f"half-cent-{month}",
+            f"2026-{month:02d}-10",
+            income=1.005,
+        )
+
+    result = planning.get_financial_position(
+        planning_db, as_of=date(2026, 8, 23)
+    )
+
+    assert result["operating_monthly_income"] == 1.01
+    assert result["free_cash_flow_after_debt_service"] == 1.01
+
+
 def test_financial_snapshot_fails_explicitly_for_empty_cache():
     db = HardenedDatabase(":memory:")
     db.init_schema()

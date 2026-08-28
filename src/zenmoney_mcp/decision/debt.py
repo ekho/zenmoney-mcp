@@ -62,7 +62,7 @@ def _future_date(value: Any, field: str, as_of: date) -> date:
 
 
 def _month_index(value: date, as_of: date) -> int:
-    return max(1, (value.year - as_of.year) * 12 + value.month - as_of.month)
+    return (value.year - as_of.year) * 12 + value.month - as_of.month
 
 
 def _configured_states(
@@ -329,6 +329,8 @@ def _configured_states(
 def _planned_payment(state: dict[str, Any], month: int) -> Decimal:
     if state["liability_type"] == "installment":
         return state["schedule"].get(month, Decimal(0))
+    if month == 0 and state["grace_month"] != 0:
+        return Decimal(0)
     payment = state["minimum"]
     if state["grace_month"] == month and state["grace_payment"] is not None:
         payment = max(payment, state["grace_payment"])
@@ -415,25 +417,42 @@ def plan_debt_payoff(
                 ],
             }
 
-    first_month_budget = sum(
-        (_planned_payment(state, 1) for state in states), Decimal(0)
+    first_calendar_month = (
+        0
+        if any(
+            state["grace_month"] == 0 or 0 in state["schedule"]
+            for state in states
+        )
+        else 1
+    )
+    monthly_minimum_budget = sum(
+        (_planned_payment(state, 1) for state in states),
+        Decimal(0),
     )
     applied_extra = Decimal(0) if strategy == "minimum_only" else money(extra)
     starting_debt = sum((state["balance"] for state in states), Decimal(0))
     schedule = []
     warnings: list[str] = []
 
-    for month in range(1, MAX_PAYOFF_MONTHS + 1):
+    period_count = MAX_PAYOFF_MONTHS + (first_calendar_month == 0)
+    for month in range(1, period_count + 1):
+        calendar_month = first_calendar_month + month - 1
         planned_budget = sum(
-            (_planned_payment(state, month) for state in states), Decimal(0)
+            (_planned_payment(state, calendar_month) for state in states),
+            Decimal(0),
         )
-        total_budget = planned_budget + applied_extra
+        period_extra = Decimal(0) if calendar_month == 0 else applied_extra
+        total_budget = planned_budget + period_extra
         rows: dict[str, dict[str, Decimal | str]] = {}
         for state in states:
             opening = state["balance"]
-            interest = money(opening * state["apr"] / HUNDRED / 12)
+            interest = (
+                Decimal(0)
+                if calendar_month == 0
+                else money(opening * state["apr"] / HUNDRED / 12)
+            )
             due = opening + interest
-            payment = min(_planned_payment(state, month), due)
+            payment = min(_planned_payment(state, calendar_month), due)
             state["balance"] = money(due - payment)
             state["interest"] += interest
             rows[state["id"]] = {
@@ -443,7 +462,7 @@ def plan_debt_payoff(
                 "payment": payment,
             }
 
-        if strategy != "minimum_only":
+        if strategy != "minimum_only" and calendar_month != 0:
             remaining = money(total_budget - sum((row["payment"] for row in rows.values()), Decimal(0)))
             for state in _priority(strategy, states, custom_order):
                 if remaining <= 0:
@@ -479,7 +498,7 @@ def plan_debt_payoff(
         schedule.append(
             {
                 "month": month,
-                "date": month_end_after(as_of or date.today(), month).isoformat(),
+                "date": month_end_after(today, calendar_month).isoformat(),
                 "accounts": month_rows,
                 "planned_budget": number(total_budget),
                 "total_payment": number(sum((Decimal(str(row["payment"])) for row in month_rows), Decimal(0))),
@@ -490,7 +509,7 @@ def plan_debt_payoff(
         if ending_debt == 0:
             payoff_months: int | None = month
             break
-        if no_positive_principal and not _has_future_event(states, month):
+        if no_positive_principal and not _has_future_event(states, calendar_month):
             payoff_months = None
             if any(
                 state["liability_type"] == "installment" and state["balance"] > 0
@@ -507,9 +526,9 @@ def plan_debt_payoff(
         "currency": facts["currency"],
         "starting_debt": number(starting_debt),
         "monthly_budget": {
-            "minimum_payments": number(first_month_budget),
+            "minimum_payments": number(monthly_minimum_budget),
             "extra_payment": number(applied_extra),
-            "total": number(first_month_budget + applied_extra),
+            "total": number(monthly_minimum_budget + applied_extra),
             "variable": any(state["schedule"] for state in states)
             or any(state["grace_payment"] is not None for state in states),
         },
@@ -539,7 +558,10 @@ def plan_debt_payoff(
                     else None
                 ),
                 "payment_schedule": [
-                    {"month": month, "amount": number(amount)}
+                    {
+                        "month": month - first_calendar_month + 1,
+                        "amount": number(amount),
+                    }
                     for month, amount in sorted(state["schedule"].items())
                 ],
                 "payoff_month": state["payoff_month"],

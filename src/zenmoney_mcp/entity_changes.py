@@ -557,7 +557,7 @@ def _proportional_amounts(
 ) -> list[Decimal]:
     if total == 0:
         return [Decimal(0) for _ in parts]
-    quantum = Decimal(1).scaleb(total.as_tuple().exponent)
+    quantum = Decimal("0.01")
     allocated: list[Decimal] = []
     cumulative = previous = Decimal(0)
     for part in parts[:-1]:
