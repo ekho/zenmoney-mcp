@@ -492,7 +492,7 @@ def _expense_patterns(
            LEFT JOIN merchants m ON m.id=t.merchant
            LEFT JOIN tags tag ON tag.id=json_extract(t.tag,'$[0]')
            WHERE COALESCE(t.deleted,0)=0 AND COALESCE(t.hold,0)=0
-             AND t.income=0 AND t.outcome>0 AND t.date BETWEEN ? AND ?
+             AND COALESCE(t.income,0)=0 AND t.outcome>0 AND t.date BETWEEN ? AND ?
            ORDER BY t.date,t.id""",
         (periods[0].start.isoformat(), periods[-1].end.isoformat()),
     ).fetchall()

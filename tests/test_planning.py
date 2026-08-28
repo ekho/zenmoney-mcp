@@ -761,6 +761,39 @@ def test_spending_baseline_limits_expense_patterns_to_top_hundred(planning_db):
     assert result["expense_patterns"][0]["total_amount"] == 101
 
 
+def test_spending_baseline_patterns_include_null_income_expense(planning_db):
+    add_transaction(
+        planning_db,
+        "null-income-expense",
+        "2026-07-10",
+        outcome=250,
+        tag="food",
+        payee="Nullable expense",
+    )
+    planning_db.connect().execute(
+        "UPDATE transactions SET income=NULL WHERE id='null-income-expense'"
+    )
+
+    result = get_spending_baseline(
+        planning_db, months=3, as_of=date(2026, 8, 28)
+    )
+
+    assert result["expense_patterns"] == [
+        {
+            "name": "Nullable expense",
+            "normalized_name": "nullableexpense",
+            "category_id": "food",
+            "category": "Food",
+            "classification": "one_off",
+            "confidence": "low",
+            "event_count": 1,
+            "intervals_days": [],
+            "average_amount": 250,
+            "total_amount": 250,
+        }
+    ]
+
+
 def test_spending_baseline_median_resists_outlier_and_includes_descendants(planning_db):
     for index, (month, amount) in enumerate(
         [(2, 100), (3, 100), (4, 100), (5, 10_000), (6, 100), (7, 200)]
