@@ -57,16 +57,16 @@ position, cursor search и атомарный transaction split.
 
 ### Task 3: Сделать transaction search постраничным
 
-- [ ] Добавить RED-тесты в `tests/test_tools.py`: все uncategorized outcomes за
+- [x] Добавить RED-тесты в `tests/test_tools.py`: все uncategorized outcomes за
   custom period через несколько страниц, amount DESC, stable ties, массивы
   category/account, categorized/uncategorized и invalid/mismatched cursor.
-- [ ] Добавить RED schema/dispatch assertions в `tests/test_entrypoint.py`.
-- [ ] Реализовать opaque versioned cursor и keyset conditions в
+- [x] Добавить RED schema/dispatch assertions в `tests/test_entrypoint.py`.
+- [x] Реализовать opaque versioned cursor и keyset conditions в
   `financial_correctness.py`; сохранить одиночные фильтры и limit 1..200.
-- [ ] Расширить schema и dispatch в `server.py`; вернуть `next_cursor`,
+- [x] Расширить schema и dispatch в `server.py`; вернуть `next_cursor`,
   `sort_by`, `sort_order`.
-- [ ] Запустить `uv run pytest -q tests/test_tools.py tests/test_hardening.py tests/test_entrypoint.py`.
-- [ ] Commit: `feat: paginate transaction search`.
+- [x] Запустить `uv run pytest -q tests/test_tools.py tests/test_hardening.py tests/test_entrypoint.py`.
+- [x] Commit: `feat: paginate transaction search`.
 
 ### Task 4: Добавить атомарный transaction split
 

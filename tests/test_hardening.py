@@ -179,6 +179,148 @@ def test_search_rejects_unbounded_limit_and_returns_converted_amount_at_maximum(
     assert result['transactions'][0]['converted_currency'] == 'RUB'
 
 
+def test_search_paginates_all_uncategorized_outcomes_by_amount_descending():
+    db = make_db()
+    add_account(db, id='cash', title='Cash', type='checking', balance=1000)
+    db.connect().execute(
+        "INSERT INTO tags(id,title,parent,show_outcome,user,changed) "
+        "VALUES ('food','Food',NULL,1,1,1)"
+    )
+    for tx_id, amount, tag in (
+        ('a', 100, None),
+        ('b', 300, None),
+        ('c', 200, None),
+        ('d', 300, None),
+        ('categorized', 999, 'food'),
+    ):
+        add_tx(
+            db,
+            id=tx_id,
+            amount=amount,
+            account='cash',
+            tx_date='2026-01-15',
+            tag=tag,
+        )
+
+    first = search_transactions(
+        db,
+        start_date='2026-01-01',
+        end_date='2026-01-31',
+        tx_type='outcome',
+        category_state='uncategorized',
+        sort_by='amount',
+        sort_order='desc',
+        limit=2,
+    )
+    second = search_transactions(
+        db,
+        start_date='2026-01-01',
+        end_date='2026-01-31',
+        tx_type='outcome',
+        category_state='uncategorized',
+        sort_by='amount',
+        sort_order='desc',
+        cursor=first['next_cursor'],
+        limit=2,
+    )
+
+    transactions = first['transactions'] + second['transactions']
+    assert [item['amount_converted'] for item in transactions] == [300, 300, 200, 100]
+    assert [item['id'] for item in transactions[:2]] == ['d', 'b']
+    assert {item['id'] for item in transactions} == {'a', 'b', 'c', 'd'}
+    assert all(item['category_id'] is None for item in transactions)
+    assert first['total_matching'] == second['total_matching'] == 4
+    assert first['next_cursor'] is not None
+    assert second['next_cursor'] is None
+    assert first['sort_by'] == 'amount'
+    assert first['sort_order'] == 'desc'
+
+
+def test_search_supports_category_and_account_arrays():
+    db = make_db()
+    add_account(db, id='cash', title='Cash', type='checking', balance=1000)
+    add_account(db, id='other', title='Other', type='checking', balance=1000)
+    db.connect().executemany(
+        "INSERT INTO tags(id,title,parent,show_outcome,user,changed) VALUES (?,?,?,1,1,1)",
+        [('parent', 'Parent', None), ('child', 'Child', 'parent')],
+    )
+    add_tx(db, id='match', amount=10, account='other', tag='child')
+    add_tx(db, id='wrong-account', amount=20, account='cash', tag='child')
+    add_tx(db, id='wrong-category', amount=30, account='other')
+
+    result = search_transactions(
+        db,
+        category_ids=['parent'],
+        account_ids=['other'],
+        category_state='categorized',
+        sort_order='asc',
+    )
+
+    assert [item['id'] for item in result['transactions']] == ['match']
+    assert result['transactions'][0]['category_id'] == 'child'
+
+
+def test_search_rejects_cursor_from_another_sort_contract():
+    db = make_db()
+    add_account(db, id='cash', title='Cash', type='checking', balance=1000)
+    add_tx(db, id='a', amount=10, account='cash')
+    add_tx(db, id='b', amount=20, account='cash')
+    first = search_transactions(db, sort_by='amount', sort_order='desc', limit=1)
+
+    with pytest.raises(InputValidationError, match='cursor'):
+        search_transactions(
+            db,
+            sort_by='amount',
+            sort_order='asc',
+            cursor=first['next_cursor'],
+            limit=1,
+        )
+
+
+def test_search_date_cursor_is_stable_across_equal_dates():
+    db = make_db()
+    add_account(db, id='cash', title='Cash', type='checking', balance=1000)
+    for tx_id in ('a', 'b', 'c'):
+        add_tx(
+            db,
+            id=tx_id,
+            amount=10,
+            account='cash',
+            tx_date='2026-01-15',
+        )
+
+    first = search_transactions(db, sort_by='date', sort_order='asc', limit=2)
+    second = search_transactions(
+        db,
+        sort_by='date',
+        sort_order='asc',
+        cursor=first['next_cursor'],
+        limit=2,
+    )
+
+    assert [item['id'] for item in first['transactions']] == ['a', 'b']
+    assert [item['id'] for item in second['transactions']] == ['c']
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('category_state', 'missing'),
+        ('sort_by', 'merchant'),
+        ('sort_order', 'sideways'),
+        ('category_ids', 'food'),
+        ('account_ids', [1]),
+        ('cursor', 'not-a-cursor'),
+    ],
+)
+def test_search_rejects_invalid_pagination_filters(field, value):
+    db = make_db()
+    add_account(db, id='cash', title='Cash', type='checking', balance=1000)
+
+    with pytest.raises(InputValidationError):
+        search_transactions(db, **{field: value})
+
+
 def test_top_n_bounds_are_rejected_instead_of_silently_clamped():
     db = make_db()
     with pytest.raises(InputValidationError, match='top_n must be between 1 and 100'):

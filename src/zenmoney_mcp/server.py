@@ -1526,6 +1526,26 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "type": "string",
                         "description": "Account UUID",
                     },
+                    "category_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Category IDs; descendants are included",
+                    },
+                    "account_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Account IDs matched on either transaction side",
+                    },
+                    "category_state": {
+                        "type": "string",
+                        "enum": ["any", "categorized", "uncategorized"],
+                        "default": "any",
+                        "description": "Filter transactions by category presence",
+                    },
                     "merchant_id": {
                         "type": "string",
                         "description": "Merchant UUID",
@@ -1551,6 +1571,21 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "type": "integer",
                         "description": "Maximum results",
                         "default": 50,
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "description": "Opaque cursor from the previous page",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["date", "amount"],
+                        "default": "date",
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "default": "desc",
                     },
                 },
             },
@@ -1944,6 +1979,12 @@ async def _dispatch_tool(
             limit=arguments.get("limit", 50),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
+            cursor=arguments.get("cursor"),
+            sort_by=arguments.get("sort_by", "date"),
+            sort_order=arguments.get("sort_order", "desc"),
+            category_state=arguments.get("category_state", "any"),
+            category_ids=arguments.get("category_ids"),
+            account_ids=arguments.get("account_ids"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 

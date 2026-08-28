@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 from datetime import date, timedelta
 from typing import Any, Iterable
 
@@ -102,6 +104,82 @@ def _tag_ids(raw: str | None) -> list[str]:
 def _primary_tag(raw: str | None) -> str | None:
     tags = _tag_ids(raw)
     return tags[0] if tags else None
+
+
+def _search_ids(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > 100
+        or any(not isinstance(item, str) or not item for item in value)
+    ):
+        raise InputValidationError(
+            f"{field} must be an array of at most 100 non-empty IDs"
+        )
+    return list(dict.fromkeys(value))
+
+
+def _encode_search_cursor(
+    sort_by: str,
+    sort_order: str,
+    sort_value: str | float,
+    tx_date: str,
+    changed: int,
+    transaction_id: str,
+) -> str:
+    payload = json.dumps(
+        [1, sort_by, sort_order, sort_value, tx_date, changed, transaction_id],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_search_cursor(
+    cursor: Any, sort_by: str, sort_order: str
+) -> tuple[str | float, str, int, str]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 2048:
+        raise InputValidationError("cursor is invalid")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        decoded = base64.b64decode(
+            cursor + padding, altchars=b"-_", validate=True
+        )
+        value = json.loads(decoded)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise InputValidationError("cursor is invalid") from exc
+    if (
+        not isinstance(value, list)
+        or len(value) != 7
+        or value[:3] != [1, sort_by, sort_order]
+        or not isinstance(value[4], str)
+        or isinstance(value[5], bool)
+        or not isinstance(value[5], int)
+        or not isinstance(value[6], str)
+        or not value[6]
+    ):
+        raise InputValidationError("cursor does not match the sort contract")
+    sort_value = value[3]
+    if sort_by == "date":
+        if not isinstance(sort_value, str) or sort_value != value[4]:
+            raise InputValidationError("cursor is invalid")
+    elif (
+        isinstance(sort_value, bool)
+        or not isinstance(sort_value, (int, float))
+        or not math.isfinite(float(sort_value))
+    ):
+        raise InputValidationError("cursor is invalid")
+    if _encode_search_cursor(*value[1:]) != cursor:
+        raise InputValidationError("cursor is invalid")
+    return sort_value, value[4], value[5], value[6]
+
+
+def _search_row_amount(row: Any, user_rate: float) -> float:
+    if float(row["outcome"] or 0) > 0:
+        return float(row["outcome"]) * float(row["outcome_rate"]) / user_rate
+    if float(row["income"] or 0) > 0:
+        return float(row["income"]) * float(row["income_rate"]) / user_rate
+    return 0.0
 
 
 def _bounded(
@@ -1012,13 +1090,44 @@ def search_transactions(
     limit: int = 50,
     start_date: str | None = None,
     end_date: str | None = None,
+    cursor: str | None = None,
+    sort_by: str = "date",
+    sort_order: str = "desc",
+    category_state: str = "any",
+    category_ids: list[str] | None = None,
+    account_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Search transactions with a hard 200-row response bound."""
+    """Search one stable keyset page with a hard 200-row response bound."""
     applied_limit = _bounded(limit, "limit", 50, 1, 200)
     lower, upper = validate_amount_range(min_amount, max_amount)
     if tx_type not in (None, "income", "outcome", "transfer"):
         raise InputValidationError("type must be income, outcome, or transfer")
+    if sort_by not in {"date", "amount"}:
+        raise InputValidationError("sort_by must be date or amount")
+    if sort_order not in {"asc", "desc"}:
+        raise InputValidationError("sort_order must be asc or desc")
+    if category_state not in {"any", "categorized", "uncategorized"}:
+        raise InputValidationError(
+            "category_state must be any, categorized, or uncategorized"
+        )
+    categories = _search_ids(category_ids, "category_ids")
+    accounts = _search_ids(account_ids, "account_ids")
+    if category_id is not None:
+        if not isinstance(category_id, str) or not category_id:
+            raise InputValidationError("category_id must be a non-empty ID")
+        categories.insert(0, category_id)
+    if account_id is not None:
+        if not isinstance(account_id, str) or not account_id:
+            raise InputValidationError("account_id must be a non-empty ID")
+        accounts.insert(0, account_id)
+    categories = list(dict.fromkeys(categories))
+    accounts = list(dict.fromkeys(accounts))
     user_currency_id, user_code, _, user_rate = _user_currency(db)
+    amount_expr = """CASE
+          WHEN t.outcome>0 THEN t.outcome * oi.rate / ?
+          WHEN t.income>0 THEN t.income * ii.rate / ?
+          ELSE 0
+        END"""
     query = """
         SELECT t.id,t.date,t.income,t.outcome,t.hold,t.income_instrument,
                t.outcome_instrument,t.income_account,t.outcome_account,t.tag,
@@ -1040,13 +1149,31 @@ def search_transactions(
         start, end = resolve_date_range(period or "this_month", start_date, end_date)
         query += " AND t.date BETWEEN ? AND ?"
         params.extend([start, end])
-    if category_id:
-        ids = _descendant_tag_ids(db, category_id)
-        query += f" AND json_extract(t.tag,'$[0]') IN ({','.join('?' for _ in ids)})"
-        params.extend(ids)
-    if account_id:
-        query += " AND (t.income_account=? OR t.outcome_account=?)"
-        params.extend([account_id, account_id])
+    if categories:
+        expanded = list(
+            dict.fromkeys(
+                descendant
+                for category in categories
+                for descendant in _descendant_tag_ids(db, category)
+            )
+        )
+        placeholders = ",".join("?" for _ in expanded)
+        query += (
+            " AND EXISTS (SELECT 1 FROM json_each(t.tag) "
+            f"WHERE value IN ({placeholders}))"
+        )
+        params.extend(expanded)
+    if accounts:
+        placeholders = ",".join("?" for _ in accounts)
+        query += (
+            f" AND (t.income_account IN ({placeholders}) "
+            f"OR t.outcome_account IN ({placeholders}))"
+        )
+        params.extend([*accounts, *accounts])
+    if category_state == "categorized":
+        query += " AND t.tag IS NOT NULL AND COALESCE(json_array_length(t.tag),0)>0"
+    elif category_state == "uncategorized":
+        query += " AND (t.tag IS NULL OR COALESCE(json_array_length(t.tag),0)=0)"
     if merchant_id:
         query += " AND t.merchant=?"
         params.append(merchant_id)
@@ -1076,14 +1203,7 @@ def search_transactions(
     if invalid_rate is not None:
         db.require_instrument_rate(invalid_rate["instrument_id"])
 
-    # Thresholds are expressed in the user's currency.
-    amount_expr = """
-        CASE
-          WHEN t.outcome>0 THEN t.outcome * oi.rate / ?
-          WHEN t.income>0 THEN t.income * ii.rate / ?
-          ELSE 0
-        END
-    """
+    # Thresholds and amount sorting are expressed in the user's currency.
     if lower is not None:
         query += f" AND ({amount_expr}) >= ?"
         params.extend([user_rate, user_rate, lower])
@@ -1092,11 +1212,76 @@ def search_transactions(
         params.extend([user_rate, user_rate, upper])
     count_query = f"SELECT COUNT(*) AS total FROM ({query})"
     total = db.connect().execute(count_query, params).fetchone()["total"]
-    query += " ORDER BY t.date DESC,t.changed DESC LIMIT ?"
-    rows = db.connect().execute(query, [*params, applied_limit]).fetchall()
+
+    if cursor is not None:
+        sort_value, cursor_date, cursor_changed, cursor_id = _decode_search_cursor(
+            cursor, sort_by, sort_order
+        )
+        comparison = ">" if sort_order == "asc" else "<"
+        if sort_by == "date":
+            query += f""" AND (
+                t.date {comparison} ?
+                OR (t.date=? AND COALESCE(t.changed,0) {comparison} ?)
+                OR (t.date=? AND COALESCE(t.changed,0)=? AND t.id {comparison} ?)
+            )"""
+            params.extend(
+                [
+                    cursor_date,
+                    cursor_date,
+                    cursor_changed,
+                    cursor_date,
+                    cursor_changed,
+                    cursor_id,
+                ]
+            )
+        else:
+            clauses = [
+                f"({amount_expr}) {comparison} ?",
+                f"(({amount_expr}) = ? AND t.date {comparison} ?)",
+                f"(({amount_expr}) = ? AND t.date=? AND COALESCE(t.changed,0) {comparison} ?)",
+                f"(({amount_expr}) = ? AND t.date=? AND COALESCE(t.changed,0)=? AND t.id {comparison} ?)",
+            ]
+            query += " AND (" + " OR ".join(clauses) + ")"
+            params.extend([user_rate, user_rate, sort_value])
+            params.extend([user_rate, user_rate, sort_value, cursor_date])
+            params.extend(
+                [
+                    user_rate,
+                    user_rate,
+                    sort_value,
+                    cursor_date,
+                    cursor_changed,
+                ]
+            )
+            params.extend(
+                [
+                    user_rate,
+                    user_rate,
+                    sort_value,
+                    cursor_date,
+                    cursor_changed,
+                    cursor_id,
+                ]
+            )
+
+    direction = sort_order.upper()
+    if sort_by == "amount":
+        query += (
+            f" ORDER BY ({amount_expr}) {direction},t.date {direction},"
+            f"COALESCE(t.changed,0) {direction},t.id {direction} LIMIT ?"
+        )
+        params.extend([user_rate, user_rate])
+    else:
+        query += (
+            f" ORDER BY t.date {direction},COALESCE(t.changed,0) {direction},"
+            f"t.id {direction} LIMIT ?"
+        )
+    rows = db.connect().execute(query, [*params, applied_limit + 1]).fetchall()
+    has_more = len(rows) > applied_limit
+    page = rows[:applied_limit]
 
     tag_ids: set[str] = set()
-    for row in rows:
+    for row in page:
         tag = _primary_tag(row["tag"])
         if tag:
             tag_ids.add(tag)
@@ -1111,7 +1296,7 @@ def search_transactions(
         }
 
     transactions: list[dict[str, Any]] = []
-    for row in rows:
+    for row in page:
         income, outcome = float(row["income"] or 0), float(row["outcome"] or 0)
         if income > 0 and outcome == 0:
             kind, raw, instrument, raw_currency, account = (
@@ -1142,17 +1327,37 @@ def search_transactions(
                 "amount_converted": round(converted, 2),
                 "converted_currency": user_code,
                 "account": account,
+                "category_id": tag,
                 "category": titles.get(tag, tag) if tag else None,
                 "payee": payee,
                 "comment": row["comment"] if row["comment"] != payee else None,
                 "hold": bool(row["hold"]),
             }
         )
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        sort_value = (
+            last["date"]
+            if sort_by == "date"
+            else _search_row_amount(last, user_rate)
+        )
+        next_cursor = _encode_search_cursor(
+            sort_by,
+            sort_order,
+            sort_value,
+            last["date"],
+            int(last["changed"] or 0),
+            str(last["id"]),
+        )
     return {
         "transactions": transactions,
         "returned_count": len(transactions),
         "total_matching": int(total),
         "limit_applied": applied_limit,
+        "next_cursor": next_cursor,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
     }
 
 
