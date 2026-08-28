@@ -783,13 +783,22 @@ def test_debt_service_counts_transfer_into_debt_account(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 6_000
+    assert result["total_liabilities"] == 7_000
+    assert {item["account_id"] for item in result["obligations"]} == {
+        "credit",
+        "loan",
+    }
     assert result["last_complete_month"] == {
-        "debt_payments": 500,
-        "income": 1_000,
+        "operating_income": 1_000,
+        "debt_service_cash_outflow": 500,
         "debt_service_ratio_pct": 50,
     }
-    assert result["trailing_3_month_average_payment"] == 166.67
+    assert result["trailing_3_complete_months"] == {
+        "average_debt_service_cash_outflow": 166.67,
+    }
+    assert "current_debt_balance" not in result
+    assert "accounts" not in result
+    assert "trailing_3_month_average_payment" not in result
 
 
 def test_debt_service_handles_multiple_currencies_and_zero_income(planning_db):
@@ -810,19 +819,20 @@ def test_debt_service_handles_multiple_currencies_and_zero_income(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 6_900
-    assert result["last_complete_month"]["debt_payments"] == 90
+    assert result["total_liabilities"] == 7_900
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 90
     assert result["last_complete_month"]["debt_service_ratio_pct"] is None
-    assert len(result["accounts"]) == 2
+    assert len(result["obligations"]) == 3
 
 
 def test_debt_service_with_no_debt_is_zero(planning_db):
-    planning_db.connect().execute("UPDATE accounts SET balance=0 WHERE type IN ('loan','debt')")
+    planning_db.connect().execute("UPDATE accounts SET balance=0 WHERE balance<0")
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 0
-    assert result["last_complete_month"]["debt_payments"] == 0
+    assert result["total_liabilities"] == 0
+    assert result["obligations"] == []
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 0
 
 
 def test_debt_service_excludes_transfer_into_positive_debt_account(planning_db):
@@ -842,7 +852,7 @@ def test_debt_service_excludes_transfer_into_positive_debt_account(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["last_complete_month"]["debt_payments"] == 0
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 0
 
 
 def test_debt_service_uses_actual_source_cash_outflow(planning_db):
@@ -864,7 +874,7 @@ def test_debt_service_uses_actual_source_cash_outflow(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["last_complete_month"]["debt_payments"] == 100
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 100
 
 
 def test_forecast_sums_planned_income_and_outcome(planning_db):

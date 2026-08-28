@@ -644,74 +644,47 @@ def get_emergency_fund_status(
     }
 
 
-def _debt_payments_for_dates(
-    db: Any, start: date, end: date, currency: CurrencyContext
-) -> float:
-    rows = db.connect().execute(
-        """SELECT t.outcome,t.outcome_instrument
-           FROM transactions t
-           JOIN accounts debt ON debt.id=t.income_account
-           LEFT JOIN accounts source ON source.id=t.outcome_account
-           WHERE COALESCE(t.deleted,0)=0 AND COALESCE(t.hold,0)=0
-             AND t.income>0 AND t.outcome>0
-             AND debt.type IN ('loan','debt') AND debt.balance<0
-             AND COALESCE(debt.archive,0)=0
-             AND COALESCE(source.archive,0)=0
-             AND (source.in_balance=1 OR source.in_balance IS NULL)
-             AND COALESCE(source.type,'') NOT IN ('loan','debt')
-             AND t.date BETWEEN ? AND ?""",
-        (start.isoformat(), end.isoformat()),
-    ).fetchall()
-    return sum(
-        convert(db, row["outcome"], row["outcome_instrument"], currency)
-        for row in rows
-    )
-
-
-def get_debt_service(db: Any, *, as_of: date | None = None) -> dict[str, Any]:
+def get_debt_service(
+    db: Any,
+    obligation_overrides: dict[str, Any] | None = None,
+    *,
+    as_of: date | None = None,
+) -> dict[str, Any]:
     currency = user_currency(db)
-    rows = db.connect().execute(
-        """SELECT id,title,type,balance,instrument
-           FROM accounts
-           WHERE type IN ('loan','debt') AND COALESCE(archive,0)=0
-           ORDER BY title,id"""
-    ).fetchall()
-    accounts = []
-    current_debt = 0.0
-    for row in rows:
-        balance = convert(db, row["balance"], row["instrument"], currency)
-        debt_balance = max(0.0, -balance)
-        current_debt += debt_balance
-        accounts.append(
-            {
-                "id": row["id"],
-                "title": row["title"],
-                "type": row["type"],
-                "balance": round(balance, 2),
-                "debt_balance": round(debt_balance, 2),
-            }
-        )
+    obligations = _financial_obligations(
+        db, currency, obligation_overrides, as_of=as_of
+    )
     periods = completed_periods(db, 3, as_of)
-    payments = [
-        _debt_payments_for_dates(db, period.start, period.end, currency)
+    flows = [
+        _cash_flow_for_dates(db, period.start, period.end)
         for period in periods
     ]
-    latest = periods[-1]
-    income = _cash_flow_for_dates(db, latest.start, latest.end)["income"]
-    latest_payment = payments[-1]
+    latest = flows[-1]
+    income = latest["income"]
+    latest_payment = latest["debt_service_cash_outflow"]
+    payments = [item["debt_service_cash_outflow"] for item in flows]
+    data_quality = _data_quality(db, as_of)
+    if any(item["flow_components"]["unknown"]["count"] for item in flows):
+        data_quality["warnings"].append("unknown_transaction_flows_excluded")
     return {
         "currency": currency.code,
-        "current_debt_balance": round(current_debt, 2),
+        "total_liabilities": round(
+            sum(item["balance"] for item in obligations), 2
+        ),
+        "obligations": obligations,
         "last_complete_month": {
-            "debt_payments": round(latest_payment, 2),
-            "income": round(income, 2),
+            "operating_income": round(income, 2),
+            "debt_service_cash_outflow": round(latest_payment, 2),
             "debt_service_ratio_pct": (
                 round(latest_payment / income * 100, 2) if income > 0 else None
             ),
         },
-        "trailing_3_month_average_payment": round(statistics.fmean(payments), 2),
-        "accounts": accounts,
-        "data_quality": _data_quality(db, as_of),
+        "trailing_3_complete_months": {
+            "average_debt_service_cash_outflow": round(
+                statistics.fmean(payments), 2
+            )
+        },
+        "data_quality": data_quality,
     }
 
 

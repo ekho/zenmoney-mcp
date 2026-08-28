@@ -102,6 +102,43 @@ async def test_cash_flow_schema_accepts_every_documented_period(period):
 
 
 @pytest.mark.asyncio
+async def test_debt_service_schema_accepts_strict_obligation_overrides():
+    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
+    schema = tools["get_debt_service"]
+    overrides = schema["properties"]["obligation_overrides"]
+    account = overrides["additionalProperties"]
+    payment = account["properties"]["minimum_payment"]
+
+    assert overrides["maxProperties"] == 50
+    assert account["minProperties"] == 1
+    assert account["additionalProperties"] is False
+    assert account["properties"]["classification"]["enum"] == [
+        "loan",
+        "credit_card",
+        "installment",
+        "personal_debt",
+        "other",
+    ]
+    assert payment["required"] == ["amount"]
+    assert payment["additionalProperties"] is False
+    validate(
+        {
+            "obligation_overrides": {
+                "credit": {
+                    "classification": "installment",
+                    "minimum_payment": {
+                        "amount": 250,
+                        "due_date": "2026-09-18",
+                    },
+                    "apr_pct": 19.9,
+                }
+            }
+        },
+        schema,
+    )
+
+
+@pytest.mark.asyncio
 async def test_planning_tool_dispatch_returns_json(planning_mcp_db):
     content = await server.call_tool(
         "get_cash_flow",
@@ -111,6 +148,36 @@ async def test_planning_tool_dispatch_returns_json(planning_mcp_db):
     result = json.loads(content[0].text)
     assert result["income"] == 500
     assert result["currency"] == "RUB"
+
+
+@pytest.mark.asyncio
+async def test_debt_service_dispatch_passes_obligation_overrides(planning_mcp_db):
+    planning_mcp_db.connect().execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('installment','Installment','checking',1,-1000,0,0,0,1,1)"
+    )
+
+    content = await server.call_tool(
+        "get_debt_service",
+        {
+            "obligation_overrides": {
+                "installment": {
+                    "classification": "installment",
+                    "minimum_payment": {
+                        "amount": 250,
+                        "due_date": "2026-09-18",
+                    },
+                    "apr_pct": 19.9,
+                }
+            }
+        },
+    )
+
+    result = json.loads(content[0].text)
+    obligation = result["obligations"][0]
+    assert obligation["classification"] == "installment"
+    assert obligation["minimum_payment"]["source"] == "user_override"
+    assert obligation["apr_pct"] == {"value": 19.9, "source": "user_override"}
 
 
 @pytest.mark.asyncio

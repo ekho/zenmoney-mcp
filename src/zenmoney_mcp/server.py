@@ -408,8 +408,14 @@ def _planning_tools() -> list[Tool]:
         ),
         Tool(
             name="get_debt_service",
-            description="Get actual debt balances, transfer-based payments, and debt-service ratio without APR assumptions.",
-            inputSchema={"type": "object", "properties": {}},
+            description="Get every active financial obligation, cash debt service, and debt-service ratio without invented terms.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "obligation_overrides": _OBLIGATION_OVERRIDES_SCHEMA,
+                },
+                "additionalProperties": False,
+            },
         ),
         Tool(
             name="forecast_cash_flow",
@@ -450,6 +456,39 @@ _DEBT_ACCOUNTS_SCHEMA = {
         "additionalProperties": False,
     },
     "description": "Planning configuration keyed by ZenMoney debt account ID",
+}
+
+_OBLIGATION_OVERRIDES_SCHEMA = {
+    "type": "object",
+    "maxProperties": 50,
+    "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": [
+                    "loan",
+                    "credit_card",
+                    "installment",
+                    "personal_debt",
+                    "other",
+                ],
+            },
+            "minimum_payment": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "minimum": 0},
+                    "due_date": {"type": "string", "pattern": _DATE_PATTERN},
+                },
+                "required": ["amount"],
+                "additionalProperties": False,
+            },
+            "apr_pct": {"type": "number", "minimum": 0},
+        },
+        "additionalProperties": False,
+    },
+    "description": "Optional explicit terms keyed by active obligation account ID",
 }
 
 _GOAL_SCHEMA = {
@@ -1883,7 +1922,7 @@ async def _dispatch_tool(
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_debt_service":
-        result = get_debt_service(db)
+        result = get_debt_service(db, arguments.get("obligation_overrides"))
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "forecast_cash_flow":
