@@ -201,6 +201,18 @@ def test_prepare_recurring_payment_rejects_nonfinite_or_bool_amount_before_compi
         )
 
 
+def test_prepare_recurring_payment_rejects_oversized_int_amount(
+    financial_db, tmp_path
+):
+    payment = recurring_payment()
+    payment["amount"] = 10**1000
+
+    with pytest.raises(MutationValidationError):
+        prepare_recurring_payment(
+            financial_db, ProposalStore(tmp_path / "proposals.db"), payment
+        )
+
+
 def test_prepare_persists_generic_immutable_preview(financial_db, tmp_path):
     store = ProposalStore(tmp_path / "proposals.db")
 
