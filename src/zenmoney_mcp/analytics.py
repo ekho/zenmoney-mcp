@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from .database import Database
+from .sync_control import format_sync_timestamp
 from .utils import convert_to_user_currency
 
 
@@ -2210,178 +2211,211 @@ def detect_anomalies(
     Returns:
         Dictionary with detected anomalies.
     """
-    # Enforce minimum z_threshold
     z_threshold = max(z_threshold, 1.5)
-
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    selected_start = date.fromisoformat(start_date)
+    selected_end = date.fromisoformat(end_date)
+    history_start = min(selected_start, selected_end - timedelta(days=400)).isoformat()
 
-    # Get user currency for conversion
-    user_currency_id = db.get_user_currency()
-    if not user_currency_id:
-        user_currency_id = 2  # Default to RUB
+    user_currency_id = db.get_user_currency() or 2
     currency_row = conn.execute(
-        "SELECT short_title, rate FROM instruments WHERE id = ?",
-        (user_currency_id,)
+        "SELECT short_title FROM instruments WHERE id = ?", (user_currency_id,)
     ).fetchone()
     currency_code = currency_row["short_title"] if currency_row else "RUB"
-    user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Build query with optional category filter
-    query = """
-        SELECT
-            t.id, t.date, t.outcome, t.outcome_instrument, t.tag, t.merchant, t.payee,
-            t.comment,
-            m.title as merchant_title,
-            tag.title as tag_title
-        FROM transactions t
-        LEFT JOIN merchants m ON m.id = t.merchant
-        LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
-        WHERE t.deleted = 0
-          AND (t.hold IS NULL OR t.hold = 0)
-          AND NOT (t.income > 0 AND t.outcome > 0)
-          AND t.outcome > 0
-          AND t.income = 0
-          AND t.date >= ? AND t.date <= ?
-    """
-    params: list[Any] = [start_date, end_date]
-
-    # Add category filter (with children)
+    category_cte = ""
+    params: list[Any] = [history_start, end_date]
+    category_filter = ""
     if category_id:
-        category_ids = [category_id]
-        children = conn.execute(
-            "SELECT id FROM tags WHERE parent = ?", (category_id,)
-        ).fetchall()
-        category_ids.extend(row["id"] for row in children)
+        category_cte = """
+            WITH RECURSIVE selected_categories(id) AS (
+                SELECT id FROM tags WHERE id = ?
+                UNION
+                SELECT tags.id FROM tags JOIN selected_categories ON tags.parent = selected_categories.id
+            )
+        """
+        category_filter = " AND json_extract(t.tag, '$[0]') IN (SELECT id FROM selected_categories)"
+        params.insert(0, category_id)
 
-        placeholders = ",".join("?" * len(category_ids))
-        query += f" AND json_extract(t.tag, '$[0]') IN ({placeholders})"
-        params.extend(category_ids)
+    rows = conn.execute(
+        category_cte + """
+            SELECT t.id, t.date, t.outcome, t.outcome_instrument, t.outcome_account, t.tag,
+                   t.payee, m.title AS merchant_title, tag.title AS tag_title
+            FROM transactions t
+            LEFT JOIN merchants m ON m.id = t.merchant
+            LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
+            WHERE t.deleted = 0
+              AND (t.hold IS NULL OR t.hold = 0)
+              AND t.outcome > 0
+              AND COALESCE(t.income, 0) = 0
+              AND t.date BETWEEN ? AND ?
+        """ + category_filter + " ORDER BY t.date, t.id",
+        params,
+    ).fetchall()
 
-    rows = conn.execute(query, params).fetchall()
-
-    outliers = []
-    duplicates = []
-
-    # Detect amount outliers by category
-    category_stats = {}
+    records = []
     for row in rows:
-        tag_json = row["tag"]
-        if tag_json:
-            try:
-                tags = json.loads(tag_json)
-                category = tags[0] if tags else None
-            except:
-                category = None
-        else:
+        try:
+            tags = json.loads(row["tag"]) if row["tag"] else []
+            category = tags[0] if tags else None
+        except (json.JSONDecodeError, IndexError, TypeError):
             category = None
+        tx_date = date.fromisoformat(row["date"])
+        amount = convert_to_user_currency(
+            row["outcome"], row["outcome_instrument"], db, user_currency_id,
+        )
+        payee = (row["merchant_title"] or "").strip() or (row["payee"] or "").strip()
+        records.append({
+            "id": row["id"],
+            "date": tx_date,
+            "amount": amount,
+            "amount_cents": round(amount, 2),
+            "category_id": category,
+            "category": row["tag_title"] or "Uncategorized",
+            "outcome_account": row["outcome_account"],
+            "payee": payee,
+            "normalized_payee": payee.casefold(),
+            "selected": selected_start <= tx_date <= selected_end,
+        })
 
-        if category not in category_stats:
-            category_stats[category] = []
-        amount = row["outcome"]
-        instrument_id = row["outcome_instrument"]
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            amount = amount * source_rate / user_rate if user_rate else amount
-        category_stats[category].append(amount)
+    selected_records = [record for record in records if record["selected"]]
 
-    # Calculate stats for each category
-    for category, amounts in category_stats.items():
-        if len(amounts) < 3:
-            continue  # Need at least 3 for meaningful stats
+    def pair_details(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "transactions": [first["id"], second["id"]],
+            "date": first["date"].isoformat(),
+            "amount": first["amount_cents"],
+            "payee": first["payee"],
+            "severity": "medium",
+            "timestamp_precision": "day",
+        }
 
+    exact_duplicates = []
+    same_merchant_amount_close_timestamp = []
+    near_duplicates = []
+    exact_duplicates_count = 0
+    same_merchant_amount_close_timestamp_count = 0
+    near_duplicates_count = 0
+    for index, first in enumerate(selected_records):
+        for second_index in range(index + 1, len(selected_records)):
+            second = selected_records[second_index]
+            if (second["date"] - first["date"]).days > 2:
+                break
+            if (
+                first["normalized_payee"]
+                and first["date"] == second["date"]
+                and first["amount_cents"] == second["amount_cents"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["category_id"] == second["category_id"]
+                and first["outcome_account"] == second["outcome_account"]
+            ):
+                exact_duplicates_count += 1
+                if len(exact_duplicates) < 15:
+                    exact_duplicates.append(pair_details(first, second))
+            elif (
+                first["normalized_payee"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["amount_cents"] == second["amount_cents"]
+                and abs((first["date"] - second["date"]).days) <= 1
+            ):
+                same_merchant_amount_close_timestamp_count += 1
+                if len(same_merchant_amount_close_timestamp) < 15:
+                    same_merchant_amount_close_timestamp.append(pair_details(first, second))
+            elif (
+                first["normalized_payee"]
+                and first["normalized_payee"] == second["normalized_payee"]
+                and first["category_id"] == second["category_id"]
+                and abs((first["date"] - second["date"]).days) <= 2
+                and abs(first["amount"] - second["amount"]) / max(first["amount"], second["amount"]) <= 0.05
+            ):
+                near_duplicates_count += 1
+                if len(near_duplicates) < 15:
+                    near_duplicates.append(pair_details(first, second))
+
+    recurrence_groups: dict[tuple[str | None, float], list[dict[str, Any]]] = {}
+    for record in records:
+        recurrence_groups.setdefault((record["category_id"], record["amount_cents"]), []).append(record)
+    periodic_recurrences = []
+    periodic_ids = set()
+    for group in recurrence_groups.values():
+        dates = sorted({record["date"] for record in group})
+        intervals = [(later - earlier).days for earlier, later in zip(dates, dates[1:])]
+        frequency = None
+        if len(dates) >= 3 and all(25 <= interval <= 35 for interval in intervals):
+            frequency = "monthly"
+        elif len(dates) >= 2 and all(80 <= interval <= 100 for interval in intervals):
+            frequency = "quarterly"
+        elif len(dates) >= 2 and all(170 <= interval <= 195 for interval in intervals):
+            frequency = "semiannual"
+        elif len(dates) >= 2 and all(350 <= interval <= 380 for interval in intervals):
+            frequency = "annual"
+        if frequency and any(record["selected"] for record in group):
+            periodic_ids.update(record["id"] for record in group)
+            periodic_recurrences.append({
+                "transactions": [record["id"] for record in group],
+                "dates": [tx_date.isoformat() for tx_date in dates],
+                "amount": group[0]["amount_cents"],
+                "category": group[0]["category"],
+                "frequency": frequency,
+                "timestamp_precision": "day",
+            })
+
+    category_stats: dict[str | None, list[dict[str, Any]]] = {}
+    for record in selected_records:
+        category_stats.setdefault(record["category_id"], []).append(record)
+    unusually_large_one_off = []
+    for category_records in category_stats.values():
+        if len(category_records) < 3:
+            continue
+        amounts = [record["amount"] for record in category_records]
         mean = sum(amounts) / len(amounts)
-        variance = sum((x - mean) ** 2 for x in amounts) / len(amounts)
-        stddev = variance ** 0.5
-
+        stddev = (sum((amount - mean) ** 2 for amount in amounts) / len(amounts)) ** 0.5
         if stddev == 0:
             continue
-
-        # Find outliers
-        for row in rows:
-            tag_json = row["tag"]
-            if tag_json:
-                try:
-                    tags = json.loads(tag_json)
-                    row_category = tags[0] if tags else None
-                except:
-                    row_category = None
-            else:
-                row_category = None
-
-            if row_category != category:
-                continue
-
-            amount = row["outcome"]
-            instrument_id = row["outcome_instrument"]
-            if instrument_id and instrument_id != user_currency_id:
-                source_rate = db.get_instrument_rate(instrument_id)
-                amount = amount * source_rate / user_rate if user_rate else amount
-
-            z_score = abs(amount - mean) / stddev
-            if z_score > z_threshold:
-                outliers.append({
-                    "transaction_id": row["id"],
-                    "date": row["date"],
-                    "amount": round(amount, 2),
-                    "category": row["tag_title"] or "Uncategorized",
-                    "payee": row["merchant_title"] or row["payee"],
+        for record in category_records:
+            z_score = (record["amount"] - mean) / stddev
+            if z_score > z_threshold and record["id"] not in periodic_ids:
+                unusually_large_one_off.append({
+                    "transaction_id": record["id"],
+                    "date": record["date"].isoformat(),
+                    "amount": record["amount_cents"],
+                    "category": record["category"],
+                    "payee": record["payee"],
                     "z_score": round(z_score, 2),
                     "mean": round(mean, 2),
                     "stddev": round(stddev, 2),
                     "severity": "high" if z_score >= 3.0 else ("medium" if z_score >= 2.0 else "low"),
                 })
 
-    # Detect possible duplicates (same amount, date ±1 day, same payee)
-    checked_pairs = set()
-    for i, row1 in enumerate(rows):
-        for row2 in rows[i+1:]:
-            pair_key = tuple(sorted([row1["id"], row2["id"]]))
-            if pair_key in checked_pairs:
-                continue
-            checked_pairs.add(pair_key)
-
-            # Convert amounts to user currency for comparison
-            amount1 = row1["outcome"]
-            instr1 = row1["outcome_instrument"]
-            if instr1 and instr1 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr1)
-                amount1 = amount1 * source_rate / user_rate if user_rate else amount1
-
-            amount2 = row2["outcome"]
-            instr2 = row2["outcome_instrument"]
-            if instr2 and instr2 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr2)
-                amount2 = amount2 * source_rate / user_rate if user_rate else amount2
-
-            # Check if amounts are close
-            if abs(amount1 - amount2) < 0.01:
-                # Check if dates are close
-                date1 = date.fromisoformat(row1["date"])
-                date2 = date.fromisoformat(row2["date"])
-                if abs((date1 - date2).days) <= 1:
-                    # Check if payees match
-                    payee1 = row1["merchant_title"] or row1["payee"] or ""
-                    payee2 = row2["merchant_title"] or row2["payee"] or ""
-                    if payee1 and payee2 and payee1 == payee2:
-                        duplicates.append({
-                            "transactions": [row1["id"], row2["id"]],
-                            "date": row1["date"],
-                            "amount": round(amount1, 2),
-                            "payee": payee1,
-                            "severity": "medium",
-                        })
-
+    counts = {
+        "exact_duplicates_count": exact_duplicates_count,
+        "same_merchant_amount_close_timestamp_count": same_merchant_amount_close_timestamp_count,
+        "near_duplicates_count": near_duplicates_count,
+        "periodic_recurrences_count": len(periodic_recurrences),
+        "unusually_large_one_off_count": len(unusually_large_one_off),
+    }
+    duplicates_count = exact_duplicates_count + same_merchant_amount_close_timestamp_count + near_duplicates_count
+    results_truncated = any(count > 15 for count in (*counts.values(), duplicates_count))
+    outliers = unusually_large_one_off[:15]
+    possible_duplicates = (exact_duplicates + same_merchant_amount_close_timestamp + near_duplicates)[:15]
     return {
         "period": {"start": start_date, "end": end_date},
         "currency": currency_code,
         "summary": {
-            "outliers_count": len(outliers),
-            "duplicates_count": len(duplicates),
-            "total_transactions_analyzed": len(rows),
+            **counts,
+            "outliers_count": len(unusually_large_one_off),
+            "duplicates_count": duplicates_count,
+            "total_transactions_analyzed": len(selected_records),
+            "results_truncated": results_truncated,
         },
-        "outliers": outliers[:15],
-        "possible_duplicates": duplicates[:15],
+        "exact_duplicates": exact_duplicates,
+        "same_merchant_amount_close_timestamp": same_merchant_amount_close_timestamp,
+        "near_duplicates": near_duplicates,
+        "periodic_recurrences": periodic_recurrences[:15],
+        "unusually_large_one_off": outliers,
+        "outliers": outliers,
+        "possible_duplicates": possible_duplicates,
     }
 
 
@@ -3249,13 +3283,13 @@ def get_sync_status_resource(db: Database) -> dict[str, Any]:
         count = conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()["cnt"]
         cache_stats[table] = count
 
-    # Calculate staleness
+    last_sync_formatted = None
     if last_sync_time:
         try:
             last_sync = int(last_sync_time)
+            last_sync_formatted = format_sync_timestamp(last_sync)
             current_time = int(datetime.now().timestamp())
             age_seconds = current_time - last_sync
-
             if age_seconds < 300:  # 5 minutes
                 staleness = "fresh"
             elif age_seconds < 3600:  # 1 hour
@@ -3266,16 +3300,6 @@ def get_sync_status_resource(db: Database) -> dict[str, Any]:
             staleness = "unknown"
     else:
         staleness = "never_synced"
-
-    # Format last sync time
-    if last_sync_time:
-        try:
-            dt = datetime.fromtimestamp(int(last_sync_time))
-            last_sync_formatted = dt.isoformat()
-        except (ValueError, TypeError):
-            last_sync_formatted = None
-    else:
-        last_sync_formatted = None
 
     return {
         "last_server_timestamp": int(server_timestamp) if server_timestamp else 0,

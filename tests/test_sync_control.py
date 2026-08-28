@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 import pytest
 
+from zenmoney_mcp import sync_control
 from zenmoney_mcp.sync_control import (
     InvalidSyncState,
     claim_sync_request,
@@ -11,6 +13,45 @@ from zenmoney_mcp.sync_control import (
     read_sync_state,
     request_sync,
 )
+
+
+def test_format_sync_timestamp_uses_rfc3339_utc():
+    """A public sync time must not inherit the host timezone."""
+    assert sync_control.format_sync_timestamp(0) == "1970-01-01T00:00:00Z"
+    assert (
+        sync_control.format_sync_timestamp(1_700_000_000)
+        == "2023-11-14T22:13:20Z"
+    )
+
+
+@pytest.mark.parametrize("timestamp", [-1, 10**100])
+def test_format_sync_timestamp_rejects_invalid_epoch(timestamp):
+    """Public timestamp formatting must fail closed outside Unix epoch bounds."""
+    with pytest.raises(ValueError):
+        sync_control.format_sync_timestamp(timestamp)
+
+
+@pytest.mark.parametrize("timestamp", [-1, 10**100])
+def test_control_state_rejects_invalid_epoch_timestamp(tmp_path, timestamp):
+    """A valid-shaped control file cannot carry unrenderable public metadata."""
+    path = tmp_path / "sync-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "state": "pending",
+                "request_id": "00000000-0000-0000-0000-000000000001",
+                "force_full": False,
+                "requested_at": timestamp,
+                "started_at": None,
+                "finished_at": None,
+                "failure_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidSyncState):
+        read_sync_state(path)
 
 
 def test_missing_control_state_is_idle(tmp_path):

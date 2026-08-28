@@ -1,5 +1,6 @@
 """MCP Server for ZenMoney financial analytics."""
 
+import asyncio
 import json
 import logging
 import os
@@ -84,6 +85,7 @@ from .entity_resources import (
 from .sync_control import (
     DEFAULT_CONTROL_PATH,
     InvalidSyncState,
+    format_sync_timestamp,
     read_sync_state,
     request_sync,
 )
@@ -126,6 +128,8 @@ MUTATION_TOOLS = frozenset(
     }
 )
 LOGGER = logging.getLogger(__name__)
+_SYNC_WAIT_TIMEOUT_SECONDS = 60.0
+_SYNC_WAIT_INTERVAL_SECONDS = 0.25
 ENTITY_RESOURCE_NAMES = {
     "accounts": "account",
     "tags": "tag",
@@ -256,6 +260,7 @@ def harden_tool_schemas(tools: list[Tool]) -> list[Tool]:
     non_negative = {"amount", "target_amount", "min_amount", "max_amount"}
 
     for tool in tools:
+        tool.output_schema = {"type": "object"}
         properties = tool.input_schema.get("properties")
         if not isinstance(properties, dict):
             continue
@@ -1685,7 +1690,12 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "type": "boolean",
                         "default": False,
                         "description": "Request a full snapshot instead of an incremental sync",
-                    }
+                    },
+                    "wait_until_complete": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Wait up to 60 seconds for this sync request to finish",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -1703,6 +1713,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
     return [
         tool.model_copy(
             update={
+                "output_schema": {"type": "object"},
                 "annotations": ToolAnnotations(
                     readOnlyHint=tool.name
                     not in {
@@ -1735,9 +1746,21 @@ def _public_sync_state(state: dict[str, Any]) -> dict[str, Any]:
         "state": state["state"],
         "request_id": state["request_id"],
         "mode": mode,
-        "requested_at": state["requested_at"],
-        "started_at": state["started_at"],
-        "finished_at": state["finished_at"],
+        "requested_at": (
+            format_sync_timestamp(state["requested_at"])
+            if state["requested_at"] is not None
+            else None
+        ),
+        "started_at": (
+            format_sync_timestamp(state["started_at"])
+            if state["started_at"] is not None
+            else None
+        ),
+        "finished_at": (
+            format_sync_timestamp(state["finished_at"])
+            if state["finished_at"] is not None
+            else None
+        ),
         "failure_code": state["failure_code"],
     }
 
@@ -1780,7 +1803,46 @@ def _dispatch_entity_read_tool(
     return _text_result(result)
 
 
-def _dispatch_remote_control_tool(
+def _invalid_wait_result() -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "state": "failed",
+        "request_id": None,
+        "mode": None,
+        "requested_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "failure_code": "invalid_sync_state",
+        "wait_timed_out": False,
+    }
+
+
+async def _wait_for_sync_request(
+    control_path: Path, request_id: str
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SYNC_WAIT_TIMEOUT_SECONDS
+    while True:
+        try:
+            state = read_sync_state(control_path)
+        except InvalidSyncState:
+            return _invalid_wait_result()
+        if state["request_id"] != request_id:
+            return _invalid_wait_result()
+
+        public_state = _public_sync_state(state)
+        if state["state"] in {"completed", "failed"}:
+            return {
+                "status": state["state"],
+                **public_state,
+                "wait_timed_out": False,
+            }
+        if loop.time() >= deadline:
+            return {"status": "timeout", **public_state, "wait_timed_out": True}
+        await asyncio.sleep(_SYNC_WAIT_INTERVAL_SECONDS)
+
+
+async def _dispatch_remote_control_tool(
     name: str,
     arguments: dict[str, Any],
     *,
@@ -1789,9 +1851,9 @@ def _dispatch_remote_control_tool(
     db_path: str | Path | None,
 ) -> list[TextContent]:
     if name == "force_sync":
-        if set(arguments) - {"force_full"} or type(
+        if set(arguments) - {"force_full", "wait_until_complete"} or type(
             arguments.get("force_full", False)
-        ) is not bool:
+        ) is not bool or type(arguments.get("wait_until_complete", False)) is not bool:
             raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
         try:
             state = request_sync(
@@ -1805,8 +1867,12 @@ def _dispatch_remote_control_tool(
             "status": state["status"],
             "request_id": state["request_id"],
             "mode": "full" if state["force_full"] else "incremental",
-            "requested_at": state["requested_at"],
+            "requested_at": format_sync_timestamp(state["requested_at"]),
         }
+        if arguments.get("wait_until_complete", False):
+            return _text_result(
+                await _wait_for_sync_request(control_path, state["request_id"])
+            )
         return _text_result(result)
 
     if arguments:
@@ -2234,7 +2300,7 @@ async def call_tool(
         raise MCPError(INVALID_PARAMS, "Remote tool is unavailable")
 
     if remote and name in REMOTE_CONTROL_TOOLS:
-        return _dispatch_remote_control_tool(
+        return await _dispatch_remote_control_tool(
             name,
             arguments,
             control_path=(
@@ -2485,6 +2551,11 @@ def create_server(
                 control_path=control_path,
                 mutation_path=mutation_path,
             )
+            if len(content) != 1 or type(content[0]) is not TextContent:
+                raise ValueError("Tool result must be one JSON TextContent")
+            structured_content = json.loads(content[0].text)
+            if not isinstance(structured_content, dict):
+                raise ValueError("Tool result must be a JSON object")
         except MCPError:
             raise
         except Exception as exc:
@@ -2501,7 +2572,10 @@ def create_server(
                 )
             )
             raise MCPError(INTERNAL_ERROR, "Remote tool failed") from None
-        return CallToolResult(content=content)
+        return CallToolResult(
+            content=content,
+            structuredContent=structured_content,
+        )
 
     async def _on_list_resources(context, params):
         return ListResourcesResult(resources=await list_resources())

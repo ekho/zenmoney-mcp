@@ -1016,6 +1016,26 @@ class TestR6SyncStatusResource:
         assert stats["accounts"] > 0
         assert stats["tags"] > 0
 
+    def test_sync_status_utc_last_sync_time(self, populated_db: Database):
+        """Cache metadata crosses the public boundary as RFC3339 UTC."""
+        populated_db.set_meta("last_sync_time", "0")
+
+        result = get_sync_status_resource(populated_db)
+
+        assert result["last_sync_time"] == "1970-01-01T00:00:00Z"
+
+    @pytest.mark.parametrize("raw_timestamp", ["-1", str(10**100)])
+    def test_invalid_sync_timestamp_metadata_is_unknown(
+        self, populated_db: Database, raw_timestamp
+    ):
+        """Malformed cache timestamps cannot look fresh or stale."""
+        populated_db.set_meta("last_sync_time", raw_timestamp)
+
+        result = get_sync_status_resource(populated_db)
+
+        assert result["last_sync_time"] is None
+        assert result["staleness"] == "unknown"
+
 
 # ============================================================================
 # Step 5: Expert Tools (T9, T10, T11, T14, T15)
@@ -2280,3 +2300,294 @@ class TestAuditFixSearchAmountCurrency:
         # max 5000 RUB -> 9000 > 5000, excluded.
         exc = search_transactions(populated_db, payee_search="USDTEST", max_amount=5000)
         assert exc["returned_count"] == 0
+
+
+class TestAnomalySignals:
+    """Structured anomaly signals retain one classification per pair."""
+
+    @pytest.mark.parametrize(
+        ("tags", "category_id"),
+        [
+            (("cycle-self", "Cycle", "cycle-self"), "cycle-self"),
+            (
+                (
+                    ("cycle-parent", "Cycle parent", "cycle-child"),
+                    ("cycle-child", "Cycle child", "cycle-parent"),
+                ),
+                "cycle-parent",
+            ),
+        ],
+        ids=("self-cycle", "two-node-cycle"),
+    )
+    def test_anomaly_category_filter_returns_selected_records_with_cycles(
+        self, populated_db: Database, tags: tuple[tuple[str, str, str], ...] | tuple[str, str, str], category_id: str,
+    ):
+        """Recursive category filtering must terminate for malformed parent cycles."""
+        conn = populated_db.connect()
+        if isinstance(tags[0], str):
+            tags = (tags,)
+        conn.executemany(
+            """INSERT INTO tags
+            (id, title, parent, show_income, show_outcome, budget_income, budget_outcome, required, user, changed)
+            VALUES (?, ?, ?, 0, 1, 0, 1, 0, 1, 1)""",
+            tags,
+        )
+        _insert_tx(
+            populated_db,
+            id="cycle-selected",
+            date="2026-08-10",
+            outcome=777.0,
+            tag=json.dumps([tags[-1][0]]),
+            payee="cycle-selected",
+        )
+
+        steps = 0
+
+        def stop_runaway_query() -> int:
+            nonlocal steps
+            steps += 1
+            return int(steps > 1_000)
+
+        conn.set_progress_handler(stop_runaway_query, 1)
+        try:
+            result = detect_anomalies(
+                populated_db,
+                category_id=category_id,
+                start_date="2026-08-01",
+                end_date="2026-08-31",
+            )
+        finally:
+            conn.set_progress_handler(None, 0)
+
+        assert result["summary"]["total_transactions_analyzed"] == 1
+        assert result["summary"]["unusually_large_one_off_count"] == 0
+
+    def test_anomaly_duplicate_results_are_bounded_but_counts_are_complete(self, populated_db: Database):
+        """Duplicate result arrays retain their precedence while summary counts remain complete."""
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        for index in range(3):
+            for suffix in ("a", "b"):
+                _insert_tx(
+                    populated_db,
+                    id=f"exact-{index}-{suffix}",
+                    date="2026-08-10",
+                    outcome=1_000.0 + index,
+                    tag=json.dumps(["tag-grocery"]),
+                    payee=f"exact-{index}",
+                )
+        for index in range(16):
+            for suffix, tx_date, tag, account in (
+                ("a", "2026-08-11", "tag-grocery", "acc-rub"),
+                ("b", "2026-08-12", "tag-transport", "acc-usd"),
+            ):
+                _insert_tx(
+                    populated_db,
+                    id=f"merchant-{index}-{suffix}",
+                    date=tx_date,
+                    outcome=2_000.0 + index,
+                    tag=json.dumps([tag]),
+                    payee=f"merchant-{index}",
+                    outcome_account=account,
+                )
+        for index in range(16):
+            for suffix, tx_date, amount in (
+                ("a", "2026-08-20", 3_000.0 + index * 10),
+                ("b", "2026-08-22", 3_090.0 + index * 10),
+            ):
+                _insert_tx(
+                    populated_db,
+                    id=f"near-{index}-{suffix}",
+                    date=tx_date,
+                    outcome=amount,
+                    tag=json.dumps(["tag-restaurant"]),
+                    payee=f"near-{index}",
+                )
+
+        result = detect_anomalies(populated_db, **period)
+
+        summary = result["summary"]
+        assert summary["exact_duplicates_count"] == 3
+        assert summary["same_merchant_amount_close_timestamp_count"] == 16
+        assert summary["near_duplicates_count"] == 16
+        assert summary["duplicates_count"] == 35
+        assert summary["results_truncated"] is True
+        assert len(result["exact_duplicates"]) == 3
+        assert len(result["same_merchant_amount_close_timestamp"]) == 15
+        assert len(result["near_duplicates"]) == 15
+        assert len(result["possible_duplicates"]) == 15
+        assert all(item["transactions"][0].startswith("exact-") for item in result["possible_duplicates"][:3])
+        assert all(item["transactions"][0].startswith("merchant-") for item in result["possible_duplicates"][3:])
+
+    def test_anomaly_pair_classification_uses_precedence_and_day_precision(self, populated_db: Database):
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        transactions = [
+            ("exact-a", "2026-08-10", 900.0, "tag-grocery", "  Shop  ", "acc-rub", None),
+            ("exact-b", "2026-08-10", 900.0, "tag-grocery", "shop", "acc-rub", 0.0),
+            ("merchant-a", "2026-08-12", 700.0, "tag-grocery", "Taxi", "acc-rub", 0.0),
+            ("merchant-b", "2026-08-13", 700.0, "tag-transport", " taxi ", "acc-usd", 0.0),
+            ("near-a", "2026-08-20", 1000.0, "tag-restaurant", "Cafe", "acc-rub", 0.0),
+            ("near-b", "2026-08-22", 1050.0, "tag-restaurant", " cafe ", "acc-usd", 0.0),
+        ]
+        for tx_id, tx_date, outcome, tag, payee, account, income in transactions:
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date=tx_date,
+                outcome=outcome,
+                tag=json.dumps([tag]),
+                payee=payee,
+                outcome_account=account,
+                income=income,
+            )
+
+        result = detect_anomalies(populated_db, **period)
+
+        exact = next(item for item in result["exact_duplicates"] if set(item["transactions"]) == {"exact-a", "exact-b"})
+        merchant = next(
+            item
+            for item in result["same_merchant_amount_close_timestamp"]
+            if set(item["transactions"]) == {"merchant-a", "merchant-b"}
+        )
+        near = next(item for item in result["near_duplicates"] if set(item["transactions"]) == {"near-a", "near-b"})
+
+        assert exact["timestamp_precision"] == merchant["timestamp_precision"] == near["timestamp_precision"] == "day"
+        classified_pairs = {
+            tuple(sorted(item["transactions"]))
+            for signal in ("exact_duplicates", "same_merchant_amount_close_timestamp", "near_duplicates")
+            for item in result[signal]
+        }
+        assert len(classified_pairs) == sum(
+            len(result[signal])
+            for signal in ("exact_duplicates", "same_merchant_amount_close_timestamp", "near_duplicates")
+        )
+        assert {"exact-a", "exact-b"} not in [set(item["transactions"]) for item in result["near_duplicates"]]
+        assert {"exact-a", "exact-b"} not in [set(item["transactions"]) for item in result["same_merchant_amount_close_timestamp"]]
+        assert {"merchant-a", "merchant-b"} not in [set(item["transactions"]) for item in result["near_duplicates"]]
+
+    def test_anomaly_periodic_context_suppresses_only_periodic_outliers(self, populated_db: Database):
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        periodic = [
+            ("monthly-june", "2026-06-01", 1000.0, "tag-grocery"),
+            ("monthly-july", "2026-07-01", 1000.0, "tag-grocery"),
+            ("monthly-august", "2026-08-01", 1000.0, "tag-grocery"),
+            ("quarterly-may", "2026-05-01", 2000.0, "tag-transport"),
+            ("quarterly-august", "2026-08-01", 2000.0, "tag-transport"),
+            ("annual-2025", "2025-08-01", 3333.0, "tag-restaurant"),
+            ("annual-2026", "2026-08-01", 3333.0, "tag-restaurant"),
+        ]
+        for tx_id, tx_date, outcome, tag in periodic:
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date=tx_date,
+                outcome=outcome,
+                tag=json.dumps([tag]),
+                payee=tx_id,
+            )
+        for index in range(4):
+            _insert_tx(
+                populated_db,
+                id=f"ordinary-{index}",
+                date=f"2026-08-{10 + index:02d}",
+                outcome=100.0,
+                tag=json.dumps(["tag-grocery"]),
+                payee=f"ordinary-{index}",
+            )
+        _insert_tx(
+            populated_db,
+            id="one-off-large",
+            date="2026-08-20",
+            outcome=10000.0,
+            tag=json.dumps(["tag-grocery"]),
+            payee="one-off-large",
+        )
+        _insert_tx(
+            populated_db,
+            id="legacy-a",
+            date="2026-08-25",
+            outcome=300.0,
+            tag=json.dumps(["tag-grocery"]),
+            payee="Legacy",
+        )
+        _insert_tx(
+            populated_db,
+            id="legacy-b",
+            date="2026-08-25",
+            outcome=300.0,
+            tag=json.dumps(["tag-grocery"]),
+            payee=" legacy ",
+        )
+
+        result = detect_anomalies(populated_db, z_threshold=1.5, **period)
+
+        recurrence_ids = [set(item["transactions"]) for item in result["periodic_recurrences"]]
+        assert {"monthly-june", "monthly-july", "monthly-august"} in recurrence_ids
+        assert {"quarterly-may", "quarterly-august"} in recurrence_ids
+        assert {"annual-2025", "annual-2026"} in recurrence_ids
+        one_off_ids = {item["transaction_id"] for item in result["unusually_large_one_off"]}
+        assert "monthly-august" not in one_off_ids
+        assert "one-off-large" in one_off_ids
+        assert result["outliers"] == result["unusually_large_one_off"]
+        assert any(set(item["transactions"]) == {"legacy-a", "legacy-b"} for item in result["possible_duplicates"])
+        assert result["summary"]["periodic_recurrences_count"] == len(recurrence_ids)
+        assert result["summary"]["results_truncated"] is False
+
+    def test_anomaly_omits_history_only_recurrences_before_bounding_context(self, populated_db: Database):
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        for index in range(15):
+            for month in ("2025-08-01", "2025-09-01", "2025-10-01"):
+                _insert_tx(
+                    populated_db,
+                    id=f"history-{index}-{month}",
+                    date=month,
+                    outcome=100.0 + index,
+                    tag=json.dumps(["tag-grocery"]),
+                    payee=f"history-{index}",
+                )
+        for tx_id, tx_date in (
+            ("selected-june", "2026-06-01"),
+            ("selected-july", "2026-07-01"),
+            ("selected-august", "2026-08-01"),
+        ):
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date=tx_date,
+                outcome=999.0,
+                tag=json.dumps(["tag-grocery"]),
+                payee="selected",
+            )
+
+        result = detect_anomalies(populated_db, **period)
+
+        recurrence_ids = [set(item["transactions"]) for item in result["periodic_recurrences"]]
+        assert {"selected-june", "selected-july", "selected-august"} in recurrence_ids
+        assert not any(any(tx_id.startswith("history-") for tx_id in ids) for ids in recurrence_ids)
+        assert result["summary"]["periodic_recurrences_count"] == 1
+
+    def test_anomaly_uses_payee_when_merchant_title_is_whitespace(self, populated_db: Database):
+        populated_db.connect().execute(
+            "INSERT INTO merchants (id, title, user, changed) VALUES ('blank-merchant', '   ', 1, 1)"
+        )
+        populated_db.connect().commit()
+        for tx_id, merchant, payee in (
+            ("blank-merchant-a", "blank-merchant", "Straße"),
+            ("blank-merchant-b", None, "STRASSE"),
+        ):
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date="2026-08-10",
+                outcome=500.0,
+                tag=json.dumps(["tag-grocery"]),
+                merchant=merchant,
+                payee=payee,
+            )
+
+        result = detect_anomalies(populated_db, start_date="2026-08-01", end_date="2026-08-31")
+
+        duplicate = next(
+            item for item in result["exact_duplicates"]
+            if set(item["transactions"]) == {"blank-merchant-a", "blank-merchant-b"}
+        )
+        assert duplicate["payee"] == "Straße"

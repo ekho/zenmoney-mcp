@@ -14,6 +14,14 @@ reasons, alternatives, and outcomes. Missing personal inputs produce
 calculated; planning outputs use the categorical `high`, `medium`, or `low`
 data-quality vocabulary with explicit limitations.
 
+Every planning `data_quality.last_sync` value is an RFC3339 UTC timestamp with
+a `Z` suffix, or `null` when unavailable. The cache continues to store its sync
+metadata as Unix epoch, and `last_server_timestamp` remains the separate numeric
+ZenMoney delta cursor. At the MCP protocol boundary planning results, like every
+tool result, are delivered as a native object in `structuredContent` and as the
+identical JSON object in `TextContent` for compatibility; discovery uses the
+generic output schema `{"type":"object"}`.
+
 ## Financial obligations
 
 `get_debt_service` treats every active, non-archived account with a negative
@@ -235,6 +243,26 @@ are divided with `Decimal`; cumulative half-up rounding keeps each operation
 amount non-negative and puts the exact residual into the last part. All split
 items are sent in one Diff batch. A changed source rejects the proposal before
 write, and applying a terminal proposal again does not resend it.
+
+## Transaction anomaly signals
+
+`detect_anomalies` evaluates posted one-sided expenses in the selected period
+and, only to identify recurrence, up to 400 days of prior history before the
+selected end date. Exact duplicates share a date, user-currency amount to the
+cent, normalized merchant/payee, category, and outcome account. The next class
+shares merchant/payee and amount to the cent within one day; near duplicates
+share normalized merchant/payee and category within two days and 5% of amount.
+Pairs use that precedence. Transaction time is unavailable in the cache, so
+duplicate results explicitly report day precision.
+
+Periodic groups use equal category and cent-rounded user-currency amount with
+unique dates: monthly is 25–35 days and at least three events; quarterly is
+80–100 days, semiannual 170–195, and annual 350–380, each with at least two.
+Only recurrence groups touching the selected period are returned. Their IDs are
+excluded from `unusually_large_one_off`, which contains only positive z-scores
+above the requested threshold. The new collections and compatible `outliers`
+and `possible_duplicates` aliases each return at most 15 entries; complete
+counts and any truncation are in `summary`.
 
 ## Confirmed mixed changes and recurring payments
 

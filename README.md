@@ -66,6 +66,35 @@ Tag, Merchant, Reminder, ReminderMarker, Transaction, and Budget, plus currencie
 synchronization status, and a cache-only financial snapshot at
 `zenmoney://financial-snapshot`. Reading a resource never starts synchronization.
 
+### Synchronization and anomaly contracts
+
+Public synchronization timestamps (`requested_at`, `started_at`, `finished_at`,
+`last_sync_time`, and planning `data_quality.last_sync`) are RFC3339 UTC strings
+with a `Z` suffix; an unavailable value is `null`. The cache and control state
+continue to store Unix-epoch integers. `last_server_timestamp` remains ZenMoney's
+numeric delta cursor, not a synchronization timestamp.
+
+`detect_anomalies` returns bounded `exact_duplicates` (same day,
+converted amount to the cent, normalized merchant/payee, category, and outcome
+account), `same_merchant_amount_close_timestamp` (same merchant/payee, exact
+amount, and up to one day apart), `near_duplicates` (same normalized
+merchant/payee and category, up to two days and 5% amount difference),
+`periodic_recurrences`, and `unusually_large_one_off`. The cache has dates rather
+than transaction times, so duplicate signals declare `timestamp_precision:
+"day"`. Recurrence detection reads at most 400 days of history before the
+selected period end, groups equal category and cent-rounded user-currency amounts
+by unique dates, and returns only recurrences touching the selected period:
+monthly 25–35 days (at least 3 events), quarterly 80–100, semiannual 170–195,
+and annual 350–380 (at least 2 each). Periodic transaction IDs are excluded from
+one-off outliers. Every new collection, plus the retained `outliers` and
+`possible_duplicates` aliases, returns at most 15 results; `summary` contains
+full counts and `results_truncated`.
+
+MCP discovery declares the generic output schema `{"type":"object"}` for every
+tool. At the protocol boundary each response contains the native object in
+`structuredContent` and the identical JSON object as `TextContent` for clients
+that still require the text fallback.
+
 ## Confirmed user-entity changes
 
 All writes use two separate calls. Choose the entity-specific prepare tool for
@@ -290,6 +319,15 @@ container still receives no ZenMoney token and cannot write the financial
 snapshot or call ZenMoney directly. See the
 [remote operations runbook](deploy/remote-mcp/README.md) and
 [threat model](docs/remote-mcp-threat-model.md).
+
+`force_sync(force_full=false, wait_until_complete=false)` is asynchronous by
+default. With `wait_until_complete=true`, it waits only for the same request ID,
+polling the validated control state every 0.25 seconds for a fixed 60 seconds.
+A terminal result is `completed` or `failed`; a timeout returns `status:
+"timeout"`, the current `pending` or `running` state, and
+`wait_timed_out: true` without cancelling the worker. Invalid or replaced state
+fails closed with `invalid_sync_state`; a pending or running request remains
+single-flight.
 
 ## Hardening in this fork
 

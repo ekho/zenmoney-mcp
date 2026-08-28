@@ -159,17 +159,28 @@ docker compose --env-file deploy/remote-mcp/.env \
 
 ### Remote synchronization and entity-change control
 
-The remote `force_sync` tool accepts `force_full` (default `false`) and returns
-immediately with `accepted`, a request ID, mode, and request timestamp. It does
-not hold the MCP call open while ZenMoney responds. If a request is already
-pending or running, another call returns `already_running` with that request
-ID instead of creating a queue.
+The remote `force_sync` tool accepts `force_full` and `wait_until_complete`, both
+defaulting to `false`. The default response is immediate: `accepted`, a request
+ID, mode, and an RFC3339 UTC request timestamp with a `Z` suffix. It does not
+hold the MCP call open while ZenMoney responds. If a request is already pending
+or running, another call returns `already_running` with that request ID instead
+of creating a queue.
+
+With `wait_until_complete=true`, the same MCP request polls its own validated
+control-state request ID every 0.25 seconds for a fixed maximum of 60 seconds.
+It returns the terminal `completed` or `failed` state when available. Otherwise
+it returns `status: "timeout"`, the current `pending` or `running` state, and
+`wait_timed_out: true`; this timeout does not cancel the worker sync. A malformed
+or replaced control state fails closed with the fixed `invalid_sync_state` code
+and exposes no control-file content.
 
 Use `get_sync_status` to observe `pending`, `running`, `completed`, or `failed`,
-plus the last successful cache sync time. A failed forced request reports only
-the fixed `sync_failed` code and leaves the previous snapshot readable. A full
-request may take longer than an incremental request; completion is determined
-only from `get_sync_status`, not from the initial `force_sync` response.
+plus the last successful cache sync time. These public sync timestamps are
+RFC3339 UTC strings with a `Z` suffix; internal control state remains Unix epoch.
+`last_server_timestamp` is instead the numeric ZenMoney cursor. A failed forced
+request reports only the fixed `sync_failed` code and leaves the previous snapshot
+readable. A full request may take longer than an incremental request; completion
+is determined only from `get_sync_status` or the explicit bounded wait.
 
 The control volume contains no credentials. It does contain entity-change
 previews and results, so protect it as financial data and do not include it in
