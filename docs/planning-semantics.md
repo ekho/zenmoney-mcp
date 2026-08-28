@@ -14,6 +14,76 @@ reasons, alternatives, and outcomes. Missing personal inputs produce
 calculated; planning outputs use the categorical `high`, `medium`, or `low`
 data-quality vocabulary with explicit limitations.
 
+## Financial obligations
+
+`get_debt_service` treats every active, non-archived account with a negative
+balance as a current financial obligation. This rule is independent of
+ZenMoney's `inBalance` flag: that flag still controls UI/net-worth inclusion,
+but it cannot hide money the user owes.
+
+Default classification is deterministic:
+
+| ZenMoney account type | Classification | Confidence |
+|---|---|---|
+| `loan` | `loan` | `high` |
+| `ccard` | `credit_card` | `high` |
+| `debt` | `personal_debt` | `high` |
+| any other type, including `checking` | `other` | `low` |
+
+Names, payees, merchants, categories, and comments are never used to guess a
+credit product. A caller may explicitly override `classification`,
+`minimum_payment`, or `apr_pct` for a current obligation. Unknown payment
+amounts, dates, and APR remain `null`; zero is returned only when zero was
+actually supplied. The nearest future planned transfer into an obligation may
+provide a medium-confidence payment estimate with source `reminder`. It is not
+presented as a contractual bank minimum.
+
+The existing amortization tools intentionally continue to model only negative
+`loan` and `debt` accounts. Credit-card, installment, and arbitrary-liability
+payoff schedules require their richer product-specific contract and are not
+silently forced into the older fixed-payment model.
+
+## Cash-flow components
+
+`get_cash_flow` classifies each posted, non-deleted transaction by its account
+relationship instead of discarding every transfer:
+
+| Transaction shape | Component(s) | Household cash effect |
+|---|---|---|
+| income to an eligible non-obligation account | `income` | positive |
+| expense from an eligible non-obligation account | `operating_expense` | negative |
+| expense funded by an obligation | `operating_expense`, `financing_inflow` | zero until repayment |
+| transfer from an eligible asset to an obligation | `debt_service_outflow` | negative |
+| transfer from an obligation to an eligible asset | `financing_inflow` | positive |
+| transfer between ordinary eligible assets | `internal_transfer` | zero |
+| transfer involving savings or a deposit | `asset_transfer` | zero |
+| transfer between obligations | `internal_transfer` | zero |
+| incomplete or contradictory relationship | `unknown` | excluded with a warning |
+
+An eligible non-obligation account preserves the existing household boundary:
+it is active and is not explicitly excluded with `inBalance=false`.
+Obligations remain in scope regardless of `inBalance`. Debt service uses the
+converted source-side amount; financing received into an asset uses the
+converted destination-side amount. This preserves the actual cash amount in
+cross-currency transfers.
+
+```text
+operating net cash flow = income - operating expenses
+net cash flow after debt service = operating net cash flow
+                                   + financing inflow
+                                   - debt-service cash outflow
+savings rate before debt service = operating net cash flow / income
+savings rate after debt service = net cash flow after debt service / income
+```
+
+Both rates are `null` when income is zero. Spending baselines, category
+comparisons, and the existing integrated planner continue to use operating
+expenses, so debt repayment is not counted a second time as consumption.
+Unlinked single-sided inflows remain income because the cache contains no
+account relationship proving that they are borrowed funds. Structurally
+uncertain rows are excluded from totals, counted in the `unknown` component,
+and exposed through at most 50 compact `uncertain_transactions` entries.
+
 ## Default priority policy
 
 `build_financial_plan` exposes this policy in every response:
@@ -73,8 +143,9 @@ has no estimated completion date.
 
 ## Debt amortization
 
-APR and minimum payment are required for every active debt account. They are
-never inferred from transactions. For each calendar month and account:
+APR and minimum payment are required for every active `loan` or `debt` account
+used by the amortization tools. They are never inferred from transactions. For
+each calendar month and account:
 
 ```text
 monthly rate = APR / 100 / 12
