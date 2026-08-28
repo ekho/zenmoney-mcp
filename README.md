@@ -100,8 +100,11 @@ Planning analytics are deliberately conservative:
 
 - emergency-fund coverage requires explicit essential category IDs or a monthly
   essential-spending override;
-- debt service reports observed balances and payments but does not infer APR,
-  minimum payments, or amortization schedules;
+- `get_cash_flow` separates operating expenses, financing inflows, and cash
+  debt service;
+- `get_debt_service` includes every active negative-balance account regardless
+  of `inBalance`;
+- unknown APR and payment terms remain `null` unless supplied explicitly;
 - recurring-payment detection is a historical heuristic and is labeled as such;
 - cash-flow forecasts are transparent scenarios, not prediction guarantees.
 
@@ -187,6 +190,7 @@ Key semantics:
 - accessible savings and term deposits are not treated as equivalent liquidity;
 - budget periods respect the user's configured month-start day;
 - zero-budget and unbudgeted spending are surfaced explicitly;
+- active negative balances remain obligations regardless of `inBalance`;
 - debt-account balances are authoritative and attribution gaps remain visible;
 - account flow includes signed transfers in native and user currency;
 - missing or zero exchange rates fail explicitly instead of becoming a 1:1 rate;

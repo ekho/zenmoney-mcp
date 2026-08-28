@@ -136,7 +136,13 @@ def run_financial_scenario(
     snapshot = get_financial_snapshot(db, as_of=today)
     debt_service = get_debt_service(db, as_of=today)
     cash = money(snapshot["own_liquid_funds"] + snapshot["accessible_savings"])
-    debt = money(debt_service["current_debt_balance"])
+    debt = money(
+        sum(
+            obligation["balance"]
+            for obligation in debt_service["obligations"]
+            if obligation["source_account_type"] in {"loan", "debt"}
+        )
+    )
     net_worth = money(snapshot["net_worth"])
     starting = {
         "liquid_funds": number(cash),

@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from zenmoney_mcp import planning
 from zenmoney_mcp.hardened_database import CurrencyRateError, HardenedDatabase
 from zenmoney_mcp.money import FinancialDataError, convert, user_currency
 from zenmoney_mcp.periods import completed_periods
@@ -156,10 +157,215 @@ def test_convert_zero_does_not_require_stale_instrument(planning_db):
     assert convert(planning_db, 0, 999, user_currency(planning_db)) == 0
 
 
+def test_financial_obligations_include_every_active_negative_account(planning_db):
+    planning_db.connect().executemany(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES (?,?,?,?,?,?,0,?,1,1)",
+        [
+            ("installment", "Installment", "checking", 1, -300, 0, 0),
+            ("personal", "Personal", "debt", 1, -200, 1, 0),
+            ("odd", "Odd", "cash", 1, -100, 1, 0),
+            ("positive", "Positive", "loan", 1, 100, 1, 0),
+            ("zero", "Zero", "debt", 1, 0, 1, 0),
+            ("archived", "Archived", "loan", 1, -400, 1, 1),
+        ],
+    )
+
+    obligations = planning._financial_obligations(
+        planning_db, user_currency(planning_db), as_of=date(2026, 8, 23)
+    )
+
+    assert [item["account_id"] for item in obligations] == [
+        "credit",
+        "installment",
+        "loan",
+        "odd",
+        "personal",
+    ]
+    by_id = {item["account_id"]: item for item in obligations}
+    assert by_id["loan"]["classification"] == "loan"
+    assert by_id["credit"]["classification"] == "credit_card"
+    assert by_id["personal"]["classification"] == "personal_debt"
+    assert by_id["installment"]["classification"] == "other"
+    assert by_id["installment"]["classification_confidence"] == "low"
+    assert by_id["installment"]["in_balance"] is False
+    assert by_id["installment"]["balance"] == 300
+    assert by_id["installment"]["minimum_payment"] == {
+        "amount": None,
+        "due_date": None,
+        "source": "unknown",
+        "confidence": "low",
+    }
+    assert by_id["installment"]["apr_pct"] == {
+        "value": None,
+        "source": "unknown",
+    }
+    assert by_id["odd"]["classification"] == "other"
+
+
+def test_financial_obligation_overrides_are_explicit(planning_db):
+    obligations = planning._financial_obligations(
+        planning_db,
+        user_currency(planning_db),
+        {
+            "credit": {
+                "classification": "installment",
+                "minimum_payment": {"amount": 250, "due_date": "2026-09-18"},
+                "apr_pct": 19.9,
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    credit = next(item for item in obligations if item["account_id"] == "credit")
+    assert credit["classification"] == "installment"
+    assert credit["classification_confidence"] == "high"
+    assert credit["minimum_payment"] == {
+        "amount": 250,
+        "due_date": "2026-09-18",
+        "source": "user_override",
+        "confidence": "high",
+    }
+    assert credit["apr_pct"] == {"value": 19.9, "source": "user_override"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error_path"),
+    [
+        ({"missing": {"classification": "loan"}}, "obligation_overrides.missing"),
+        (
+            {"cash-rub": {"classification": "loan"}},
+            "obligation_overrides.cash-rub",
+        ),
+        ({"credit": {"guess": "loan"}}, "obligation_overrides.credit.guess"),
+        (
+            {"credit": {"classification": "mortgage"}},
+            "obligation_overrides.credit.classification",
+        ),
+        (
+            {"credit": {"classification": []}},
+            "obligation_overrides.credit.classification",
+        ),
+        (
+            {"credit": {"minimum_payment": {"amount": -1}}},
+            "obligation_overrides.credit.minimum_payment.amount",
+        ),
+        (
+            {
+                "credit": {
+                    "minimum_payment": {"amount": 1, "due_date": "2026-02-30"}
+                }
+            },
+            "obligation_overrides.credit.minimum_payment.due_date",
+        ),
+        (
+            {str(index): {"classification": "loan"} for index in range(51)},
+            "obligation_overrides",
+        ),
+    ],
+)
+def test_financial_obligation_overrides_are_strict(
+    planning_db, overrides, error_path
+):
+    with pytest.raises(InputValidationError, match=error_path):
+        planning._financial_obligations(
+            planning_db,
+            user_currency(planning_db),
+            overrides,
+            as_of=date(2026, 8, 23),
+        )
+
+
+def test_financial_obligation_uses_nearest_reminder_payment(planning_db):
+    add_marker(
+        planning_db,
+        "excluded-source",
+        "2026-09-01",
+        income=100,
+        outcome=100,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="excluded",
+    )
+    add_marker(
+        planning_db,
+        "nearest",
+        "2026-09-18",
+        income=500,
+        outcome=500,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+    add_marker(
+        planning_db,
+        "later",
+        "2026-10-18",
+        income=700,
+        outcome=700,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+
+    obligations = planning._financial_obligations(
+        planning_db, user_currency(planning_db), as_of=date(2026, 8, 23)
+    )
+
+    loan = next(item for item in obligations if item["account_id"] == "loan")
+    assert loan["minimum_payment"] == {
+        "amount": 500,
+        "due_date": "2026-09-18",
+        "source": "reminder",
+        "confidence": "medium",
+    }
+
+
+def test_financial_obligation_payment_override_skips_reminder_conversion(planning_db):
+    add_marker(
+        planning_db,
+        "usd-reminder",
+        "2026-09-18",
+        income=1,
+        outcome=1,
+        income_instrument=2,
+        outcome_instrument=2,
+        income_account="loan",
+        outcome_account="cash-usd",
+    )
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    obligations = planning._financial_obligations(
+        planning_db,
+        user_currency(planning_db),
+        {"loan": {"minimum_payment": {"amount": 250}}},
+        as_of=date(2026, 8, 23),
+    )
+
+    loan = next(item for item in obligations if item["account_id"] == "loan")
+    assert loan["minimum_payment"] == {
+        "amount": 250,
+        "due_date": None,
+        "source": "user_override",
+        "confidence": "high",
+    }
+
+
 def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):
     add_transaction(planning_db, "income", "2026-08-01", income=1_000, tag="salary")
     add_transaction(planning_db, "expense", "2026-08-02", outcome=200, tag="food")
     add_transaction(planning_db, "transfer", "2026-08-03", income=300, outcome=300)
+    add_transaction(
+        planning_db,
+        "asset-transfer",
+        "2026-08-03",
+        income=400,
+        outcome=400,
+        income_account="savings",
+    )
     add_transaction(planning_db, "hold", "2026-08-04", outcome=50, hold=1)
     add_transaction(
         planning_db, "external", "2026-08-05", outcome=70, outcome_account="excluded"
@@ -173,10 +379,30 @@ def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):
     )
 
     assert result["income"] == 1_000
-    assert result["outcome"] == 200
-    assert result["net_cash_flow"] == 800
-    assert result["savings_rate_pct"] == 80
-    assert result["transaction_counts"] == {"income": 1, "outcome": 1}
+    assert result["operating_expenses"] == 200
+    assert result["operating_net_cash_flow"] == 800
+    assert result["financing_inflow"] == 0
+    assert result["debt_service_cash_outflow"] == 0
+    assert result["net_cash_flow_after_debt_service"] == 800
+    assert result["savings_rate_before_debt_service_pct"] == 80
+    assert result["savings_rate_after_debt_service_pct"] == 80
+    assert result["flow_components"]["income"] == {"amount": 1_000, "count": 1}
+    assert result["flow_components"]["operating_expense"] == {
+        "amount": 200,
+        "count": 1,
+    }
+    assert result["flow_components"]["internal_transfer"] == {
+        "amount": 300,
+        "count": 1,
+    }
+    assert result["flow_components"]["asset_transfer"] == {
+        "amount": 400,
+        "count": 1,
+    }
+    assert result["uncertain_transactions"] == []
+    assert "outcome" not in result
+    assert "net_cash_flow" not in result
+    assert "savings_rate_pct" not in result
 
 
 def test_cash_flow_converts_each_side_to_user_currency(planning_db):
@@ -202,7 +428,29 @@ def test_cash_flow_converts_each_side_to_user_currency(planning_db):
     )
 
     assert result["income"] == 900
-    assert result["outcome"] == 450
+    assert result["operating_expenses"] == 450
+
+
+def test_cash_flow_does_not_read_unrelated_reminder_rates(planning_db):
+    add_marker(
+        planning_db,
+        "future-usd-payment",
+        "9999-12-31",
+        income=1,
+        outcome=1,
+        income_instrument=2,
+        outcome_instrument=2,
+        income_account="loan",
+        outcome_account="cash-usd",
+    )
+    add_transaction(planning_db, "income", "2026-08-01", income=100)
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-08-01", end_date="2026-08-31"
+    )
+
+    assert result["income"] == 100
 
 
 def test_cash_flow_has_null_savings_rate_without_income(planning_db):
@@ -212,7 +460,8 @@ def test_cash_flow_has_null_savings_rate_without_income(planning_db):
         planning_db, start_date="2026-08-01", end_date="2026-08-31"
     )
 
-    assert result["savings_rate_pct"] is None
+    assert result["savings_rate_before_debt_service_pct"] is None
+    assert result["savings_rate_after_debt_service_pct"] is None
 
 
 def test_last_complete_month_respects_user_budget_month(planning_db):
@@ -230,7 +479,123 @@ def test_last_complete_month_respects_user_budget_month(planning_db):
         "end": "2026-08-07",
         "complete": True,
     }
-    assert result["outcome"] == 200
+    assert result["operating_expenses"] == 200
+
+
+def test_cash_flow_separates_debt_service_from_operating_expense(planning_db):
+    add_transaction(
+        planning_db,
+        "payment",
+        "2026-07-10",
+        income=100_000,
+        outcome=100_000,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["operating_expenses"] == 0
+    assert result["debt_service_cash_outflow"] == 100_000
+    assert result["net_cash_flow_after_debt_service"] == -100_000
+    assert result["flow_components"]["debt_service_outflow"] == {
+        "amount": 100_000,
+        "count": 1,
+    }
+
+
+def test_cash_flow_does_not_count_borrowing_as_income(planning_db):
+    add_transaction(
+        planning_db,
+        "borrowing",
+        "2026-07-10",
+        income=300_000,
+        outcome=300_000,
+        income_account="cash-rub",
+        outcome_account="loan",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["income"] == 0
+    assert result["financing_inflow"] == 300_000
+    assert result["net_cash_flow_after_debt_service"] == 300_000
+
+
+def test_cash_flow_uses_financing_destination_side_without_source_rate(planning_db):
+    planning_db.connect().execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('loan-usd','USD Loan','loan',2,-10,1,0,0,1,1)"
+    )
+    add_transaction(
+        planning_db,
+        "borrowing",
+        "2026-07-10",
+        income=100,
+        income_instrument=1,
+        income_account="cash-rub",
+        outcome=1,
+        outcome_instrument=2,
+        outcome_account="loan-usd",
+    )
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["financing_inflow"] == 100
+
+
+def test_liability_funded_spending_has_equal_expense_and_financing(planning_db):
+    add_transaction(
+        planning_db,
+        "card-purchase",
+        "2026-07-10",
+        outcome=30_000,
+        outcome_account="credit",
+        tag="food",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["operating_expenses"] == 30_000
+    assert result["financing_inflow"] == 30_000
+    assert result["operating_net_cash_flow"] == -30_000
+    assert result["net_cash_flow_after_debt_service"] == 0
+
+
+def test_cash_flow_bounds_structurally_unknown_transactions(planning_db):
+    for index in range(51):
+        add_transaction(
+            planning_db,
+            f"unknown-{index}",
+            "2026-07-10",
+            income=10,
+            income_account="loan",
+        )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["flow_components"]["unknown"] == {"amount": 510, "count": 51}
+    assert len(result["uncertain_transactions"]) == 50
+    assert result["uncertain_transactions"][0] == {
+        "transaction_id": "unknown-0",
+        "classification": "unknown",
+        "classification_reason": "account_relationship_is_not_classifiable",
+        "confidence": "low",
+    }
+    assert "unknown_transaction_flows_excluded" in result["data_quality"][
+        "warnings"
+    ]
 
 
 @pytest.mark.parametrize("months", [3, 6, 12])
@@ -473,13 +838,22 @@ def test_debt_service_counts_transfer_into_debt_account(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 6_000
+    assert result["total_liabilities"] == 7_000
+    assert {item["account_id"] for item in result["obligations"]} == {
+        "credit",
+        "loan",
+    }
     assert result["last_complete_month"] == {
-        "debt_payments": 500,
-        "income": 1_000,
+        "operating_income": 1_000,
+        "debt_service_cash_outflow": 500,
         "debt_service_ratio_pct": 50,
     }
-    assert result["trailing_3_month_average_payment"] == 166.67
+    assert result["trailing_3_complete_months"] == {
+        "average_debt_service_cash_outflow": 166.67,
+    }
+    assert "current_debt_balance" not in result
+    assert "accounts" not in result
+    assert "trailing_3_month_average_payment" not in result
 
 
 def test_debt_service_handles_multiple_currencies_and_zero_income(planning_db):
@@ -500,19 +874,20 @@ def test_debt_service_handles_multiple_currencies_and_zero_income(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 6_900
-    assert result["last_complete_month"]["debt_payments"] == 90
+    assert result["total_liabilities"] == 7_900
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 90
     assert result["last_complete_month"]["debt_service_ratio_pct"] is None
-    assert len(result["accounts"]) == 2
+    assert len(result["obligations"]) == 3
 
 
 def test_debt_service_with_no_debt_is_zero(planning_db):
-    planning_db.connect().execute("UPDATE accounts SET balance=0 WHERE type IN ('loan','debt')")
+    planning_db.connect().execute("UPDATE accounts SET balance=0 WHERE balance<0")
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["current_debt_balance"] == 0
-    assert result["last_complete_month"]["debt_payments"] == 0
+    assert result["total_liabilities"] == 0
+    assert result["obligations"] == []
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 0
 
 
 def test_debt_service_excludes_transfer_into_positive_debt_account(planning_db):
@@ -532,7 +907,7 @@ def test_debt_service_excludes_transfer_into_positive_debt_account(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["last_complete_month"]["debt_payments"] == 0
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 0
 
 
 def test_debt_service_uses_actual_source_cash_outflow(planning_db):
@@ -554,7 +929,7 @@ def test_debt_service_uses_actual_source_cash_outflow(planning_db):
 
     result = get_debt_service(planning_db, as_of=date(2026, 8, 23))
 
-    assert result["last_complete_month"]["debt_payments"] == 100
+    assert result["last_complete_month"]["debt_service_cash_outflow"] == 100
 
 
 def test_forecast_sums_planned_income_and_outcome(planning_db):
@@ -722,6 +1097,6 @@ def test_cash_flow_scans_50_000_transactions_without_truncation(planning_db):
         planning_db, start_date="2026-07-01", end_date="2026-07-31"
     )
 
-    assert result["outcome"] == 50_000
-    assert result["transaction_counts"]["outcome"] == 50_000
+    assert result["operating_expenses"] == 50_000
+    assert result["flow_components"]["operating_expense"]["count"] == 50_000
     assert result["data_quality"]["complete_months_available"] == 1

@@ -80,7 +80,15 @@ def plan_debt_payoff(
         raise InputValidationError("debt_accounts must be an object with at most 50 accounts")
 
     facts = get_debt_service(db, as_of=as_of)
-    active = [account for account in facts["accounts"] if account["debt_balance"] > 0]
+    active = [
+        {
+            "id": obligation["account_id"],
+            "title": obligation["title"],
+            "debt_balance": obligation["balance"],
+        }
+        for obligation in facts["obligations"]
+        if obligation["source_account_type"] in {"loan", "debt"}
+    ]
     if len(active) > 50:
         raise InputValidationError("at most 50 active debt accounts are supported")
     if not active:
