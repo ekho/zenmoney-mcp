@@ -145,6 +145,11 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert tools_by_name["apply_changes"].annotations.read_only_hint is False
     assert tools_by_name["apply_changes"].annotations.destructive_hint is True
     assert tools_by_name["apply_changes"].annotations.open_world_hint is True
+    assert all(tool.output_schema == {"type": "object"} for tool in tools)
+    assert all(
+        tool.model_dump(by_alias=True)["outputSchema"] == {"type": "object"}
+        for tool in tools
+    )
     assert all(
         tool.annotations.open_world_hint is False
         for tool in tools
@@ -157,6 +162,60 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert json.loads(result.content[0].text)["net_worth"] == 1000
     assert json.loads(accounts.content[0].text)["items"][0]["id"] == "cash"
     assert json.loads(account.content[0].text)["id"] == "cash"
+
+
+@pytest.mark.asyncio
+async def test_remote_mcp_returns_structured_payload_matching_json_fallback(tmp_path):
+    path = tmp_path / "snapshot.db"
+    control_path = tmp_path / "sync-state.json"
+    mutation_path = tmp_path / "proposals.db"
+    _write_snapshot(path, 100)
+    app = create_app(path, control_path, mutation_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        analytics = await client.call_tool("get_net_worth", {})
+        control = await client.call_tool("force_sync", {})
+        proposal = await client.call_tool(
+            "prepare_transaction_changes",
+            {"operations": [{"operation": "update", "id": "tx",
+                             "set": {"comment": "fixed"}}]},
+        )
+
+    for result in (analytics, control, proposal):
+        assert isinstance(result.structured_content, dict)
+        assert result.structured_content == json.loads(result.content[0].text)
+
+
+@pytest.mark.asyncio
+async def test_remote_structured_adapter_failure_is_sanitized(monkeypatch, tmp_path, caplog):
+    sentinel = "malformed-fallback-sentinel"
+
+    async def malformed(*args, **kwargs):
+        return [server.TextContent(type="text", text=json.dumps([sentinel]))]
+
+    monkeypatch.setattr(server, "call_tool", malformed)
+    caplog.set_level(logging.WARNING)
+    app = create_app(tmp_path / "missing.db")
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        with pytest.raises(MCPError) as error:
+            await client.call_tool("get_net_worth", {})
+
+    assert error.value.code == INTERNAL_ERROR
+    assert error.value.message == "Remote tool failed"
+    assert sentinel not in f"{error.value}\n{caplog.text}"
+    assert [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("{")
+    ] == [{
+        "event": "remote_tool_call",
+        "tool": "get_net_worth",
+        "status": "failed",
+        "exception_class": "ValueError",
+    }]
 
 
 @pytest.mark.asyncio

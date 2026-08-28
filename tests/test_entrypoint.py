@@ -144,6 +144,18 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
 
 
 @pytest.mark.asyncio
+async def test_tool_discovery_declares_object_output_schema_for_local_and_remote():
+    for remote in (False, True):
+        descriptors = await server.list_tools(remote=remote)
+        assert descriptors
+        assert all(tool.output_schema == {"type": "object"} for tool in descriptors)
+        assert all(
+            tool.model_dump(by_alias=True)["outputSchema"] == {"type": "object"}
+            for tool in descriptors
+        )
+
+
+@pytest.mark.asyncio
 async def test_spending_baseline_schema_is_strict_and_dispatches_partial_flag(
     monkeypatch,
 ):

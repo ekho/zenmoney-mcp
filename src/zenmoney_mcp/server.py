@@ -260,6 +260,7 @@ def harden_tool_schemas(tools: list[Tool]) -> list[Tool]:
     non_negative = {"amount", "target_amount", "min_amount", "max_amount"}
 
     for tool in tools:
+        tool.output_schema = {"type": "object"}
         properties = tool.input_schema.get("properties")
         if not isinstance(properties, dict):
             continue
@@ -1712,6 +1713,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
     return [
         tool.model_copy(
             update={
+                "output_schema": {"type": "object"},
                 "annotations": ToolAnnotations(
                     readOnlyHint=tool.name
                     not in {
@@ -2549,6 +2551,11 @@ def create_server(
                 control_path=control_path,
                 mutation_path=mutation_path,
             )
+            if len(content) != 1 or type(content[0]) is not TextContent:
+                raise ValueError("Tool result must be one JSON TextContent")
+            structured_content = json.loads(content[0].text)
+            if not isinstance(structured_content, dict):
+                raise ValueError("Tool result must be a JSON object")
         except MCPError:
             raise
         except Exception as exc:
@@ -2565,7 +2572,10 @@ def create_server(
                 )
             )
             raise MCPError(INTERNAL_ERROR, "Remote tool failed") from None
-        return CallToolResult(content=content)
+        return CallToolResult(
+            content=content,
+            structuredContent=structured_content,
+        )
 
     async def _on_list_resources(context, params):
         return ListResourcesResult(resources=await list_resources())
