@@ -1,72 +1,72 @@
-# Financial Obligations and Cash Flow Phase 1 Design
+# Финансовые обязательства и денежный поток: дизайн Phase 1
 
-## Goal
+## Цель
 
-Make the planning surface distinguish consumption, financing, and debt-service
-cash movements. The result must identify every active negative-balance account
-as a financial obligation, count transfers that repay those obligations, and
-never report structurally linked borrowing as household income.
+Научить planning API различать потребление, финансирование и денежные платежи
+по долгам. Система должна находить все активные счета с отрицательным балансом
+как финансовые обязательства, учитывать переводы в счёт их погашения и не
+считать доходом получение заёмных денег, если операция структурно связана с
+обязательством.
 
-This is the first, P0 phase of the broader financial-planning change request.
-It intentionally delivers the final response contract rather than temporary
-compatibility aliases.
+Это первая, P0-фаза большого запроса на улучшение финансового планирования.
+Она сразу вводит конечный контракт ответа, без временных compatibility aliases.
 
-## Confirmed decisions
+## Согласованные решения
 
-- Cash flow is cash-basis. Liability-funded spending contributes an operating
-  expense and an equal financing inflow, so the purchase does not reduce cash a
-  second time before repayment.
-- Every active negative `checking` account is an obligation classified as
-  `other` with low confidence unless the caller explicitly overrides its
-  classification.
-- Account-title, payee, merchant, and comment heuristics are not used to infer
-  a liability or installment.
-- Existing `get_cash_flow` and `get_debt_service` result fields are replaced by
-  the final contract. Deprecated aliases are not returned.
-- `inBalance` remains source/UI metadata and never removes an active liability
-  from obligation totals.
+- Денежный поток считаем по кассовому принципу. Покупка за счёт обязательства
+  создаёт operating expense и равный ему financing inflow. Поэтому покупка не
+  уменьшает деньги второй раз до момента погашения долга.
+- Любой активный `checking` с отрицательным балансом считаем обязательством
+  класса `other` с низкой уверенностью. Другой класс можно задать явным
+  override для конкретного счёта.
+- Не определяем кредит или рассрочку по названию счёта, payee, merchant либо
+  комментарию.
+- Старые поля ответов `get_cash_flow` и `get_debt_service` заменяем конечным
+  контрактом. Устаревшие aliases не возвращаем.
+- `inBalance` остаётся исходной UI-семантикой ZenMoney и не исключает активное
+  обязательство из итоговой суммы.
 
-## Scope
+## Границы Phase 1
 
-Phase 1 changes only the shared read-only planning logic, MCP schemas and
-dispatch, and their tests. It does not persist financial overrides, change
-ZenMoney entities, alter synchronization, extend the payoff planner, or add the
-later `get_financial_position` tool.
+Меняем только общую read-only логику планирования, MCP-схемы, dispatch и тесты.
+Не сохраняем финансовые overrides, не меняем сущности ZenMoney и синхронизацию,
+не расширяем payoff planner и пока не добавляем `get_financial_position`.
 
-The implementation remains in `planning.py` and `server.py`. A new domain
-module, database table, migration, or dependency would add ownership without
-improving this phase's result.
+Реализация остаётся в `planning.py` и `server.py`. Новый domain-модуль, таблица
+БД, миграция или зависимость в этой фазе не дают пользы, но добавляют код и
+владение.
 
-## Financial obligation model
+## Модель финансового обязательства
 
-`planning.py` gains one shared obligation collector. An account is a current
-financial obligation when:
+В `planning.py` появится один общий сборщик обязательств. Счёт считается
+текущим финансовым обязательством, если:
 
-- it is not archived;
-- its converted balance is negative; and
-- it exists in the synchronized household account set.
+- он не архивный;
+- его баланс после конвертации отрицательный;
+- он входит в синхронизированный набор счетов пользователя.
 
-All such accounts are included regardless of `inBalance`. Classification is
-deterministic:
+Все такие счета учитываются независимо от `inBalance`. Классификация
+детерминирована:
 
-| Source account type | Default classification | Confidence |
+| Исходный тип счёта | Класс по умолчанию | Уверенность |
 | --- | --- | --- |
 | `loan` | `loan` | high |
 | `ccard` | `credit_card` | high |
 | `debt` | `personal_debt` | high |
 | `checking` | `other` | low |
-| any other type | `other` | low |
+| любой другой тип | `other` | low |
 
-The reported `balance` is the positive amount owed in the user's currency.
-`source_account_type` and `in_balance` preserve the original account metadata.
+Поле `balance` содержит положительную сумму долга в основной валюте
+пользователя. `source_account_type` и `in_balance` сохраняют исходные свойства
+счёта.
 
-Callers may pass an `obligation_overrides` object keyed by account ID. The only
-supported override fields in this phase are `classification`,
-`minimum_payment`, and `apr_pct`. An unknown account ID, an account that is not
-a current obligation, an invalid classification, a negative amount, or an
-invalid date fails validation rather than being silently ignored.
+Клиент может передать объект `obligation_overrides`, где ключ - ID счёта.
+В Phase 1 поддерживаются только поля `classification`, `minimum_payment` и
+`apr_pct`. Неизвестный ID, счёт без текущего обязательства, недопустимый класс,
+отрицательная сумма или неверная дата приводят к ошибке валидации, а не молча
+игнорируются.
 
-Each obligation has this final shape:
+Конечная структура обязательства:
 
 ```json
 {
@@ -91,52 +91,52 @@ Each obligation has this final shape:
 }
 ```
 
-Unknown amounts and dates are `null`, never zero. A caller override is reported
-with source `user_override` and high confidence. Without an override, the
-nearest future planned reminder-marker transfer from a non-obligation account
-into the obligation may supply the amount and due date with source `reminder`
-and medium confidence. This is explicitly a scheduled payment estimate, not a
-claim about a contractual bank minimum. Undocumented raw account fields are not
-interpreted as APR or payment terms in this phase.
+Неизвестные суммы и даты возвращаются как `null`, а не как выдуманный ноль.
+Явный override получает источник `user_override` и высокую уверенность. Без
+override ближайший будущий запланированный ReminderMarker-перевод с обычного
+счёта в обязательство может дать сумму и дату с источником `reminder` и средней
+уверенностью. Это оценка запланированного платежа, а не утверждение о
+договорном минимальном платеже банка. Недокументированные поля исходного счёта
+не трактуем как APR или параметры платежа.
 
-## Flow classification
+## Классификация денежных потоков
 
-The existing transaction representation defines a transfer as a row with both
-`income > 0` and `outcome > 0`; `outcome_account` is the source and
-`income_account` is the destination. One range query loads settled,
-non-deleted transactions and both account sides. Currency conversion continues
-to fail explicitly when a required synchronized rate is missing.
+В текущем формате транзакций перевод - это строка, где одновременно
+`income > 0` и `outcome > 0`: `outcome_account` является источником,
+`income_account` - получателем. Один запрос за период загружает проведённые,
+неудалённые операции и оба связанных счёта. Если для конвертации нет корректного
+курса, расчёт по-прежнему завершается явной ошибкой.
 
-The classifier produces economic components rather than forcing every
-transaction into one mutually exclusive bucket. This is required for a credit
-purchase, which is both consumption and financing.
+Классификатор возвращает экономические компоненты, а не пытается поместить
+каждую транзакцию ровно в одну корзину. Это нужно для покупки по кредитной
+карте: она одновременно является потреблением и финансированием.
 
-| Transaction shape | Components | Cash effect |
+| Форма транзакции | Компоненты | Влияние на деньги |
 | --- | --- | --- |
-| single-sided income into a non-obligation account | `income` | positive |
-| single-sided outcome from a non-obligation account | `operating_expense` | negative |
-| single-sided outcome from an obligation | `operating_expense` plus `financing_inflow` | zero |
-| transfer from non-obligation to obligation | `debt_service_outflow` | negative |
-| transfer from obligation to non-obligation | `financing_inflow` | positive |
-| transfer between ordinary asset accounts | `internal_transfer` | zero |
-| transfer involving a savings/deposit asset but no obligation | `asset_transfer` | zero |
-| transfer between obligations | `internal_transfer` | zero |
-| structurally incomplete or contradictory row | `unknown` | excluded and warned |
+| односторонний приход на счёт без обязательства | `income` | положительное |
+| односторонний расход со счёта без обязательства | `operating_expense` | отрицательное |
+| односторонний расход с обязательства | `operating_expense` и `financing_inflow` | нулевое |
+| перевод со счёта без обязательства в обязательство | `debt_service_outflow` | отрицательное |
+| перевод из обязательства на счёт без обязательства | `financing_inflow` | положительное |
+| перевод между обычными активами | `internal_transfer` | нулевое |
+| перевод с участием накопительного или депозитного актива, но без обязательства | `asset_transfer` | нулевое |
+| перевод между обязательствами | `internal_transfer` | нулевое |
+| структурно неполная или противоречивая строка | `unknown` | исключается с предупреждением |
 
-For debt service, the source-side amount is authoritative because it is the
-cash that left the household. For financing into an asset account, the
-destination-side amount is authoritative because it is the cash received.
-This also handles cross-currency transfers without assuming both sides have the
-same numeric amount.
+Для обслуживания долга берём сумму со стороны источника: именно столько денег
+ушло у пользователя. Для финансирования, пришедшего на обычный счёт, берём
+сумму со стороны получателя: именно столько денег поступило. Это корректно
+работает и с переводами между разными валютами, где числовые суммы сторон не
+обязаны совпадать.
 
-A single-sided inflow with no linked liability remains ordinary income because
-the cache contains no factual account relationship proving that it is
-borrowing. The response documents this structural limitation; linked transfers
-from an obligation are classified as financing with high confidence.
+Односторонний приход без связи с обязательством остаётся обычным доходом:
+в кэше нет фактической связи со счётом долга, которая доказывала бы обратное.
+Это ограничение будет явно указано в ответе. Связанный перевод из обязательства
+классифицируется как финансирование с высокой уверенностью.
 
-## `get_cash_flow` contract
+## Контракт `get_cash_flow`
 
-The tool keeps the existing period inputs and returns:
+Входные параметры периода остаются прежними. Ответ:
 
 ```json
 {
@@ -169,7 +169,7 @@ The tool keeps the existing period inputs and returns:
 }
 ```
 
-The formulas are:
+Формулы:
 
 ```text
 operating_net_cash_flow = income - operating_expenses
@@ -179,20 +179,22 @@ savings_rate_before_debt_service_pct = operating_net_cash_flow / income * 100
 savings_rate_after_debt_service_pct = net_cash_flow_after_debt_service / income * 100
 ```
 
-Both percentages are `null` when income is zero. Internal and asset transfers
-do not affect either net measure. `uncertain_transactions` is bounded to 50
-items and contains only transaction ID, proposed classification, reason, and
-confidence; it does not duplicate the normal transaction-search response.
+Если доход равен нулю, оба процента возвращаются как `null`. Внутренние переводы
+и перемещения активов не влияют ни на один net-показатель.
+`uncertain_transactions` ограничен 50 элементами и содержит только ID
+транзакции, предполагаемый класс, причину и уверенность. Полный ответ поиска
+транзакций здесь не дублируется.
 
-`operating_net_cash_flow` is the operating component, not by itself the change
-in liquid account balances when consumption was financed by an obligation. In
-that case the matching financing component offsets the expense. The final
-`net_cash_flow_after_debt_service` value is the cash-basis household change.
+`operating_net_cash_flow` - операционная часть потока, а не самостоятельное
+изменение ликвидных остатков, если потребление профинансировано обязательством.
+В таком случае расход компенсируется соответствующим financing-компонентом.
+Именно `net_cash_flow_after_debt_service` показывает кассовое изменение денег
+пользователя.
 
-## `get_debt_service` contract
+## Контракт `get_debt_service`
 
-The tool accepts optional `obligation_overrides` and returns the same shared
-obligations plus payment facts:
+Инструмент принимает необязательный `obligation_overrides` и возвращает общие
+обязательства вместе с фактами о платежах:
 
 ```json
 {
@@ -211,60 +213,60 @@ obligations plus payment facts:
 }
 ```
 
-The service ratio is debt-service cash outflow divided by operating income and
-is `null` when income is zero. The same flow classifier used by
-`get_cash_flow` supplies both monthly income and debt-service values, preventing
-the two tools from drifting.
+Debt service ratio равен денежным платежам по долгам, делённым на операционный
+доход. При нулевом доходе он равен `null`. Доход и платежи для обоих инструментов
+считает один и тот же flow-классификатор, поэтому `get_cash_flow` и
+`get_debt_service` не смогут разойтись в правилах.
 
-## MCP schema correction
+## Исправление MCP-схемы
 
-`harden_tool_schemas` currently adds the legacy period regex to every property
-named `period`, including properties that already declare a different enum.
-The patcher will add the regex only when the property has no enum. Planning
-period enums therefore remain the sole constraint, while legacy tools retain
-their existing named-period/custom-month validation.
+Сейчас `harden_tool_schemas` добавляет старый regex периода к любому свойству с
+именем `period`, в том числе к свойствам с другим enum. Патчер будет добавлять
+regex только при отсутствии enum. Для planning-периодов единственным
+ограничением останется их enum, а старые инструменты сохранят проверку своих
+именованных периодов и пользовательского месяца.
 
-No new schema-validation dependency is needed. Contract tests inspect the
-actual `tools/list` descriptors, assert that the planning period has no regex,
-and exercise every documented enum value through the planning dispatcher.
+Новая зависимость для проверки JSON Schema не нужна. Contract tests читают
+реальные дескрипторы `tools/list`, проверяют отсутствие regex у planning-периода
+и вызывают planning dispatch с каждым документированным значением enum.
 
-## Error and data-quality behavior
+## Ошибки и качество данных
 
-- Invalid overrides raise `InputValidationError` with the failing field path.
-- Missing or non-positive currency rates keep the existing fail-closed
-  behavior.
-- Unknown obligation terms remain `null` with source `unknown`.
-- Structurally unknown transactions are not silently included in income or
-  spending. They are summarized and produce a data-quality warning.
-- No account title, merchant, payee, comment, or category text is treated as
-  proof of borrowing or installment status.
+- Неверные overrides вызывают `InputValidationError` с путём проблемного поля.
+- Отсутствующий или неположительный валютный курс по-прежнему останавливает
+  расчёт.
+- Неизвестные параметры обязательства остаются `null` с источником `unknown`.
+- Структурно неопределённые транзакции не попадают молча в доход или расходы.
+  Они учитываются отдельно и добавляют предупреждение о качестве данных.
+- Название счёта, merchant, payee, комментарий и категория не служат
+  доказательством кредита или рассрочки.
 
-## Tests
+## Тесты
 
-The implementation is written red-first and adds focused checks for:
+Реализация идёт от падающих тестов. Добавляем точечные проверки:
 
-- `loan`, negative `ccard`, and negative `checking` obligations, including
-  `inBalance=false`;
-- non-negative and archived accounts not appearing as current obligations;
-- unknown terms returning `null` rather than invented zeroes;
-- explicit classification, payment, and APR overrides;
-- a planned reminder-marker payment estimate;
-- a 100,000-unit asset-to-loan transfer producing no operating expense,
-  100,000 debt-service cash outflow, and a 100,000 reduction after debt service;
-- a 300,000-unit obligation-to-asset transfer producing financing inflow and no
-  operating income;
-- liability-funded spending producing equal operating-expense and financing
-  components;
-- cross-currency debt service using the actual source cash amount;
-- every documented `get_cash_flow.period` enum value surviving the final MCP
-  schema and dispatcher;
-- removal of the old response fields from both final contracts.
+- обязательства `loan`, отрицательного `ccard` и отрицательного `checking`, в
+  том числе при `inBalance=false`;
+- отсутствие среди текущих обязательств неотрицательных и архивных счетов;
+- `null` вместо выдуманных нулей для неизвестных условий;
+- явные overrides класса, платежа и APR;
+- оценка запланированного платежа по ReminderMarker;
+- перевод 100 000 единиц с обычного счёта на кредит: нулевой operating expense,
+  debt-service outflow 100 000 и уменьшение итогового cash flow на 100 000;
+- перевод 300 000 единиц из обязательства на обычный счёт: financing inflow без
+  операционного дохода;
+- расход за счёт обязательства с равными operating-expense и financing
+  компонентами;
+- валютный платёж по долгу по фактической сумме, ушедшей со счёта-источника;
+- прохождение каждого документированного значения `get_cash_flow.period`
+  через конечную MCP-схему и dispatch;
+- отсутствие старых полей в обоих конечных контрактах.
 
-The complete non-live suite remains the release gate.
+Полный набор non-live тестов остаётся обязательным release gate.
 
-## Later phases
+## Следующие фазы
 
-The shared obligation collector and flow classifier are the only reusable
-primitives intentionally created here. Later phases may consume them for the
-payoff planner and `get_financial_position`; they do not justify speculative
-tables, services, or configuration persistence in Phase 1.
+Общий сборщик обязательств и flow-классификатор - единственные переиспользуемые
+примитивы, которые намеренно создаются сейчас. Следующие фазы смогут применить
+их в payoff planner и `get_financial_position`. Ради этого в Phase 1 не нужны
+таблицы, сервисы или постоянное хранилище конфигурации «на будущее».
