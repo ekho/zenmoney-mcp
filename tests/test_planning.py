@@ -168,6 +168,21 @@ def test_planning_sync_status_utc_data_quality(planning_db):
     assert result["data_quality"]["last_sync"] == "1970-01-01T00:00:00Z"
 
 
+@pytest.mark.parametrize("raw_timestamp", ["-1", str(10**100)])
+def test_planning_invalid_sync_timestamp_metadata_is_unknown(
+    planning_db, raw_timestamp
+):
+    """Planning freshness shares the cache fail-closed timestamp contract."""
+    planning_db.set_meta("last_sync_time", raw_timestamp)
+
+    result = planning.get_financial_snapshot(
+        planning_db, as_of=date(2026, 8, 23)
+    )
+
+    assert result["data_quality"]["last_sync"] is None
+    assert result["data_quality"]["staleness"] == "unknown"
+
+
 def test_financial_obligations_include_every_active_negative_account(planning_db):
     planning_db.connect().executemany(
         "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "

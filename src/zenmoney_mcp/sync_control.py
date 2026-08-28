@@ -33,9 +33,14 @@ class InvalidSyncState(ValueError):
 
 def format_sync_timestamp(timestamp: int) -> str:
     """Render a stored Unix timestamp at the public UTC boundary."""
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    if type(timestamp) is not int or timestamp < 0:
+        raise ValueError("Invalid synchronization timestamp")
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("Invalid synchronization timestamp") from exc
 
 
 def _idle_state() -> dict[str, Any]:
@@ -51,7 +56,11 @@ def _idle_state() -> dict[str, Any]:
 
 
 def _is_timestamp(value: Any) -> bool:
-    return type(value) is int and value >= 0
+    try:
+        format_sync_timestamp(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_state(value: Any) -> dict[str, Any]:

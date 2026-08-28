@@ -3250,13 +3250,13 @@ def get_sync_status_resource(db: Database) -> dict[str, Any]:
         count = conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()["cnt"]
         cache_stats[table] = count
 
-    # Calculate staleness
+    last_sync_formatted = None
     if last_sync_time:
         try:
             last_sync = int(last_sync_time)
+            last_sync_formatted = format_sync_timestamp(last_sync)
             current_time = int(datetime.now().timestamp())
             age_seconds = current_time - last_sync
-
             if age_seconds < 300:  # 5 minutes
                 staleness = "fresh"
             elif age_seconds < 3600:  # 1 hour
@@ -3267,15 +3267,6 @@ def get_sync_status_resource(db: Database) -> dict[str, Any]:
             staleness = "unknown"
     else:
         staleness = "never_synced"
-
-    # Format last sync time
-    if last_sync_time:
-        try:
-            last_sync_formatted = format_sync_timestamp(int(last_sync_time))
-        except (ValueError, TypeError):
-            last_sync_formatted = None
-    else:
-        last_sync_formatted = None
 
     return {
         "last_server_timestamp": int(server_timestamp) if server_timestamp else 0,

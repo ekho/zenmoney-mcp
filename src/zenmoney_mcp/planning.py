@@ -66,7 +66,8 @@ def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
                 staleness = "slightly_stale"
             else:
                 staleness = "stale"
-        except (TypeError, ValueError, OSError):
+        except (TypeError, ValueError):
+            last_sync = None
             staleness = "unknown"
     return {
         "last_sync": last_sync,

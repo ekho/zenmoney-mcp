@@ -1024,6 +1024,18 @@ class TestR6SyncStatusResource:
 
         assert result["last_sync_time"] == "1970-01-01T00:00:00Z"
 
+    @pytest.mark.parametrize("raw_timestamp", ["-1", str(10**100)])
+    def test_invalid_sync_timestamp_metadata_is_unknown(
+        self, populated_db: Database, raw_timestamp
+    ):
+        """Malformed cache timestamps cannot look fresh or stale."""
+        populated_db.set_meta("last_sync_time", raw_timestamp)
+
+        result = get_sync_status_resource(populated_db)
+
+        assert result["last_sync_time"] is None
+        assert result["staleness"] == "unknown"
+
 
 # ============================================================================
 # Step 5: Expert Tools (T9, T10, T11, T14, T15)
