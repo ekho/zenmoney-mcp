@@ -2093,6 +2093,12 @@ async def _dispatch_tool(
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_spending_baseline":
+        if set(arguments) - {
+            "months",
+            "category_id",
+            "include_current_partial_month",
+        } or type(arguments.get("include_current_partial_month", False)) is not bool:
+            raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
         result = get_spending_baseline(
             db,
             months=arguments.get("months", 6),

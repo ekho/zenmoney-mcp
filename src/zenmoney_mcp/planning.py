@@ -515,9 +515,9 @@ def _expense_patterns(
         if not (outcome_asset or outcome_obligation):
             continue
         name = row["merchant"] or row["payee"] or "Unspecified"
-        normalized_name = _normalize_name(name)
+        normalized_name = _normalize_name(row["merchant"] or row["payee"])
         group = groups.setdefault(
-            (normalized_name, category_id),
+            (normalized_name or str(row["id"]), category_id),
             {
                 "name": name,
                 "normalized_name": normalized_name,

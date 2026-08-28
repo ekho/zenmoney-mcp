@@ -794,6 +794,30 @@ def test_spending_baseline_patterns_include_null_income_expense(planning_db):
     ]
 
 
+def test_spending_baseline_does_not_group_anonymous_expenses(planning_db):
+    for index, tx_date in enumerate(("2026-05-10", "2026-06-10", "2026-07-10")):
+        add_transaction(
+            planning_db,
+            f"anonymous-{index}",
+            tx_date,
+            outcome=250,
+            tag="food",
+        )
+
+    result = get_spending_baseline(
+        planning_db, months=3, as_of=date(2026, 8, 28)
+    )
+
+    assert result["patterns_total"] == 3
+    assert [item["classification"] for item in result["expense_patterns"]] == [
+        "one_off",
+        "one_off",
+        "one_off",
+    ]
+    assert all(item["name"] == "Unspecified" for item in result["expense_patterns"])
+    assert all(item["event_count"] == 1 for item in result["expense_patterns"])
+
+
 def test_spending_baseline_median_resists_outlier_and_includes_descendants(planning_db):
     for index, (month, amount) in enumerate(
         [(2, 100), (3, 100), (4, 100), (5, 10_000), (6, 100), (7, 200)]

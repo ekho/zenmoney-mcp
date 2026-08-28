@@ -2,6 +2,8 @@ import inspect
 import json
 
 import pytest
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_PARAMS
 
 from zenmoney_mcp import server
 from zenmoney_mcp import financial_correctness as corrected
@@ -178,6 +180,26 @@ async def test_spending_baseline_schema_is_strict_and_dispatches_partial_flag(
         "category_id": None,
         "include_current_partial_month": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"unexpected": True},
+        {"include_current_partial_month": "false"},
+    ],
+)
+async def test_spending_baseline_dispatch_rejects_invalid_arguments(arguments):
+    db = HardenedDatabase(":memory:")
+    try:
+        with pytest.raises(MCPError) as error:
+            await server.call_tool("get_spending_baseline", arguments, db=db)
+    finally:
+        db.close()
+
+    assert error.value.code == INVALID_PARAMS
+    assert error.value.message == "Invalid tool arguments"
 
 
 @pytest.mark.asyncio
