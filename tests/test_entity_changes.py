@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import math
 import uuid
 
@@ -277,7 +278,7 @@ def test_split_keeps_rounded_operation_amounts_non_negative(financial_db):
 
     operation_amounts = [item["after"]["opOutcome"] for item in items]
     assert min(operation_amounts) >= 0
-    assert sum(operation_amounts) == 0.5
+    assert sum(Decimal(str(amount)) for amount in operation_amounts) == Decimal("0.5")
 
 
 @pytest.mark.parametrize(
