@@ -428,15 +428,15 @@ def prepare_recurring_payment(
     day = payment["day_of_month"]
     start_date = payment["start_date"]
     end_date = payment["end_date"]
+    numeric_amount = not isinstance(amount, bool) and isinstance(amount, (int, float))
     try:
-        finite_amount = math.isfinite(amount)
-    except (OverflowError, TypeError):
+        finite_amount = numeric_amount and math.isfinite(amount)
+    except OverflowError:
         finite_amount = False
     if (
         not isinstance(name, str)
         or not name
-        or isinstance(amount, bool)
-        or not isinstance(amount, (int, float))
+        or not numeric_amount
         or not finite_amount
         or amount <= 0
         or not isinstance(account_id, str)

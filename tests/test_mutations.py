@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,18 @@ def test_prepare_recurring_payment_rejects_oversized_int_amount(
 ):
     payment = recurring_payment()
     payment["amount"] = 10**1000
+
+    with pytest.raises(MutationValidationError):
+        prepare_recurring_payment(
+            financial_db, ProposalStore(tmp_path / "proposals.db"), payment
+        )
+
+
+def test_prepare_recurring_payment_rejects_signaling_decimal_amount(
+    financial_db, tmp_path
+):
+    payment = recurring_payment()
+    payment["amount"] = Decimal("sNaN")
 
     with pytest.raises(MutationValidationError):
         prepare_recurring_payment(
