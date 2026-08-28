@@ -8,10 +8,12 @@ import pytest
 from zenmoney_mcp.hardened_database import HardenedDatabase, entity_key
 from zenmoney_mcp.mutations import (
     MutationStateError,
+    MutationValidationError,
     ProposalStore,
     execute_proposal,
     get_change_proposal,
     prepare_changes,
+    prepare_recurring_payment,
 )
 
 
@@ -61,6 +63,96 @@ def mixed_updates():
         {"entity": "transaction", "operation": "update", "id": "tx",
          "set": {"tag": ["food"], "comment": "fixed"}},
     ]
+
+
+def recurring_payment():
+    return {
+        "name": "Internet",
+        "amount": 1200,
+        "account_id": "cash",
+        "category_id": "food",
+        "frequency": "monthly",
+        "day_of_month": 18,
+        "start_date": "2026-09-18",
+        "end_date": None,
+        "notify": True,
+    }
+
+
+def test_prepare_recurring_payment_compiles_reminder_and_marker(
+    financial_db, tmp_path
+):
+    store = ProposalStore(tmp_path / "proposals.db")
+
+    proposal = prepare_recurring_payment(
+        financial_db, store, recurring_payment(), now=1_000
+    )
+
+    assert [item["entity"] for item in proposal["items"]] == [
+        "reminder",
+        "reminderMarker",
+    ]
+    reminder, marker = [item["after"] for item in store.execution_items(proposal["proposal_id"])]
+    assert reminder["interval"] == "month"
+    assert reminder["step"] == 1
+    assert reminder["points"] == [0]
+    assert reminder["income"] == 0
+    assert reminder["outcome"] == 1200
+    assert reminder["incomeAccount"] == reminder["outcomeAccount"] == "cash"
+    assert reminder["incomeInstrument"] == reminder["outcomeInstrument"] == 1
+    assert reminder["tag"] == ["food"]
+    assert reminder["payee"] == "Internet"
+    assert marker["reminder"] == reminder["id"]
+    assert marker["state"] == "planned"
+    assert marker["date"] == "2026-09-18"
+    assert marker["income"] == 0
+    assert marker["outcome"] == 1200
+    assert marker["incomeAccount"] == marker["outcomeAccount"] == "cash"
+    assert marker["incomeInstrument"] == marker["outcomeInstrument"] == 1
+    assert marker["tag"] == ["food"]
+    assert marker["payee"] == "Internet"
+    assert marker["notify"] is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda db, payment: db.upsert_accounts([
+            {**db.get_entity_raw("account", entity_key("account", {"id": "cash"})), "archive": True}
+        ]),
+        lambda db, payment: payment.update(account_id="missing"),
+        lambda db, payment: (
+            db.upsert_users([{"id": 2, "login": "other", "currency": 1, "parent": None, "changed": 1}]),
+            db.upsert_tags([{"id": "foreign", "title": "Foreign", "parent": None,
+                             "showIncome": False, "showOutcome": True, "budgetIncome": False,
+                             "budgetOutcome": True, "required": None, "user": 2, "changed": 1}]),
+            payment.update(category_id="foreign"),
+        ),
+        lambda db, payment: payment.update(category_id="missing"),
+        lambda db, payment: payment.update(frequency="weekly"),
+        lambda db, payment: payment.update(day_of_month=17),
+        lambda db, payment: payment.update(end_date="2026-09-17"),
+    ],
+    ids=[
+        "archived_account",
+        "missing_account",
+        "foreign_category",
+        "missing_category",
+        "non_monthly_frequency",
+        "day_mismatch",
+        "end_before_start",
+    ],
+)
+def test_prepare_recurring_payment_rejects_invalid_references_or_dates(
+    financial_db, tmp_path, change
+):
+    payment = recurring_payment()
+    change(financial_db, payment)
+
+    with pytest.raises(MutationValidationError):
+        prepare_recurring_payment(
+            financial_db, ProposalStore(tmp_path / "proposals.db"), payment
+        )
 
 
 def test_prepare_persists_generic_immutable_preview(financial_db, tmp_path):

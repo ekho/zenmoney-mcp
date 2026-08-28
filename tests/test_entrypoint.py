@@ -227,6 +227,75 @@ async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
 
 
 @pytest.mark.asyncio
+async def test_recurring_payment_tool_has_strict_schema_and_dispatches(tmp_path):
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    db.upsert_instruments([{"id": 1, "rate": 1, "changed": 1}])
+    db.upsert_users([{"id": 1, "currency": 1, "changed": 1}])
+    db.upsert_accounts(
+        [{"id": "cash", "type": "checking", "instrument": 1,
+          "archive": False, "user": 1, "changed": 1}]
+    )
+    db.upsert_tags([{"id": "food", "title": "Food", "user": 1, "changed": 1}])
+    db.set_meta("user_entity_raw_complete", "1")
+    tool = {tool.name: tool for tool in await server.list_tools()}[
+        "prepare_recurring_payment"
+    ]
+
+    assert tool.input_schema == {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "amount": {"type": "number", "minimum": 0, "exclusiveMinimum": 0},
+            "account_id": {"type": "string", "minLength": 1},
+            "category_id": {"type": "string", "minLength": 1},
+            "frequency": {"const": "monthly"},
+            "day_of_month": {"type": "integer", "minimum": 1, "maximum": 31},
+            "start_date": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+            "end_date": {"anyOf": [
+                {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+                {"type": "null"},
+            ], "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+            "notify": {"type": "boolean"},
+        },
+        "required": [
+            "name", "amount", "account_id", "category_id", "frequency",
+            "day_of_month", "start_date", "end_date", "notify",
+        ],
+        "additionalProperties": False,
+    }
+
+    result = await server.call_tool(
+        "prepare_recurring_payment",
+        {
+            "name": "Internet", "amount": 1200, "account_id": "cash",
+            "category_id": "food", "frequency": "monthly", "day_of_month": 18,
+            "start_date": "2026-09-18", "end_date": None, "notify": True,
+        },
+        db=db,
+        mutation_path=tmp_path / "proposals.db",
+    )
+
+    assert [item["entity"] for item in json.loads(result[0].text)["items"]] == [
+        "reminder", "reminderMarker"
+    ]
+    assert tool.annotations.read_only_hint is False
+    invalid = await server.call_tool(
+        "prepare_recurring_payment",
+        {
+            "name": "Internet", "amount": 1200, "account_id": "cash",
+            "category_id": "food", "frequency": "weekly", "day_of_month": 18,
+            "start_date": "2026-09-18", "end_date": None, "notify": True,
+        },
+        db=db,
+        mutation_path=tmp_path / "proposals.db",
+    )
+    assert json.loads(invalid[0].text) == {
+        "status": "rejected", "failure_code": "invalid_changes"
+    }
+
+
+@pytest.mark.asyncio
 async def test_local_transaction_change_tools_prepare_and_apply_exact_proposal(
     tmp_path, monkeypatch
 ):

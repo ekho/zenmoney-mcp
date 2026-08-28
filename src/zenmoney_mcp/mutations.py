@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,7 +20,7 @@ from .entity_changes import (
     rebuild_after,
     verify_after,
 )
-from .hardened_database import HardenedDatabase
+from .hardened_database import HardenedDatabase, entity_key
 
 DEFAULT_MUTATION_PATH = Path("/sync-control/mutation-proposals.db")
 MAX_PROPOSAL_ITEMS = 100
@@ -404,6 +405,110 @@ def prepare_changes(
     proposal = store.get(proposal_id, timestamp)
     assert proposal is not None
     return proposal
+
+
+def prepare_recurring_payment(
+    db: HardenedDatabase,
+    store: ProposalStore,
+    payment: Any,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Compile one monthly expense into the existing mixed proposal flow."""
+    required = {
+        "name", "amount", "account_id", "category_id", "frequency",
+        "day_of_month", "start_date", "end_date", "notify",
+    }
+    if not isinstance(payment, dict) or set(payment) != required:
+        raise MutationValidationError("recurring payment fields are invalid")
+    name = payment["name"]
+    amount = payment["amount"]
+    account_id = payment["account_id"]
+    category_id = payment["category_id"]
+    day = payment["day_of_month"]
+    start_date = payment["start_date"]
+    end_date = payment["end_date"]
+    if (
+        not isinstance(name, str)
+        or not name
+        or isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or amount <= 0
+        or not isinstance(account_id, str)
+        or not account_id
+        or not isinstance(category_id, str)
+        or not category_id
+        or payment["frequency"] != "monthly"
+        or isinstance(day, bool)
+        or not isinstance(day, int)
+        or not 1 <= day <= 31
+        or not isinstance(payment["notify"], bool)
+    ):
+        raise MutationValidationError("recurring payment values are invalid")
+    try:
+        start = date.fromisoformat(start_date)
+        end = None if end_date is None else date.fromisoformat(end_date)
+    except (TypeError, ValueError) as exc:
+        raise MutationValidationError("recurring payment dates are invalid") from exc
+    if (
+        start.isoformat() != start_date
+        or (end is not None and end.isoformat() != end_date)
+        or start.day != day
+        or (end is not None and end < start)
+    ):
+        raise MutationValidationError("recurring payment dates are invalid")
+
+    account = db.get_entity_raw("account", entity_key("account", {"id": account_id}))
+    if account is None or account.get("archive"):
+        raise MutationValidationError("account is unavailable")
+    owner = account.get("user")
+    instrument = account.get("instrument")
+    category = db.get_entity_raw("tag", entity_key("tag", {"id": category_id}))
+    if category is None or category.get("user") != owner:
+        raise MutationValidationError("category is unavailable")
+
+    value = {
+        "income": 0,
+        "outcome": amount,
+        "incomeAccount": account_id,
+        "outcomeAccount": account_id,
+        "incomeInstrument": instrument,
+        "outcomeInstrument": instrument,
+        "tag": [category_id],
+        "payee": name,
+        "notify": payment["notify"],
+    }
+    return prepare_changes(
+        db,
+        store,
+        [
+            {
+                "entity": "reminder",
+                "operation": "create",
+                "ref": "recurring_payment_reminder",
+                "owner_user_id": owner,
+                "value": {
+                    **value,
+                    "interval": "month",
+                    "step": 1,
+                    "points": [0],
+                    "startDate": start_date,
+                    "endDate": end_date,
+                },
+            },
+            {
+                "entity": "reminderMarker",
+                "operation": "create",
+                "owner_user_id": owner,
+                "value": {
+                    **value,
+                    "date": start_date,
+                    "reminder": {"ref": "recurring_payment_reminder"},
+                    "state": "planned",
+                },
+            },
+        ],
+        now=now,
+    )
 
 
 def get_change_proposal(
