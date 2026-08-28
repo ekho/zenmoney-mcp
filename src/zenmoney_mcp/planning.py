@@ -65,6 +65,15 @@ def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
     }
 
 
+def _financial_obligation_accounts(db: Any) -> list[Any]:
+    return db.connect().execute(
+        """SELECT id,title,type,instrument,balance,in_balance
+           FROM accounts
+           WHERE COALESCE(archive,0)=0 AND balance<0
+           ORDER BY title,id"""
+    ).fetchall()
+
+
 def _financial_obligations(
     db: Any,
     currency: CurrencyContext,
@@ -190,15 +199,6 @@ def _financial_obligations(
     return obligations
 
 
-def _financial_obligation_accounts(db: Any) -> list[Any]:
-    return db.connect().execute(
-        """SELECT id,title,type,instrument,balance,in_balance
-           FROM accounts
-           WHERE COALESCE(archive,0)=0 AND balance<0
-           ORDER BY title,id"""
-    ).fetchall()
-
-
 def _cash_flow_for_dates(
     db: Any,
     start: date,
@@ -245,6 +245,24 @@ def _cash_flow_for_dates(
         components[name]["amount"] += amount
         components[name]["count"] += 1
 
+    def add_category(
+        category_id: str | None,
+        category: str | None,
+        side: str,
+        amount: float,
+    ) -> None:
+        key = category_id or "uncategorized"
+        item = categories.setdefault(
+            key,
+            {
+                "category_id": category_id,
+                "category": category or "Uncategorized",
+                "income": 0.0,
+                "outcome": 0.0,
+            },
+        )
+        item[side] += amount
+
     for row in rows:
         try:
             tag_ids = json.loads(row["tag"] or "[]")
@@ -277,39 +295,26 @@ def _cash_flow_for_dates(
         if not (income_relevant or outcome_relevant):
             continue
 
-        def add_category(side: str, amount: float) -> None:
-            key = category_id or "uncategorized"
-            item = categories.setdefault(
-                key,
-                {
-                    "category_id": category_id,
-                    "category": row["category"] or "Uncategorized",
-                    "income": 0.0,
-                    "outcome": 0.0,
-                },
-            )
-            item[side] += amount
-
         if income > 0 and outcome == 0 and income_asset:
             amount = convert(db, income, row["income_instrument"], currency)
             add_component("income", amount)
-            add_category("income", amount)
+            add_category(category_id, row["category"], "income", amount)
             continue
 
         if outcome > 0 and income == 0 and (outcome_asset or outcome_obligation):
             amount = convert(db, outcome, row["outcome_instrument"], currency)
             add_component("operating_expense", amount)
-            add_category("outcome", amount)
+            add_category(category_id, row["category"], "outcome", amount)
             if outcome_obligation:
                 add_component("financing_inflow", amount)
             continue
 
         if income > 0 and outcome > 0:
-            source_amount = convert(
-                db, outcome, row["outcome_instrument"], currency
-            )
             if outcome_asset and income_obligation:
-                add_component("debt_service_outflow", source_amount)
+                add_component(
+                    "debt_service_outflow",
+                    convert(db, outcome, row["outcome_instrument"], currency),
+                )
                 continue
             if outcome_obligation and income_asset:
                 add_component(
@@ -318,7 +323,10 @@ def _cash_flow_for_dates(
                 )
                 continue
             if outcome_obligation and income_obligation:
-                add_component("internal_transfer", source_amount)
+                add_component(
+                    "internal_transfer",
+                    convert(db, outcome, row["outcome_instrument"], currency),
+                )
                 continue
             if outcome_asset and income_asset:
                 is_asset_transfer = (
@@ -329,7 +337,7 @@ def _cash_flow_for_dates(
                 )
                 add_component(
                     "asset_transfer" if is_asset_transfer else "internal_transfer",
-                    source_amount,
+                    convert(db, outcome, row["outcome_instrument"], currency),
                 )
                 continue
 

@@ -496,6 +496,31 @@ def test_cash_flow_does_not_count_borrowing_as_income(planning_db):
     assert result["net_cash_flow_after_debt_service"] == 300_000
 
 
+def test_cash_flow_uses_financing_destination_side_without_source_rate(planning_db):
+    planning_db.connect().execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('loan-usd','USD Loan','loan',2,-10,1,0,0,1,1)"
+    )
+    add_transaction(
+        planning_db,
+        "borrowing",
+        "2026-07-10",
+        income=100,
+        income_instrument=1,
+        income_account="cash-rub",
+        outcome=1,
+        outcome_instrument=2,
+        outcome_account="loan-usd",
+    )
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["financing_inflow"] == 100
+
+
 def test_liability_funded_spending_has_equal_expense_and_financing(planning_db):
     add_transaction(
         planning_db,
