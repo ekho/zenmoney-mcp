@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from .database import Database
+from .sync_control import format_sync_timestamp
 from .utils import convert_to_user_currency
 
 
@@ -3270,8 +3271,7 @@ def get_sync_status_resource(db: Database) -> dict[str, Any]:
     # Format last sync time
     if last_sync_time:
         try:
-            dt = datetime.fromtimestamp(int(last_sync_time))
-            last_sync_formatted = dt.isoformat()
+            last_sync_formatted = format_sync_timestamp(int(last_sync_time))
         except (ValueError, TypeError):
             last_sync_formatted = None
     else:

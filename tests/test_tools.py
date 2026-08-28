@@ -1016,6 +1016,14 @@ class TestR6SyncStatusResource:
         assert stats["accounts"] > 0
         assert stats["tags"] > 0
 
+    def test_sync_status_utc_last_sync_time(self, populated_db: Database):
+        """Cache metadata crosses the public boundary as RFC3339 UTC."""
+        populated_db.set_meta("last_sync_time", "0")
+
+        result = get_sync_status_resource(populated_db)
+
+        assert result["last_sync_time"] == "1970-01-01T00:00:00Z"
+
 
 # ============================================================================
 # Step 5: Expert Tools (T9, T10, T11, T14, T15)

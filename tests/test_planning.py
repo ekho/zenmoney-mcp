@@ -157,6 +157,17 @@ def test_convert_zero_does_not_require_stale_instrument(planning_db):
     assert convert(planning_db, 0, 999, user_currency(planning_db)) == 0
 
 
+def test_planning_sync_status_utc_data_quality(planning_db):
+    """Planning responses expose cache freshness as RFC3339 UTC."""
+    planning_db.set_meta("last_sync_time", "0")
+
+    result = planning.get_financial_snapshot(
+        planning_db, as_of=date(2026, 8, 23)
+    )
+
+    assert result["data_quality"]["last_sync"] == "1970-01-01T00:00:00Z"
+
+
 def test_financial_obligations_include_every_active_negative_account(planning_db):
     planning_db.connect().executemany(
         "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "

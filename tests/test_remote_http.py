@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -18,6 +19,12 @@ from mcp_types import INTERNAL_ERROR, INVALID_PARAMS
 from zenmoney_mcp import server
 from zenmoney_mcp.hardened_database import HardenedDatabase
 from zenmoney_mcp.http_server import create_app
+from zenmoney_mcp.sync_control import (
+    claim_sync_request,
+    finish_sync_request,
+    read_sync_state,
+    request_sync,
+)
 
 
 def _write_snapshot(
@@ -193,11 +200,42 @@ async def test_remote_force_sync_and_status_work_before_first_snapshot(tmp_path)
     status_payload = json.loads(status.content[0].text)
     assert requested_payload["status"] == "accepted"
     assert requested_payload["mode"] == "full"
+    assert requested_payload["requested_at"].endswith("Z")
     assert status_payload["state"] == "pending"
     assert status_payload["request_id"] == requested_payload["request_id"]
     assert status_payload["last_sync_time"] is None
     assert status_payload["staleness"] == "never_synced"
     assert status_payload["cache_stats"] == {}
+
+
+@pytest.mark.asyncio
+async def test_remote_sync_status_utc_timestamps(tmp_path):
+    """Public control metadata must use RFC3339 UTC, never local time."""
+    control_path = tmp_path / "sync-state.json"
+    control_path.write_text(
+        json.dumps(
+            {
+                "state": "completed",
+                "request_id": "00000000-0000-0000-0000-000000000001",
+                "force_full": False,
+                "requested_at": 0,
+                "started_at": 1_700_000_000,
+                "finished_at": 1_700_000_001,
+                "failure_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    app = create_app(tmp_path / "missing.db", control_path)
+
+    async with _mcp_client(app) as client:
+        await client.initialize()
+        status = await client.call_tool("get_sync_status", {})
+
+    payload = json.loads(status.content[0].text)
+    assert payload["requested_at"] == "1970-01-01T00:00:00Z"
+    assert payload["started_at"] == "2023-11-14T22:13:20Z"
+    assert payload["finished_at"] == "2023-11-14T22:13:21Z"
 
 
 @pytest.mark.asyncio
@@ -219,6 +257,7 @@ async def test_remote_sync_status_combines_control_and_snapshot_metadata(tmp_pat
     assert payload["last_server_timestamp"] == 321
     assert payload["last_sync_time"] is not None
     assert payload["cache_stats"]["accounts"] == 1
+    assert payload["last_sync_time"].endswith("Z")
 
 
 @pytest.mark.asyncio
@@ -256,10 +295,150 @@ async def test_remote_sync_control_rejects_invalid_state_without_echo(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("succeeded", "expected_status"), [(True, "completed"), (False, "failed")]
+)
+async def test_remote_force_sync_wait_returns_terminal_state(
+    tmp_path, succeeded, expected_status
+):
+    """Waiting returns the terminal result for the request the caller made."""
+    control_path = tmp_path / "sync-state.json"
+
+    async def finish_request():
+        await asyncio.sleep(0)
+        claimed = claim_sync_request(control_path)
+        assert claimed is not None
+        finish_sync_request(control_path, claimed["request_id"], succeeded)
+
+    finisher = asyncio.create_task(finish_request())
+    content = await server.call_tool(
+        "force_sync",
+        {"wait_until_complete": True},
+        remote=True,
+        db_path=tmp_path / "missing.db",
+        control_path=control_path,
+    )
+    await finisher
+
+    payload = json.loads(content[0].text)
+    assert payload["status"] == expected_status
+    assert payload["state"] == expected_status
+    assert payload["request_id"] is not None
+    assert payload["wait_timed_out"] is False
+    assert payload["requested_at"].endswith("Z")
+    assert payload["started_at"].endswith("Z")
+    assert payload["finished_at"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_remote_force_sync_wait_preserves_running_request(tmp_path):
+    """A waiter joins an existing request instead of replacing its mode or ID."""
+    control_path = tmp_path / "sync-state.json"
+    original = request_sync(control_path, force_full=True)
+
+    async def finish_request():
+        await asyncio.sleep(0)
+        claimed = claim_sync_request(control_path)
+        assert claimed is not None
+        finish_sync_request(control_path, claimed["request_id"], succeeded=True)
+
+    finisher = asyncio.create_task(finish_request())
+    content = await server.call_tool(
+        "force_sync",
+        {"force_full": False, "wait_until_complete": True},
+        remote=True,
+        db_path=tmp_path / "missing.db",
+        control_path=control_path,
+    )
+    await finisher
+
+    payload = json.loads(content[0].text)
+    assert payload["status"] == "completed"
+    assert payload["request_id"] == original["request_id"]
+    assert payload["mode"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_remote_force_sync_wait_timeout_keeps_request_pending(
+    monkeypatch, tmp_path
+):
+    """Timeout reports current state and does not cancel the worker request."""
+    control_path = tmp_path / "sync-state.json"
+    monkeypatch.setattr(server, "_SYNC_WAIT_TIMEOUT_SECONDS", 0.0)
+
+    content = await server.call_tool(
+        "force_sync",
+        {"wait_until_complete": True},
+        remote=True,
+        db_path=tmp_path / "missing.db",
+        control_path=control_path,
+    )
+
+    payload = json.loads(content[0].text)
+    persisted = read_sync_state(control_path)
+    assert payload["status"] == "timeout"
+    assert payload["state"] == "pending"
+    assert payload["wait_timed_out"] is True
+    assert persisted["state"] == "pending"
+    assert persisted["request_id"] == payload["request_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_remote_force_sync_wait_fails_closed_when_state_changes(
+    tmp_path, invalid
+):
+    """Invalid or replaced control state must not leak metadata to a waiter."""
+    control_path = tmp_path / "sync-state.json"
+    replacement_id = "00000000-0000-0000-0000-000000000002"
+
+    async def replace_request():
+        await asyncio.sleep(0)
+        content = "not-valid-json" if invalid else json.dumps(
+            {
+                "state": "pending",
+                "request_id": replacement_id,
+                "force_full": True,
+                "requested_at": 0,
+                "started_at": None,
+                "finished_at": None,
+                "failure_code": None,
+            }
+        )
+        control_path.write_text(content, encoding="utf-8")
+
+    replacer = asyncio.create_task(replace_request())
+    content = await server.call_tool(
+        "force_sync",
+        {"wait_until_complete": True},
+        remote=True,
+        db_path=tmp_path / "missing.db",
+        control_path=control_path,
+    )
+    await replacer
+
+    payload = json.loads(content[0].text)
+    assert payload == {
+        "status": "failed",
+        "state": "failed",
+        "request_id": None,
+        "mode": None,
+        "requested_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "failure_code": "invalid_sync_state",
+        "wait_timed_out": False,
+    }
+    assert replacement_id not in content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("name", "arguments"),
     [
         ("force_sync", {"extra": 1}),
         ("force_sync", {"force_full": "yes"}),
+        ("force_sync", {"wait_until_complete": "yes"}),
+        ("force_sync", {"wait_until_complete": True, "extra": 1}),
         ("get_sync_status", {"extra": 1}),
     ],
 )

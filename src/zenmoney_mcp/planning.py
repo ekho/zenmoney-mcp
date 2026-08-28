@@ -19,6 +19,7 @@ from .periods import (
     current_period,
     resolve_period,
 )
+from .sync_control import format_sync_timestamp
 from .validation import (
     InputValidationError,
     bounded_int,
@@ -57,7 +58,7 @@ def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
     if raw_sync:
         try:
             stamp = int(raw_sync)
-            last_sync = datetime.fromtimestamp(stamp).isoformat()
+            last_sync = format_sync_timestamp(stamp)
             age = int(time.time()) - stamp
             if age < 300:
                 staleness = "fresh"

@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -28,6 +29,13 @@ _STATE_KEYS = {
 
 class InvalidSyncState(ValueError):
     """Raised when the shared synchronization state is unsafe to use."""
+
+
+def format_sync_timestamp(timestamp: int) -> str:
+    """Render a stored Unix timestamp at the public UTC boundary."""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def _idle_state() -> dict[str, Any]:
