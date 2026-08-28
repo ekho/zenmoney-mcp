@@ -70,19 +70,19 @@ position, cursor search и атомарный transaction split.
 
 ### Task 4: Добавить атомарный transaction split
 
-- [ ] Добавить RED normalization tests в `tests/test_entity_changes.py` для
+- [x] Добавить RED normalization tests в `tests/test_entity_changes.py` для
   exact sum, одного remainder, categories, raw metadata, proportional operation
   amounts и отклонения transfer/hold/deleted/stale/invalid parts.
-- [ ] Добавить RED executor test в `tests/test_mutations.py`: один `push_changes`
+- [x] Добавить RED executor test в `tests/test_mutations.py`: один `push_changes`
   содержит update исходной и create частей; повторный apply не отправляет batch.
-- [ ] Добавить RED schema tests split для entity-specific и mixed tools.
-- [ ] Реализовать минимальный split helper в `entity_changes.py`, разворачивающий
+- [x] Добавить RED schema tests split для entity-specific и mixed tools.
+- [x] Реализовать минимальный split helper в `entity_changes.py`, разворачивающий
   одну клиентскую operation в несколько proposal items с UUID.
-- [ ] Убедиться, что `execute_proposal` отправляет все split items одним batch;
+- [x] Убедиться, что `execute_proposal` отправляет все split items одним batch;
   refs не менять до Phase 3.
-- [ ] Расширить mutation schemas в `server.py`.
-- [ ] Запустить `uv run pytest -q tests/test_entity_changes.py tests/test_mutations.py tests/test_entrypoint.py tests/test_remote_http.py`.
-- [ ] Commit: `feat: prepare atomic transaction splits`.
+- [x] Расширить mutation schemas в `server.py`.
+- [x] Запустить `uv run pytest -q tests/test_entity_changes.py tests/test_mutations.py tests/test_entrypoint.py tests/test_remote_http.py`.
+- [x] Commit: `feat: prepare atomic transaction splits`.
 
 ### Task 5: Документация и полный Phase 2 gate
 

@@ -195,6 +195,29 @@ async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
         *server.PREPARE_TOOL_ENTITIES.values()
     }
     assert tools["apply_changes"].input_schema["required"] == ["proposal_id"]
+    transaction_operations = tools["prepare_transaction_changes"].input_schema[
+        "properties"
+    ]["operations"]["items"]["oneOf"]
+    split = next(
+        branch
+        for branch in transaction_operations
+        if branch["properties"]["operation"].get("const") == "split"
+    )
+    assert split["required"] == ["operation", "transaction_id", "parts"]
+    assert split["properties"]["parts"]["minItems"] == 2
+    assert split["properties"]["parts"]["maxItems"] == 100
+    mixed_split = next(
+        branch
+        for branch in mixed
+        if branch["properties"]["entity"]["const"] == "transaction"
+        and branch["properties"]["operation"].get("const") == "split"
+    )
+    assert mixed_split["required"] == [
+        "entity",
+        "operation",
+        "transaction_id",
+        "parts",
+    ]
 
 
 @pytest.mark.asyncio

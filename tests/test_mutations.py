@@ -219,6 +219,57 @@ async def test_mixed_executor_sends_one_request_and_verifies_all_types(
 
 
 @pytest.mark.asyncio
+async def test_split_executor_sends_one_idempotent_atomic_batch(financial_db, tmp_path):
+    financial_db.upsert_tags(
+        [{"id": "other", "title": "Other", "showIncome": False,
+          "showOutcome": True, "budgetIncome": False, "budgetOutcome": True,
+          "required": None, "user": 1, "changed": 1}]
+    )
+    raw = financial_db.get_transaction_raw("tx")
+    financial_db.upsert_transactions(
+        [{**raw, "outcome": 100, "outcomeBankID": "bank-operation", "changed": 10}]
+    )
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_changes(
+        financial_db,
+        store,
+        [{
+            "entity": "transaction",
+            "operation": "split",
+            "transaction_id": "tx",
+            "parts": [
+                {"amount": 40, "category_id": "food"},
+                {"amount": "remainder", "category_id": "other"},
+            ],
+        }],
+        now=90,
+    )
+    engine = SuccessfulMixedEngine(financial_db)
+
+    result = await execute_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=100
+    )
+
+    assert result["status"] == "applied"
+    assert len(engine.pushed) == 1
+    assert set(engine.pushed[0]) == {"transaction"}
+    pushed = engine.pushed[0]["transaction"]
+    assert len(pushed) == 2
+    assert sum(item["outcome"] for item in pushed) == 100
+    assert {item["outcomeBankID"] for item in pushed} == {"bank-operation"}
+    rows = financial_db.connect().execute(
+        "SELECT id,outcome FROM transactions WHERE COALESCE(deleted,0)=0"
+    ).fetchall()
+    assert sum(row["outcome"] for row in rows) == 100
+
+    repeated = await execute_proposal(
+        financial_db, engine, store, prepared["proposal_id"], now=101
+    )
+    assert repeated == result
+    assert len(engine.pushed) == 1
+
+
+@pytest.mark.asyncio
 async def test_create_references_are_sent_in_dependency_layers(
     financial_db, tmp_path
 ):

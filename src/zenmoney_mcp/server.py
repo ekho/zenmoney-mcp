@@ -994,6 +994,46 @@ def _mutation_tools() -> list[Tool]:
                 "additionalProperties": False,
             },
         ]
+        if entity_type == "transaction":
+            operations.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        **common,
+                        "operation": {"const": "split"},
+                        "transaction_id": string,
+                        "parts": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 100,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "amount": {
+                                        "oneOf": [
+                                            {
+                                                "type": "number",
+                                                "exclusiveMinimum": 0,
+                                            },
+                                            {"const": "remainder"},
+                                        ]
+                                    },
+                                    "category_id": ref,
+                                },
+                                "required": ["amount", "category_id"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": [
+                        *required_common,
+                        "operation",
+                        "transaction_id",
+                        "parts",
+                    ],
+                    "additionalProperties": False,
+                }
+            )
         if entity_type in SAFE_DELETE:
             operations.append(
                 {
