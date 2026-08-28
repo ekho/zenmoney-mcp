@@ -270,7 +270,7 @@ async def test_split_executor_sends_one_idempotent_atomic_batch(financial_db, tm
 
 
 @pytest.mark.asyncio
-async def test_create_references_are_sent_in_dependency_layers(
+async def test_cross_referenced_creates_are_sent_in_one_atomic_batch(
     financial_db, tmp_path
 ):
     store = ProposalStore(tmp_path / "proposals.db")
@@ -285,6 +285,12 @@ async def test_create_references_are_sent_in_dependency_layers(
                        "incomeAccount": "cash", "outcomeAccount": "cash",
                        "incomeInstrument": 1, "outcomeInstrument": 1,
                        "tag": [{"ref": "new_tag"}]}},
+            {"entity": "reminder", "operation": "create",
+             "value": {"income": 0, "outcome": 1,
+                       "incomeAccount": "cash", "outcomeAccount": "cash",
+                       "incomeInstrument": 1, "outcomeInstrument": 1,
+                       "tag": [{"ref": "new_tag"}],
+                       "startDate": "2026-08-25"}},
         ],
         now=90,
     )
@@ -296,12 +302,12 @@ async def test_create_references_are_sent_in_dependency_layers(
 
     assert result["status"] == "applied"
     assert [set(batch) for batch in engine.pushed] == [
-        {"tag"}, {"transaction"}
+        {"tag", "transaction", "reminder"}
     ]
 
 
 @pytest.mark.asyncio
-async def test_later_dependency_layer_failure_is_not_retried(
+async def test_atomic_mixed_batch_failure_is_not_retried(
     financial_db, tmp_path
 ):
     store = ProposalStore(tmp_path / "proposals.db")
@@ -320,21 +326,19 @@ async def test_later_dependency_layer_failure_is_not_retried(
         now=90,
     )
 
-    class FailSecondLayer(SuccessfulMixedEngine):
+    class FailAtomicBatch(SuccessfulMixedEngine):
         async def push_changes(self, changes):
-            if self.pushed:
-                self.pushed.append(changes)
-                raise RuntimeError("sensitive upstream response")
-            return await super().push_changes(changes)
+            self.pushed.append(changes)
+            raise RuntimeError("sensitive upstream response")
 
-    engine = FailSecondLayer(financial_db)
+    engine = FailAtomicBatch(financial_db)
     result = await execute_proposal(
         financial_db, engine, store, prepared["proposal_id"], now=100
     )
 
     assert result["status"] == "needs_review"
     assert result["failure_code"] == "write_result_unknown"
-    assert len(engine.pushed) == 2
+    assert len(engine.pushed) == 1
     assert [item["result"] for item in result["items"]] == ["unknown", "unknown"]
 
 

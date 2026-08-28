@@ -129,6 +129,7 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert not ({"force_sync", "get_sync_status"} & set(tools))
     assert {
         *server.PREPARE_TOOL_ENTITIES,
+        "prepare_changes",
         "prepare_mixed_changes",
         "get_change_proposal",
         "apply_changes",
@@ -189,9 +190,13 @@ async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
             for branch in operations["items"]["oneOf"]
         )
 
-    mixed = tools["prepare_mixed_changes"].input_schema[
-        "properties"
-    ]["operations"]["items"]["oneOf"]
+    assert (
+        tools["prepare_changes"].input_schema
+        == tools["prepare_mixed_changes"].input_schema
+    )
+    mixed = tools["prepare_changes"].input_schema["properties"]["operations"][
+        "items"
+    ]["oneOf"]
     assert {branch["properties"]["entity"]["const"] for branch in mixed} == {
         *server.PREPARE_TOOL_ENTITIES.values()
     }

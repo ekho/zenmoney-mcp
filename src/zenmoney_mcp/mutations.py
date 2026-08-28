@@ -419,19 +419,6 @@ def _results(items: list[dict[str, Any]], result: str) -> dict[int, str]:
     return {item["position"]: result for item in items}
 
 
-def _string_values(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {value}
-    if isinstance(value, (list, dict)):
-        values = value.values() if isinstance(value, dict) else value
-        return {
-            found
-            for item in values
-            for found in _string_values(item)
-        }
-    return set()
-
-
 async def execute_proposal(
     db: HardenedDatabase,
     engine: Any,
@@ -488,33 +475,19 @@ async def execute_proposal(
             timestamp,
         )
 
-    outgoing: dict[int, dict[str, list[dict[str, Any]]]] = {}
-    created_levels: dict[str, int] = {}
+    outgoing: dict[str, list[dict[str, Any]]] = {}
     try:
         for item in items:
             value = rebuild_after(db, item, raw_objects[item["position"]])
             value["changed"] = timestamp
-            level = max(
-                (
-                    created_levels[reference] + 1
-                    for reference in _string_values(item["after"])
-                    if reference in created_levels
-                ),
-                default=0,
-            )
-            outgoing.setdefault(level, {}).setdefault(
-                DIFF_FIELDS[item["entity_type"]], []
-            ).append(value)
-            if item["operation"] == "create" and item["entity_type"] != "budget":
-                created_levels[_decode(item["entity_key"])] = level
+            outgoing.setdefault(DIFF_FIELDS[item["entity_type"]], []).append(value)
     except MutationValidationError:
         return store.finish(
             proposal_id, "failed", unchanged, "entity_invalid", timestamp
         )
 
     try:
-        for level in sorted(outgoing):
-            await engine.push_changes(outgoing[level])
+        await engine.push_changes(outgoing)
     except Exception:
         return store.finish(
             proposal_id,

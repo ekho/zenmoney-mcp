@@ -112,6 +112,7 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
         "list_transactions", "get_transaction",
         "list_budgets", "get_budget",
         *server.PREPARE_TOOL_ENTITIES,
+        "prepare_changes",
         "prepare_mixed_changes",
         "get_change_proposal",
         "apply_changes",
@@ -127,6 +128,12 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
     assert tools_by_name["get_sync_status"].annotations.read_only_hint is True
     assert tools_by_name["prepare_transaction_changes"].annotations.read_only_hint is False
     assert tools_by_name["prepare_transaction_changes"].annotations.destructive_hint is False
+    assert tools_by_name["prepare_changes"].annotations.read_only_hint is False
+    assert tools_by_name["prepare_changes"].annotations.destructive_hint is False
+    assert tools_by_name["prepare_changes"].annotations.open_world_hint is False
+    assert tools_by_name["prepare_mixed_changes"].annotations.read_only_hint is False
+    assert tools_by_name["prepare_mixed_changes"].annotations.destructive_hint is False
+    assert tools_by_name["prepare_mixed_changes"].annotations.open_world_hint is False
     assert tools_by_name["get_change_proposal"].annotations.read_only_hint is True
     assert tools_by_name["apply_changes"].annotations.read_only_hint is False
     assert tools_by_name["apply_changes"].annotations.destructive_hint is True

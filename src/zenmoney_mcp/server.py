@@ -117,6 +117,7 @@ PREPARE_TOOL_ENTITIES = {
 MUTATION_TOOLS = frozenset(
     {
         *PREPARE_TOOL_ENTITIES,
+        "prepare_changes",
         "prepare_mixed_changes",
         "get_change_proposal",
         "apply_changes",
@@ -1092,15 +1093,17 @@ def _mutation_tools() -> list[Tool]:
         )
         for name, entity_type in PREPARE_TOOL_ENTITIES.items()
     ]
-    prepare_tools.append(
+    mixed_schema = prepare_schema(None)
+    prepare_tools.extend(
         Tool(
-            name="prepare_mixed_changes",
+            name=name,
             description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
-            inputSchema=prepare_schema(None),
+            inputSchema=mixed_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
             ),
         )
+        for name in ("prepare_changes", "prepare_mixed_changes")
     )
     return prepare_tools + [
         Tool(
@@ -1671,6 +1674,7 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                     not in {
                         "force_sync",
                         *PREPARE_TOOL_ENTITIES,
+                        "prepare_changes",
                         "prepare_mixed_changes",
                         "apply_changes",
                     },
@@ -1815,7 +1819,9 @@ async def _dispatch_mutation_tool(
 ) -> list[TextContent]:
     store = ProposalStore(mutation_path)
     try:
-        if name in PREPARE_TOOL_ENTITIES or name == "prepare_mixed_changes":
+        if name in PREPARE_TOOL_ENTITIES or name in {
+            "prepare_changes", "prepare_mixed_changes"
+        }:
             if set(arguments) != {"operations"}:
                 raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
             try:
