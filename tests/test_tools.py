@@ -2418,3 +2418,63 @@ class TestAnomalySignals:
         assert any(set(item["transactions"]) == {"legacy-a", "legacy-b"} for item in result["possible_duplicates"])
         assert result["summary"]["periodic_recurrences_count"] == len(recurrence_ids)
         assert result["summary"]["results_truncated"] is False
+
+    def test_anomaly_omits_history_only_recurrences_before_bounding_context(self, populated_db: Database):
+        period = {"start_date": "2026-08-01", "end_date": "2026-08-31"}
+        for index in range(15):
+            for month in ("2025-08-01", "2025-09-01", "2025-10-01"):
+                _insert_tx(
+                    populated_db,
+                    id=f"history-{index}-{month}",
+                    date=month,
+                    outcome=100.0 + index,
+                    tag=json.dumps(["tag-grocery"]),
+                    payee=f"history-{index}",
+                )
+        for tx_id, tx_date in (
+            ("selected-june", "2026-06-01"),
+            ("selected-july", "2026-07-01"),
+            ("selected-august", "2026-08-01"),
+        ):
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date=tx_date,
+                outcome=999.0,
+                tag=json.dumps(["tag-grocery"]),
+                payee="selected",
+            )
+
+        result = detect_anomalies(populated_db, **period)
+
+        recurrence_ids = [set(item["transactions"]) for item in result["periodic_recurrences"]]
+        assert {"selected-june", "selected-july", "selected-august"} in recurrence_ids
+        assert not any(any(tx_id.startswith("history-") for tx_id in ids) for ids in recurrence_ids)
+        assert result["summary"]["periodic_recurrences_count"] == 1
+
+    def test_anomaly_uses_payee_when_merchant_title_is_whitespace(self, populated_db: Database):
+        populated_db.connect().execute(
+            "INSERT INTO merchants (id, title, user, changed) VALUES ('blank-merchant', '   ', 1, 1)"
+        )
+        populated_db.connect().commit()
+        for tx_id, merchant, payee in (
+            ("blank-merchant-a", "blank-merchant", "Straße"),
+            ("blank-merchant-b", None, "STRASSE"),
+        ):
+            _insert_tx(
+                populated_db,
+                id=tx_id,
+                date="2026-08-10",
+                outcome=500.0,
+                tag=json.dumps(["tag-grocery"]),
+                merchant=merchant,
+                payee=payee,
+            )
+
+        result = detect_anomalies(populated_db, start_date="2026-08-01", end_date="2026-08-31")
+
+        duplicate = next(
+            item for item in result["exact_duplicates"]
+            if set(item["transactions"]) == {"blank-merchant-a", "blank-merchant-b"}
+        )
+        assert duplicate["payee"] == "Straße"

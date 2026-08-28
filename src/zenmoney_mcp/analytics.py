@@ -2265,7 +2265,7 @@ def detect_anomalies(
         amount = convert_to_user_currency(
             row["outcome"], row["outcome_instrument"], db, user_currency_id,
         )
-        payee = row["merchant_title"] or row["payee"] or ""
+        payee = (row["merchant_title"] or "").strip() or (row["payee"] or "").strip()
         records.append({
             "id": row["id"],
             "date": tx_date,
@@ -2275,7 +2275,7 @@ def detect_anomalies(
             "category": row["tag_title"] or "Uncategorized",
             "outcome_account": row["outcome_account"],
             "payee": payee,
-            "normalized_payee": payee.strip().lower(),
+            "normalized_payee": payee.casefold(),
             "selected": selected_start <= tx_date <= selected_end,
         })
 
@@ -2353,7 +2353,7 @@ def detect_anomalies(
             frequency = "semiannual"
         elif len(dates) >= 2 and all(350 <= interval <= 380 for interval in intervals):
             frequency = "annual"
-        if frequency:
+        if frequency and any(record["selected"] for record in group):
             periodic_ids.update(record["id"] for record in group)
             periodic_recurrences.append({
                 "transactions": [record["id"] for record in group],
