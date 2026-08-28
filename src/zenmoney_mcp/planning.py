@@ -114,35 +114,6 @@ def _financial_obligations(
             }
         )
     by_id = {item["account_id"]: item for item in obligations}
-    marker_rows = db.connect().execute(
-        """SELECT rm.date,rm.income_account AS obligation_id,
-                  rm.outcome,
-                  COALESCE(rm.outcome_instrument,source.instrument) AS instrument,
-                  source.id AS source_id
-           FROM reminder_markers rm
-           JOIN accounts source ON source.id=rm.outcome_account
-           WHERE rm.state='planned' AND rm.date>=?
-             AND rm.income>0 AND rm.outcome>0
-             AND COALESCE(source.archive,0)=0
-             AND (source.in_balance IS NULL OR source.in_balance!=0)
-           ORDER BY rm.date,rm.id""",
-        ((as_of or date.today()).isoformat(),),
-    ).fetchall()
-    for marker in marker_rows:
-        item = by_id.get(marker["obligation_id"])
-        if item is None or marker["source_id"] in by_id:
-            continue
-        if item["minimum_payment"]["source"] != "unknown":
-            continue
-        item["minimum_payment"] = {
-            "amount": round(
-                convert(db, marker["outcome"], marker["instrument"], currency), 2
-            ),
-            "due_date": marker["date"],
-            "source": "reminder",
-            "confidence": "medium",
-        }
-
     for account_id, override in overrides.items():
         path = f"obligation_overrides.{account_id}"
         item = by_id.get(account_id)
@@ -196,6 +167,35 @@ def _financial_obligations(
         if "apr_pct" in override:
             apr = non_negative_number(override["apr_pct"], f"{path}.apr_pct")
             item["apr_pct"] = {"value": apr, "source": "user_override"}
+
+    marker_rows = db.connect().execute(
+        """SELECT rm.date,rm.income_account AS obligation_id,
+                  rm.outcome,
+                  COALESCE(rm.outcome_instrument,source.instrument) AS instrument,
+                  source.id AS source_id
+           FROM reminder_markers rm
+           JOIN accounts source ON source.id=rm.outcome_account
+           WHERE rm.state='planned' AND rm.date>=?
+             AND rm.income>0 AND rm.outcome>0
+             AND COALESCE(source.archive,0)=0
+             AND (source.in_balance IS NULL OR source.in_balance!=0)
+           ORDER BY rm.date,rm.id""",
+        ((as_of or date.today()).isoformat(),),
+    ).fetchall()
+    for marker in marker_rows:
+        item = by_id.get(marker["obligation_id"])
+        if item is None or marker["source_id"] in by_id:
+            continue
+        if item["minimum_payment"]["source"] != "unknown":
+            continue
+        item["minimum_payment"] = {
+            "amount": round(
+                convert(db, marker["outcome"], marker["instrument"], currency), 2
+            ),
+            "due_date": marker["date"],
+            "source": "reminder",
+            "confidence": "medium",
+        }
     return obligations
 
 

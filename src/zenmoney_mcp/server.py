@@ -298,7 +298,7 @@ def _planning_tools() -> list[Tool]:
         ),
         Tool(
             name="get_cash_flow",
-            description="Get normalized household income, spending, and net cash flow with transfers and holds excluded.",
+            description="Classify household income, operating spending, financing, transfers, and cash debt service; holds are excluded.",
             inputSchema={
                 "type": "object",
                 "properties": {

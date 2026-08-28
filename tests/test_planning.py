@@ -324,6 +324,36 @@ def test_financial_obligation_uses_nearest_reminder_payment(planning_db):
     }
 
 
+def test_financial_obligation_payment_override_skips_reminder_conversion(planning_db):
+    add_marker(
+        planning_db,
+        "usd-reminder",
+        "2026-09-18",
+        income=1,
+        outcome=1,
+        income_instrument=2,
+        outcome_instrument=2,
+        income_account="loan",
+        outcome_account="cash-usd",
+    )
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    obligations = planning._financial_obligations(
+        planning_db,
+        user_currency(planning_db),
+        {"loan": {"minimum_payment": {"amount": 250}}},
+        as_of=date(2026, 8, 23),
+    )
+
+    loan = next(item for item in obligations if item["account_id"] == "loan")
+    assert loan["minimum_payment"] == {
+        "amount": 250,
+        "due_date": None,
+        "source": "user_override",
+        "confidence": "high",
+    }
+
+
 def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):
     add_transaction(planning_db, "income", "2026-08-01", income=1_000, tag="salary")
     add_transaction(planning_db, "expense", "2026-08-02", outcome=200, tag="food")
