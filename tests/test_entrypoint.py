@@ -142,6 +142,45 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
 
 
 @pytest.mark.asyncio
+async def test_spending_baseline_schema_is_strict_and_dispatches_partial_flag(
+    monkeypatch,
+):
+    tool = {tool.name: tool for tool in await server.list_tools()}[
+        "get_spending_baseline"
+    ]
+    schema = tool.input_schema
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["include_current_partial_month"] == {
+        "type": "boolean",
+        "default": False,
+    }
+
+    observed = {}
+
+    def baseline(_db, **kwargs):
+        observed.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "get_spending_baseline", baseline)
+    db = HardenedDatabase(":memory:")
+    try:
+        content = await server.call_tool(
+            "get_spending_baseline",
+            {"include_current_partial_month": True},
+            db=db,
+        )
+    finally:
+        db.close()
+
+    assert json.loads(content[0].text) == {"ok": True}
+    assert observed == {
+        "months": 6,
+        "category_id": None,
+        "include_current_partial_month": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_entity_read_tools_are_discoverable_locally_and_remotely():
     expected = {
         "list_accounts", "get_account",

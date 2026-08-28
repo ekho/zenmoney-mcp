@@ -611,6 +611,156 @@ def test_spending_baseline_returns_requested_complete_windows(planning_db, month
     assert result["latest_complete_month"] == 0
 
 
+def test_spending_baseline_partial_month_is_excluded_from_statistics(planning_db):
+    for tx_id, tx_date, amount in (
+        ("may", "2026-05-10", 100),
+        ("june", "2026-06-10", 200),
+        ("july", "2026-07-10", 300),
+        ("partial", "2026-08-10", 500),
+    ):
+        add_transaction(planning_db, tx_id, tx_date, outcome=amount)
+
+    result = get_spending_baseline(
+        planning_db,
+        months=3,
+        as_of=date(2026, 8, 28),
+        include_current_partial_month=True,
+    )
+
+    assert result["monthly_series"][-1] == {
+        "label": "2026-08",
+        "month": "2026-08",
+        "start": "2026-08-01",
+        "end": "2026-08-28",
+        "complete": False,
+        "days_elapsed": 28,
+        "days_total": 31,
+        "outcome": 500,
+    }
+    assert result["monthly"] == result["monthly_series"]
+    assert result["median"] == 200
+
+
+def test_spending_baseline_partial_month_respects_custom_period_start(planning_db):
+    planning_db.connect().execute("UPDATE users SET month_start_day=8")
+    for tx_id, tx_date, amount in (
+        ("may", "2026-05-10", 100),
+        ("june", "2026-06-10", 200),
+        ("july", "2026-07-10", 300),
+        ("partial", "2026-08-10", 500),
+    ):
+        add_transaction(planning_db, tx_id, tx_date, outcome=amount)
+
+    result = get_spending_baseline(
+        planning_db,
+        months=3,
+        as_of=date(2026, 8, 28),
+        include_current_partial_month=True,
+    )
+
+    assert result["monthly_series"][-1] == {
+        "label": "2026-08",
+        "month": "2026-08",
+        "start": "2026-08-08",
+        "end": "2026-08-28",
+        "complete": False,
+        "days_elapsed": 21,
+        "days_total": 31,
+        "outcome": 500,
+    }
+    assert result["median"] == 200
+
+
+def test_spending_baseline_uses_ten_percent_trimmed_mean(planning_db):
+    for month, amount in zip(
+        range(10, 0, -1), [1, 1, 1, 1, 1, 1, 1, 1, 100, 1_000]
+    ):
+        add_transaction(
+            planning_db, f"trim-{month}", f"2026-{month:02d}-10", outcome=amount
+        )
+
+    result = get_spending_baseline(
+        planning_db, months=10, as_of=date(2026, 11, 28)
+    )
+
+    assert result["trimmed_mean"] == 13.38
+    assert result["trimmed_mean_method"] == (
+        "statistics.fmean after floor(10%) from each tail"
+    )
+
+
+def test_spending_baseline_classifies_expense_patterns(planning_db):
+    planning_db.connect().execute(
+        "INSERT INTO merchants(id,title,user,changed) VALUES ('net','Net Service',1,1)"
+    )
+    events = {
+        "monthly": [("2026-05-01", 100), ("2026-06-01", 105), ("2026-07-01", 95)],
+        "quarterly": [("2025-10-10", 200), ("2026-01-08", 200), ("2026-04-08", 200)],
+        "semiannual": [("2025-02-01", 300), ("2025-08-01", 300), ("2026-02-01", 300)],
+        "annual": [("2024-08-10", 400), ("2025-08-10", 400)],
+        "one-off": [("2026-04-11", 500)],
+        "unknown": [("2026-05-02", 100), ("2026-06-02", 140), ("2026-07-02", 100)],
+    }
+    for name, entries in events.items():
+        for index, (tx_date, amount) in enumerate(entries):
+            add_transaction(
+                planning_db,
+                f"{name}-{index}",
+                tx_date,
+                outcome=amount,
+                tag="food",
+                payee=name,
+                merchant="net" if name == "monthly" else None,
+                outcome_account="credit" if name == "one-off" else "cash-rub",
+            )
+
+    result = get_spending_baseline(
+        planning_db, months=24, as_of=date(2026, 8, 28)
+    )
+
+    classes = {item["name"]: item["classification"] for item in result["expense_patterns"]}
+    assert classes == {
+        "Net Service": "recurring_monthly",
+        "quarterly": "likely_quarterly",
+        "semiannual": "likely_semiannual",
+        "annual": "likely_annual",
+        "one-off": "one_off",
+        "unknown": "unknown",
+    }
+    assert result["pattern_summary"]["by_class"] == {
+        "recurring_monthly": 1,
+        "likely_quarterly": 1,
+        "likely_semiannual": 1,
+        "likely_annual": 1,
+        "one_off": 1,
+        "unknown": 1,
+    }
+    assert result["expense_patterns"][0]["total_amount"] == 900
+    assert result["patterns_total"] == result["patterns_returned"] == 6
+    assert result["patterns_truncated"] is False
+
+
+def test_spending_baseline_limits_expense_patterns_to_top_hundred(planning_db):
+    for index in range(101):
+        add_transaction(
+            planning_db,
+            f"one-off-{index}",
+            "2026-07-10",
+            outcome=index + 1,
+            tag="food",
+            payee=f"Merchant {index}",
+        )
+
+    result = get_spending_baseline(
+        planning_db, months=3, as_of=date(2026, 8, 28)
+    )
+
+    assert result["patterns_total"] == 101
+    assert result["patterns_returned"] == len(result["expense_patterns"]) == 100
+    assert result["patterns_truncated"] is True
+    assert result["expense_patterns"][0]["total_amount"] == 101
+
+
 def test_spending_baseline_median_resists_outlier_and_includes_descendants(planning_db):
     for index, (month, amount) in enumerate(
         [(2, 100), (3, 100), (4, 100), (5, 10_000), (6, 100), (7, 200)]

@@ -350,7 +350,12 @@ def _planning_tools() -> list[Tool]:
                         "minLength": 1,
                         "description": "Optional category ID; descendants are included",
                     },
+                    "include_current_partial_month": {
+                        "type": "boolean",
+                        "default": False,
+                    },
                 },
+                "additionalProperties": False,
             },
         ),
         Tool(
@@ -2092,6 +2097,9 @@ async def _dispatch_tool(
             db,
             months=arguments.get("months", 6),
             category_id=arguments.get("category_id"),
+            include_current_partial_month=arguments.get(
+                "include_current_partial_month", False
+            ),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
