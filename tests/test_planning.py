@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from zenmoney_mcp import planning
 from zenmoney_mcp.hardened_database import CurrencyRateError, HardenedDatabase
 from zenmoney_mcp.money import FinancialDataError, convert, user_currency
 from zenmoney_mcp.periods import completed_periods
@@ -154,6 +155,173 @@ def test_convert_rejects_missing_rate(planning_db):
 
 def test_convert_zero_does_not_require_stale_instrument(planning_db):
     assert convert(planning_db, 0, 999, user_currency(planning_db)) == 0
+
+
+def test_financial_obligations_include_every_active_negative_account(planning_db):
+    planning_db.connect().executemany(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES (?,?,?,?,?,?,0,?,1,1)",
+        [
+            ("installment", "Installment", "checking", 1, -300, 0, 0),
+            ("personal", "Personal", "debt", 1, -200, 1, 0),
+            ("odd", "Odd", "cash", 1, -100, 1, 0),
+            ("positive", "Positive", "loan", 1, 100, 1, 0),
+            ("zero", "Zero", "debt", 1, 0, 1, 0),
+            ("archived", "Archived", "loan", 1, -400, 1, 1),
+        ],
+    )
+
+    obligations = planning._financial_obligations(
+        planning_db, user_currency(planning_db), as_of=date(2026, 8, 23)
+    )
+
+    assert [item["account_id"] for item in obligations] == [
+        "credit",
+        "installment",
+        "loan",
+        "odd",
+        "personal",
+    ]
+    by_id = {item["account_id"]: item for item in obligations}
+    assert by_id["loan"]["classification"] == "loan"
+    assert by_id["credit"]["classification"] == "credit_card"
+    assert by_id["personal"]["classification"] == "personal_debt"
+    assert by_id["installment"]["classification"] == "other"
+    assert by_id["installment"]["classification_confidence"] == "low"
+    assert by_id["installment"]["in_balance"] is False
+    assert by_id["installment"]["balance"] == 300
+    assert by_id["installment"]["minimum_payment"] == {
+        "amount": None,
+        "due_date": None,
+        "source": "unknown",
+        "confidence": "low",
+    }
+    assert by_id["installment"]["apr_pct"] == {
+        "value": None,
+        "source": "unknown",
+    }
+    assert by_id["odd"]["classification"] == "other"
+
+
+def test_financial_obligation_overrides_are_explicit(planning_db):
+    obligations = planning._financial_obligations(
+        planning_db,
+        user_currency(planning_db),
+        {
+            "credit": {
+                "classification": "installment",
+                "minimum_payment": {"amount": 250, "due_date": "2026-09-18"},
+                "apr_pct": 19.9,
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    credit = next(item for item in obligations if item["account_id"] == "credit")
+    assert credit["classification"] == "installment"
+    assert credit["classification_confidence"] == "high"
+    assert credit["minimum_payment"] == {
+        "amount": 250,
+        "due_date": "2026-09-18",
+        "source": "user_override",
+        "confidence": "high",
+    }
+    assert credit["apr_pct"] == {"value": 19.9, "source": "user_override"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error_path"),
+    [
+        ({"missing": {"classification": "loan"}}, "obligation_overrides.missing"),
+        (
+            {"cash-rub": {"classification": "loan"}},
+            "obligation_overrides.cash-rub",
+        ),
+        ({"credit": {"guess": "loan"}}, "obligation_overrides.credit.guess"),
+        (
+            {"credit": {"classification": "mortgage"}},
+            "obligation_overrides.credit.classification",
+        ),
+        (
+            {"credit": {"classification": []}},
+            "obligation_overrides.credit.classification",
+        ),
+        (
+            {"credit": {"minimum_payment": {"amount": -1}}},
+            "obligation_overrides.credit.minimum_payment.amount",
+        ),
+        (
+            {
+                "credit": {
+                    "minimum_payment": {"amount": 1, "due_date": "2026-02-30"}
+                }
+            },
+            "obligation_overrides.credit.minimum_payment.due_date",
+        ),
+        (
+            {str(index): {"classification": "loan"} for index in range(51)},
+            "obligation_overrides",
+        ),
+    ],
+)
+def test_financial_obligation_overrides_are_strict(
+    planning_db, overrides, error_path
+):
+    with pytest.raises(InputValidationError, match=error_path):
+        planning._financial_obligations(
+            planning_db,
+            user_currency(planning_db),
+            overrides,
+            as_of=date(2026, 8, 23),
+        )
+
+
+def test_financial_obligation_uses_nearest_reminder_payment(planning_db):
+    add_marker(
+        planning_db,
+        "excluded-source",
+        "2026-09-01",
+        income=100,
+        outcome=100,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="excluded",
+    )
+    add_marker(
+        planning_db,
+        "nearest",
+        "2026-09-18",
+        income=500,
+        outcome=500,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+    add_marker(
+        planning_db,
+        "later",
+        "2026-10-18",
+        income=700,
+        outcome=700,
+        income_instrument=1,
+        outcome_instrument=1,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+
+    obligations = planning._financial_obligations(
+        planning_db, user_currency(planning_db), as_of=date(2026, 8, 23)
+    )
+
+    loan = next(item for item in obligations if item["account_id"] == "loan")
+    assert loan["minimum_payment"] == {
+        "amount": 500,
+        "due_date": "2026-09-18",
+        "source": "reminder",
+        "confidence": "medium",
+    }
 
 
 def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):

@@ -17,7 +17,26 @@ from .periods import (
     completed_periods,
     resolve_period,
 )
-from .validation import InputValidationError, bounded_int, non_negative_number
+from .validation import (
+    InputValidationError,
+    bounded_int,
+    non_negative_number,
+    parse_iso_date,
+)
+
+
+_OBLIGATION_CLASSES = {
+    "loan": ("loan", "high"),
+    "ccard": ("credit_card", "high"),
+    "debt": ("personal_debt", "high"),
+}
+_VALID_OBLIGATION_CLASSES = {
+    "loan",
+    "credit_card",
+    "installment",
+    "personal_debt",
+    "other",
+}
 
 
 def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
@@ -44,6 +63,138 @@ def _data_quality(db: Any, as_of: date | None = None) -> dict[str, Any]:
         "missing_exchange_rates": [],
         "warnings": [],
     }
+
+
+def _financial_obligations(
+    db: Any,
+    currency: CurrencyContext,
+    overrides: dict[str, Any] | None = None,
+    *,
+    as_of: date | None = None,
+) -> list[dict[str, Any]]:
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict) or len(overrides) > 50:
+        raise InputValidationError(
+            "obligation_overrides must be an object with at most 50 accounts"
+        )
+    rows = db.connect().execute(
+        """SELECT id,title,type,instrument,balance,in_balance
+           FROM accounts
+           WHERE COALESCE(archive,0)=0
+           ORDER BY title,id"""
+    ).fetchall()
+    obligations = []
+    for row in rows:
+        balance = convert(db, row["balance"], row["instrument"], currency)
+        if balance >= 0:
+            continue
+        classification, confidence = _OBLIGATION_CLASSES.get(
+            row["type"], ("other", "low")
+        )
+        obligations.append(
+            {
+                "account_id": row["id"],
+                "title": row["title"],
+                "classification": classification,
+                "classification_confidence": confidence,
+                "balance": round(-balance, 2),
+                "currency": currency.code,
+                "source_account_type": row["type"],
+                "in_balance": bool(row["in_balance"]),
+                "minimum_payment": {
+                    "amount": None,
+                    "due_date": None,
+                    "source": "unknown",
+                    "confidence": "low",
+                },
+                "apr_pct": {"value": None, "source": "unknown"},
+            }
+        )
+    by_id = {item["account_id"]: item for item in obligations}
+    marker_rows = db.connect().execute(
+        """SELECT rm.date,rm.income_account AS obligation_id,
+                  rm.outcome,
+                  COALESCE(rm.outcome_instrument,source.instrument) AS instrument,
+                  source.id AS source_id
+           FROM reminder_markers rm
+           JOIN accounts source ON source.id=rm.outcome_account
+           WHERE rm.state='planned' AND rm.date>=?
+             AND rm.income>0 AND rm.outcome>0
+             AND COALESCE(source.archive,0)=0
+             AND (source.in_balance IS NULL OR source.in_balance!=0)
+           ORDER BY rm.date,rm.id""",
+        ((as_of or date.today()).isoformat(),),
+    ).fetchall()
+    for marker in marker_rows:
+        item = by_id.get(marker["obligation_id"])
+        if item is None or marker["source_id"] in by_id:
+            continue
+        if item["minimum_payment"]["source"] != "unknown":
+            continue
+        item["minimum_payment"] = {
+            "amount": round(
+                convert(db, marker["outcome"], marker["instrument"], currency), 2
+            ),
+            "due_date": marker["date"],
+            "source": "reminder",
+            "confidence": "medium",
+        }
+
+    for account_id, override in overrides.items():
+        path = f"obligation_overrides.{account_id}"
+        item = by_id.get(account_id)
+        if item is None:
+            raise InputValidationError(f"{path} must identify an active obligation")
+        if not isinstance(override, dict) or not override:
+            raise InputValidationError(f"{path} must be a non-empty object")
+        unknown = set(override) - {
+            "classification",
+            "minimum_payment",
+            "apr_pct",
+        }
+        if unknown:
+            raise InputValidationError(f"{path}.{sorted(unknown)[0]} is not supported")
+
+        if "classification" in override:
+            classification = override["classification"]
+            if (
+                not isinstance(classification, str)
+                or classification not in _VALID_OBLIGATION_CLASSES
+            ):
+                raise InputValidationError(f"{path}.classification is invalid")
+            item["classification"] = classification
+            item["classification_confidence"] = "high"
+
+        if "minimum_payment" in override:
+            payment = override["minimum_payment"]
+            payment_path = f"{path}.minimum_payment"
+            if not isinstance(payment, dict):
+                raise InputValidationError(f"{payment_path} must be an object")
+            unknown_payment = set(payment) - {"amount", "due_date"}
+            if unknown_payment:
+                raise InputValidationError(
+                    f"{payment_path}.{sorted(unknown_payment)[0]} is not supported"
+                )
+            if "amount" not in payment:
+                raise InputValidationError(f"{payment_path}.amount is required")
+            amount = non_negative_number(payment["amount"], f"{payment_path}.amount")
+            due_date = payment.get("due_date")
+            if due_date is not None:
+                due_date = parse_iso_date(
+                    due_date, f"{payment_path}.due_date"
+                ).isoformat()
+            item["minimum_payment"] = {
+                "amount": round(amount, 2),
+                "due_date": due_date,
+                "source": "user_override",
+                "confidence": "high",
+            }
+
+        if "apr_pct" in override:
+            apr = non_negative_number(override["apr_pct"], f"{path}.apr_pct")
+            item["apr_pct"] = {"value": apr, "source": "user_override"}
+    return obligations
 
 
 def _cash_flow_for_dates(
