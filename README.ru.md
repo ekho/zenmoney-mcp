@@ -65,6 +65,35 @@ Tag, Merchant, Reminder, ReminderMarker, Transaction и Budget. Кроме ни�
 валюты, статус синхронизации и финансовый снимок только из кеша по адресу
 `zenmoney://financial-snapshot`. Чтение ресурса никогда не запускает синхронизацию.
 
+### Контракты синхронизации и аномалий
+
+Публичные timestamps синхронизации (`requested_at`, `started_at`, `finished_at`,
+`last_sync_time` и planning `data_quality.last_sync`) — строки RFC3339 UTC с
+суффиксом `Z`; недоступное значение равно `null`. Кеш и управляющее состояние
+по-прежнему хранят целые Unix epoch. `last_server_timestamp` остаётся числовым
+cursor дельт ZenMoney, а не timestamp синхронизации.
+
+`detect_anomalies` возвращает ограниченные `exact_duplicates` (один день, сумма
+в пользовательской валюте до цента, нормализованный merchant/payee, категория и
+outcome account), `same_merchant_amount_close_timestamp` (тот же merchant/payee,
+точная сумма и разница до одного дня), `near_duplicates` (тот же нормализованный
+merchant/payee и категория, до двух дней и 5% разницы суммы),
+`periodic_recurrences` и `unusually_large_one_off`. В кеше есть дата, но нет
+времени операции, поэтому сигналы дубликатов содержат `timestamp_precision:
+"day"`. Для периодичности читается не более 400 дней истории до конца выбранного
+периода, одинаковые category и суммы в пользовательской валюте, округлённые до
+цента, группируются по уникальным датам; возвращаются только повторы,
+затрагивающие выбранный период: monthly 25–35 дней (минимум 3 события), quarterly
+80–100, semiannual 170–195 и annual 350–380 (минимум по 2). ID периодических
+операций исключаются из разовых аномалий. Каждый новый список и сохранённые aliases
+`outliers` и `possible_duplicates` содержат не более 15 результатов; `summary`
+хранит полные счётчики и `results_truncated`.
+
+MCP discovery объявляет для каждого инструмента общую output schema
+`{"type":"object"}`. На границе протокола ответ содержит native object в
+`structuredContent` и идентичный JSON object в `TextContent` для клиентов,
+которым всё ещё нужен текстовый fallback.
+
 ## Подтверждённые изменения пользовательских сущностей
 
 Любая запись проходит в два отдельных вызова. Для обычной работы выберите
@@ -297,6 +326,15 @@ SDK v2 и усиленную среду выполнения, без оверл�
 токен ZenMoney, не может записывать финансовый снимок и не обращается к ZenMoney
 напрямую. Подробности есть в [инструкции по удалённой эксплуатации](deploy/remote-mcp/README.md)
 и [модели угроз](docs/remote-mcp-threat-model.md).
+
+`force_sync(force_full=false, wait_until_complete=false)` по умолчанию
+асинхронен. При `wait_until_complete=true` он ждёт только тот же request ID,
+опрашивая валидированное управляющее состояние каждые 0,25 с не более фиксированных
+60 с. Terminal result — `completed` или `failed`; timeout возвращает
+`status: "timeout"`, текущее состояние `pending` или `running` и
+`wait_timed_out: true`, не отменяя воркер. Некорректное или заменённое состояние
+fail closed с `invalid_sync_state`; pending или running request остаётся
+single-flight.
 
 ## Усиления в этом форке
 
