@@ -16,7 +16,7 @@ MCP-сервер для надёжной аналитики личных фин�
 
 ## Полный каталог инструментов
 
-Локальный и удалённый режимы открывают по 57 инструментов. Из них 55 общие,
+Локальный и удалённый режимы открывают по 59 инструментов. Из них 57 общие,
 ещё по два отвечают за синхронизацию и подбор категорий в конкретном режиме.
 
 | Область | Инструменты |
@@ -25,7 +25,7 @@ MCP-сервер для надёжной аналитики личных фин�
 | Аналитика для планирования | `get_financial_snapshot`, `get_financial_position`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
 | Поддержка решений | `plan_emergency_fund`, `plan_debt_payoff`, `compare_debt_strategies`, `plan_financial_goal`, `plan_multiple_goals`, `run_financial_scenario`, `build_financial_plan` |
 | Чтение сущностей | `list_accounts`, `get_account`, `list_tags`, `get_tag`, `list_merchants`, `get_merchant`, `list_reminders`, `get_reminder`, `list_reminder_markers`, `get_reminder_marker`, `list_transactions`, `get_transaction`, `list_budgets`, `get_budget` |
-| Подтверждённые изменения сущностей | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_mixed_changes`, `get_change_proposal`, `apply_changes` |
+| Подтверждённые изменения сущностей | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_changes`, `prepare_mixed_changes`, `prepare_recurring_payment`, `get_change_proposal`, `apply_changes` |
 
 | Режим | Инструменты режима |
 |---|---|
@@ -68,15 +68,18 @@ Tag, Merchant, Reminder, ReminderMarker, Transaction и Budget. Кроме ни�
 ## Подтверждённые изменения пользовательских сущностей
 
 Любая запись проходит в два отдельных вызова. Для обычной работы выберите
-инструмент подготовки нужной сущности. Используйте `prepare_mixed_changes`, если
-одно предложение создаёт или меняет несколько связанных типов сущностей:
+инструмент подготовки нужной сущности. Если одно предложение создаёт или меняет
+несколько связанных типов сущностей, используйте основной `prepare_changes`.
+`prepare_mixed_changes` — совместимый alias с той же строгой схемой
+`operations[]`:
 
 ```text
 prepare_account_changes        prepare_tag_changes
 prepare_merchant_changes       prepare_reminder_changes
 prepare_reminder_marker_changes
 prepare_transaction_changes    prepare_budget_changes
-prepare_mixed_changes
+prepare_changes                 prepare_mixed_changes (совместимый alias)
+prepare_recurring_payment
 get_change_proposal            apply_changes
 ```
 
@@ -86,11 +89,13 @@ get_change_proposal            apply_changes
 `get_change_proposal`.
 
 Перед подготовкой нужна успешная полная синхронизация: так сервер сохранит поля
-ZenMoney, которых изменение не касается. Если после подготовки исходная сущность
-изменилась, применение отклонит предложение целиком ещё до записи. Связанные
-сущности создаются слоями по зависимостям, потому что API ZenMoney не всегда
-безопасно принимает все зависимости одним запросом Diff. Неудачный слой сервер
-не повторяет и автоматически не откатывает.
+ZenMoney, которых изменение не касается. При применении сервер синхронизируется
+и, если исходная сущность изменилась, отклонит предложение целиком ещё до записи.
+Ссылки `{"ref": "..."}` между созданиями разрешаются при подготовке, поэтому одно
+предложение соответствует одному mixed-запросу `/v8/diff/`. Это граница
+атомарности: при ошибке после отправки результат неизвестен, предложение получит
+`needs_review` с `write_result_unknown`, а сервер не повторит запись автоматически.
+Повторный `apply_changes` для завершённого предложения ничего не отправляет.
 
 Создание и обновление поддерживаются для всех семи пользовательских сущностей.
 При безопасном удалении Account архивируется, Transaction или ReminderMarker
@@ -117,6 +122,49 @@ ZenMoney, которых изменение не касается. Если по
   }]
 }
 ```
+
+`prepare_recurring_payment` готовит обычный ежемесячный расход и первую
+запланированную операцию без записи. Точный payload:
+
+```json
+{
+  "name": "Кредитка Т-Банк",
+  "amount": 28060,
+  "account_id": "account-id",
+  "category_id": "category-id",
+  "frequency": "monthly",
+  "day_of_month": 18,
+  "start_date": "2026-09-18",
+  "end_date": null,
+  "notify": true
+}
+```
+
+Поддерживаются только положительная сумма и `monthly`. `start_date` — ISO-дата,
+день которой совпадает с `day_of_month`; `end_date`, если задана, не может быть
+раньше. Счёт должен быть активным, а категория — принадлежать его владельцу.
+Результат — обычное mixed-предложение из `Reminder` (`interval="month"`,
+`step=1`, `points=[0]`) и первого запланированного `ReminderMarker` на
+`start_date`. У обеих сущностей одинаковы счёт/instrument, категория, `notify`,
+payee и односторонний расход (`income=0`, `outcome=amount`); записать их может
+только `apply_changes`.
+
+`get_spending_baseline` использует 3–24 полных бюджетных месяца. При
+`include_current_partial_month=true` он добавляет текущий период до даты расчёта
+в канонический `monthly_series`; `monthly` остаётся совместимым alias. У
+частичной строки `complete=false`, `days_elapsed` и `days_total`, но она не
+участвует ни в статистике, ни в поиске периодичности. `trimmed_mean` сортирует
+полные значения, отбрасывает с каждого края `floor(n * 10%)`, затем считает
+`fmean`.
+
+`expense_patterns` группирует завершённые односторонние операционные расходы по
+нормализованному merchant/payee и категории, приведя суммы к валюте пользователя.
+Классы: `recurring_monthly` (минимум 3 события, интервалы 25–35 дней),
+`likely_quarterly` (минимум 2, 80–100), `likely_semiannual` (минимум 2, 170–195),
+`likely_annual` (минимум 2, 350–380), `one_off` (одно событие) и `unknown`.
+Для периодических классов разброс суммы не превышает 20% среднего. Это
+историческая эвристика, а не прогноз: ответ содержит количество и сводку классов,
+возвращает только 100 групп с наибольшей суммой и явно отмечает truncation.
 
 Аналитика для планирования намеренно осторожна:
 

@@ -221,7 +221,8 @@ remaining rows after the cursor. Uncategorized means `tag IS NULL` or an empty
 JSON category array.
 
 Transaction split is a confirmed write, never a direct client-side sequence.
-`prepare_transaction_changes` or `prepare_mixed_changes` expands one `split`
+`prepare_transaction_changes` or preferred `prepare_changes` (with compatible
+`prepare_mixed_changes` alias) expands one `split`
 operation into an update of the source transaction and creates for the remaining
 parts. Only a full, posted, undeleted one-sided income or outcome can be split;
 transfers and holds are rejected. There must be 2–100 positive parts whose amounts
@@ -234,6 +235,70 @@ are divided with `Decimal`; cumulative half-up rounding keeps each operation
 amount non-negative and puts the exact residual into the last part. All split
 items are sent in one Diff batch. A changed source rejects the proposal before
 write, and applying a terminal proposal again does not resend it.
+
+## Confirmed mixed changes and recurring payments
+
+`prepare_changes` is the public mixed-entity prepare tool. It accepts the same
+strict `operations[]` schema as the compatible `prepare_mixed_changes` alias.
+Preparing resolves create references such as `{"ref":"new-reminder"}` to UUIDs.
+After preflight synchronization and `changed` conflict checks, one immutable
+proposal becomes one mixed `/v8/diff/` write request. A send failure is an
+external ambiguity, not a retry signal: the proposal becomes `needs_review`
+with `write_result_unknown`; applying a terminal proposal sends no new request.
+
+`prepare_recurring_payment` is a prepare-only shortcut for one monthly expense:
+
+```json
+{
+  "name": "T-Bank credit card",
+  "amount": 28060,
+  "account_id": "account-id",
+  "category_id": "category-id",
+  "frequency": "monthly",
+  "day_of_month": 18,
+  "start_date": "2026-09-18",
+  "end_date": null,
+  "notify": true
+}
+```
+
+All fields are required; only a positive amount and `monthly` frequency are
+accepted. The ISO `start_date` day must equal `day_of_month`, `end_date` cannot
+precede it, the Account must be active, and the Tag must have the same owner.
+The resulting mixed proposal creates a monthly `Reminder` (`interval="month"`,
+`step=1`, `points=[0]`) and its first planned `ReminderMarker` on `start_date`.
+Both carry the same account/instrument, tag, payee, `notify`, and one-sided
+expense (`income=0`, `outcome=amount`). Only `apply_changes` writes either one.
+
+## Spending baseline and expense patterns
+
+`get_spending_baseline` selects 3–24 completed budget months. With
+`include_current_partial_month=true`, it appends the current period through the
+calculation date as `complete=false` with `days_elapsed` and `days_total`.
+`monthly_series` is the canonical series and `monthly` is its compatibility
+alias. The partial row is excluded from mean, median, quartiles, min/max,
+trimmed mean, and pattern detection.
+
+`trimmed_mean` sorts completed monthly values, removes `floor(n * 0.10)` from
+each tail, then applies `statistics.fmean`; it equals the ordinary mean when
+that count is zero. `expense_patterns` groups completed one-sided operating
+expenses by normalized merchant/payee and category after conversion to the user
+currency. Classification is deterministic:
+
+| Class | Events and every interval |
+|---|---|
+| `recurring_monthly` | at least 3; 25–35 days |
+| `likely_quarterly` | at least 2; 80–100 days |
+| `likely_semiannual` | at least 2; 170–195 days |
+| `likely_annual` | at least 2; 350–380 days |
+| `one_off` | exactly 1; `low` confidence |
+| `unknown` | all other groups; `low` confidence |
+
+Every periodic class also requires `(max amount - min amount) / mean amount <=
+20%` and reports `medium` confidence. These are historical heuristics, not
+future-payment predictions. Results include the method, counts by class, total
+group count, and at most the 100 largest groups by total amount; truncation is
+explicit through `patterns_truncated` and `pattern_summary.truncated`.
 
 ## Goals
 

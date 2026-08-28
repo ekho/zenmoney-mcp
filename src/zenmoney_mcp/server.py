@@ -94,6 +94,7 @@ from .mutations import (
     execute_proposal,
     get_change_proposal,
     prepare_changes,
+    prepare_recurring_payment,
 )
 
 
@@ -117,7 +118,9 @@ PREPARE_TOOL_ENTITIES = {
 MUTATION_TOOLS = frozenset(
     {
         *PREPARE_TOOL_ENTITIES,
+        "prepare_changes",
         "prepare_mixed_changes",
+        "prepare_recurring_payment",
         "get_change_proposal",
         "apply_changes",
     }
@@ -347,7 +350,12 @@ def _planning_tools() -> list[Tool]:
                         "minLength": 1,
                         "description": "Optional category ID; descendants are included",
                     },
+                    "include_current_partial_month": {
+                        "type": "boolean",
+                        "default": False,
+                    },
                 },
+                "additionalProperties": False,
             },
         ),
         Tool(
@@ -1092,17 +1100,46 @@ def _mutation_tools() -> list[Tool]:
         )
         for name, entity_type in PREPARE_TOOL_ENTITIES.items()
     ]
-    prepare_tools.append(
+    mixed_schema = prepare_schema(None)
+    recurring_payment_schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "amount": {"type": "number", "exclusiveMinimum": 0},
+            "account_id": {"type": "string", "minLength": 1},
+            "category_id": {"type": "string", "minLength": 1},
+            "frequency": {"const": "monthly"},
+            "day_of_month": {"type": "integer", "minimum": 1, "maximum": 31},
+            "start_date": {"type": "string", "pattern": _DATE_PATTERN},
+            "end_date": nullable(date_schema),
+            "notify": {"type": "boolean"},
+        },
+        "required": [
+            "name", "amount", "account_id", "category_id", "frequency",
+            "day_of_month", "start_date", "end_date", "notify",
+        ],
+        "additionalProperties": False,
+    }
+    prepare_tools.extend(
         Tool(
-            name="prepare_mixed_changes",
+            name=name,
             description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
-            inputSchema=prepare_schema(None),
+            inputSchema=mixed_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
             ),
         )
+        for name in ("prepare_changes", "prepare_mixed_changes")
     )
     return prepare_tools + [
+        Tool(
+            name="prepare_recurring_payment",
+            description="Prepare one monthly recurring expense and its first planned marker for review without writing to ZenMoney.",
+            inputSchema=recurring_payment_schema,
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, openWorldHint=False
+            ),
+        ),
         Tool(
             name="get_change_proposal",
             description="Read a prepared or executed change proposal by ID.",
@@ -1671,7 +1708,9 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                     not in {
                         "force_sync",
                         *PREPARE_TOOL_ENTITIES,
+                        "prepare_changes",
                         "prepare_mixed_changes",
+                        "prepare_recurring_payment",
                         "apply_changes",
                     },
                     destructiveHint=tool.name == "apply_changes",
@@ -1815,7 +1854,18 @@ async def _dispatch_mutation_tool(
 ) -> list[TextContent]:
     store = ProposalStore(mutation_path)
     try:
-        if name in PREPARE_TOOL_ENTITIES or name == "prepare_mixed_changes":
+        if name == "prepare_recurring_payment":
+            try:
+                result = prepare_recurring_payment(db, store, arguments)
+            except MutationStateError:
+                result = {"status": "rejected", "failure_code": "mutation_not_ready"}
+            except MutationValidationError:
+                result = {"status": "rejected", "failure_code": "invalid_changes"}
+            return _text_result(result)
+
+        if name in PREPARE_TOOL_ENTITIES or name in {
+            "prepare_changes", "prepare_mixed_changes"
+        }:
             if set(arguments) != {"operations"}:
                 raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
             try:
@@ -2043,10 +2093,19 @@ async def _dispatch_tool(
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_spending_baseline":
+        if set(arguments) - {
+            "months",
+            "category_id",
+            "include_current_partial_month",
+        } or type(arguments.get("include_current_partial_month", False)) is not bool:
+            raise MCPError(INVALID_PARAMS, "Invalid tool arguments")
         result = get_spending_baseline(
             db,
             months=arguments.get("months", 6),
             category_id=arguments.get("category_id"),
+            include_current_partial_month=arguments.get(
+                "include_current_partial_month", False
+            ),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 

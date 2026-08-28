@@ -16,6 +16,7 @@ from .periods import (
     comparison_periods as resolve_comparison_periods,
     complete_months_with_activity,
     completed_periods,
+    current_period,
     resolve_period,
 )
 from .validation import (
@@ -475,45 +476,207 @@ def _descendant_category_ids(db: Any, category_id: str) -> set[str]:
     return {str(row["id"]) for row in rows}
 
 
+def _expense_patterns(
+    db: Any, periods: list[Period], category_ids: set[str] | None
+) -> tuple[list[dict[str, Any]], dict[str, Any], int, bool]:
+    currency = user_currency(db)
+    obligation_ids = {row["id"] for row in _financial_obligation_accounts(db)}
+    rows = db.connect().execute(
+        """SELECT t.id,t.date,t.outcome,t.outcome_instrument,t.payee,
+                  m.title AS merchant,t.tag,tag.title AS category,
+                  oa.id AS outcome_account_id,oa.balance AS outcome_account_balance,
+                  COALESCE(oa.archive,0) AS outcome_archive,
+                  oa.in_balance AS outcome_in_balance
+           FROM transactions t
+           LEFT JOIN accounts oa ON oa.id=t.outcome_account
+           LEFT JOIN merchants m ON m.id=t.merchant
+           LEFT JOIN tags tag ON tag.id=json_extract(t.tag,'$[0]')
+           WHERE COALESCE(t.deleted,0)=0 AND COALESCE(t.hold,0)=0
+             AND COALESCE(t.income,0)=0 AND t.outcome>0 AND t.date BETWEEN ? AND ?
+           ORDER BY t.date,t.id""",
+        (periods[0].start.isoformat(), periods[-1].end.isoformat()),
+    ).fetchall()
+    groups: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for row in rows:
+        try:
+            tags = json.loads(row["tag"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            tags = []
+        category_id = str(tags[0]) if isinstance(tags, list) and tags else None
+        if category_ids is not None and category_id not in category_ids:
+            continue
+        outcome_obligation = row["outcome_account_id"] in obligation_ids
+        outcome_asset = bool(
+            row["outcome_account_id"]
+            and not outcome_obligation
+            and not row["outcome_archive"]
+            and row["outcome_in_balance"] != 0
+        )
+        if not (outcome_asset or outcome_obligation):
+            continue
+        name = row["merchant"] or row["payee"] or "Unspecified"
+        normalized_name = _normalize_name(row["merchant"] or row["payee"])
+        group = groups.setdefault(
+            (normalized_name or str(row["id"]), category_id),
+            {
+                "name": name,
+                "normalized_name": normalized_name,
+                "category_id": category_id,
+                "category": row["category"] or "Uncategorized",
+                "dates": [],
+                "amounts": [],
+            },
+        )
+        group["dates"].append(date.fromisoformat(row["date"]))
+        group["amounts"].append(
+            convert(db, row["outcome"], row["outcome_instrument"], currency)
+        )
+
+    classes = (
+        "recurring_monthly",
+        "likely_quarterly",
+        "likely_semiannual",
+        "likely_annual",
+        "one_off",
+        "unknown",
+    )
+    class_counts = {classification: 0 for classification in classes}
+    patterns = []
+    for group in groups.values():
+        amounts = group["amounts"]
+        intervals = [
+            (right - left).days
+            for left, right in zip(group["dates"], group["dates"][1:])
+        ]
+        average_amount = statistics.fmean(amounts)
+        stable = average_amount > 0 and (
+            max(amounts) - min(amounts)
+        ) / average_amount <= 0.20
+        if len(amounts) >= 3 and stable and all(25 <= days <= 35 for days in intervals):
+            classification, confidence = "recurring_monthly", "medium"
+        elif len(amounts) >= 2 and stable and all(80 <= days <= 100 for days in intervals):
+            classification, confidence = "likely_quarterly", "medium"
+        elif len(amounts) >= 2 and stable and all(170 <= days <= 195 for days in intervals):
+            classification, confidence = "likely_semiannual", "medium"
+        elif len(amounts) >= 2 and stable and all(350 <= days <= 380 for days in intervals):
+            classification, confidence = "likely_annual", "medium"
+        elif len(amounts) == 1:
+            classification, confidence = "one_off", "low"
+        else:
+            classification, confidence = "unknown", "low"
+        class_counts[classification] += 1
+        patterns.append(
+            {
+                "name": group["name"],
+                "normalized_name": group["normalized_name"],
+                "category_id": group["category_id"],
+                "category": group["category"],
+                "classification": classification,
+                "confidence": confidence,
+                "event_count": len(amounts),
+                "intervals_days": intervals,
+                "average_amount": round(average_amount, 2),
+                "total_amount": round(sum(amounts), 2),
+            }
+        )
+    patterns.sort(
+        key=lambda item: (-item["total_amount"], item["normalized_name"], item["category_id"] or "")
+    )
+    total = len(patterns)
+    truncated = total > 100
+    returned = patterns[:100]
+    return (
+        returned,
+        {
+            "method": "one-sided operating expenses grouped by normalized merchant/payee and category",
+            "by_class": class_counts,
+            **class_counts,
+            "groups_total": total,
+            "groups_returned": len(returned),
+            "truncated": truncated,
+        },
+        total,
+        truncated,
+    )
+
+
 def get_spending_baseline(
     db: Any,
     months: int = 6,
     category_id: str | None = None,
     *,
     as_of: date | None = None,
+    include_current_partial_month: bool = False,
 ) -> dict[str, Any]:
     months = bounded_int(months, "months", default=6, minimum=3, maximum=24)
     selected = completed_periods(db, months, as_of)
     category_ids = _descendant_category_ids(db, category_id) if category_id else None
-    monthly = []
+    monthly_series = []
     values = []
     for period in selected:
         outcome = _cash_flow_for_dates(
             db, period.start, period.end, category_ids
         )["operating_expenses"]
         values.append(outcome)
-        monthly.append(
+        days_total = (period.end - period.start).days + 1
+        monthly_series.append(
             {
                 "label": period.label,
+                "month": period.label,
                 "start": period.start.isoformat(),
                 "end": period.end.isoformat(),
+                "complete": True,
+                "days_elapsed": days_total,
+                "days_total": days_total,
                 "outcome": outcome,
             }
         )
     baseline = statistics.median(values)
     p25, _, p75 = statistics.quantiles(values, n=4, method="inclusive")
     latest = values[-1]
+    trim_count = len(values) // 10
+    trimmed_values = sorted(values)[trim_count : len(values) - trim_count]
+    expense_patterns, pattern_summary, patterns_total, patterns_truncated = (
+        _expense_patterns(db, selected, category_ids)
+    )
+    if include_current_partial_month:
+        today = as_of or date.today()
+        period = current_period(db, today)
+        end = min(period.end, today)
+        days_total = (period.end - period.start).days + 1
+        monthly_series.append(
+            {
+                "label": period.label,
+                "month": period.label,
+                "start": period.start.isoformat(),
+                "end": end.isoformat(),
+                "complete": False,
+                "days_elapsed": (end - period.start).days + 1,
+                "days_total": days_total,
+                "outcome": _cash_flow_for_dates(
+                    db, period.start, end, category_ids
+                )["operating_expenses"],
+            }
+        )
     return {
         "currency": user_currency(db).code,
         "category_id": category_id,
         "months_used": months,
-        "monthly": monthly,
+        "monthly_series": monthly_series,
+        "monthly": monthly_series,
         "mean": round(statistics.fmean(values), 2),
         "median": round(baseline, 2),
         "min": round(min(values), 2),
         "max": round(max(values), 2),
         "p25": round(p25, 2),
         "p75": round(p75, 2),
+        "trimmed_mean": round(statistics.fmean(trimmed_values), 2),
+        "trimmed_mean_method": "statistics.fmean after floor(10%) from each tail",
+        "expense_patterns": expense_patterns,
+        "pattern_summary": pattern_summary,
+        "patterns_total": patterns_total,
+        "patterns_returned": len(expense_patterns),
+        "patterns_truncated": patterns_truncated,
         "latest_complete_month": round(latest, 2),
         "latest_vs_median_pct": (
             round((latest - baseline) / baseline * 100, 2) if baseline else None
