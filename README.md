@@ -17,7 +17,7 @@ two-step write workflow.
 
 ## Complete tool catalog
 
-Both local and remote modes expose 57 tools. They share 55 tools and use two
+Both local and remote modes expose 59 tools. They share 57 tools and use two
 mode-specific tools for synchronization and category suggestions.
 
 | Area | Tools |
@@ -26,7 +26,7 @@ mode-specific tools for synchronization and category suggestions.
 | Planning analytics | `get_financial_snapshot`, `get_financial_position`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
 | Decision support | `plan_emergency_fund`, `plan_debt_payoff`, `compare_debt_strategies`, `plan_financial_goal`, `plan_multiple_goals`, `run_financial_scenario`, `build_financial_plan` |
 | Entity reads | `list_accounts`, `get_account`, `list_tags`, `get_tag`, `list_merchants`, `get_merchant`, `list_reminders`, `get_reminder`, `list_reminder_markers`, `get_reminder_marker`, `list_transactions`, `get_transaction`, `list_budgets`, `get_budget` |
-| Confirmed entity changes | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_mixed_changes`, `get_change_proposal`, `apply_changes` |
+| Confirmed entity changes | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_changes`, `prepare_mixed_changes`, `prepare_recurring_payment`, `get_change_proposal`, `apply_changes` |
 
 | Mode | Mode-specific tools |
 |---|---|
@@ -69,15 +69,17 @@ synchronization status, and a cache-only financial snapshot at
 ## Confirmed user-entity changes
 
 All writes use two separate calls. Choose the entity-specific prepare tool for
-ordinary work, or `prepare_mixed_changes` when one proposal creates or changes
-several related entity types:
+ordinary work, or the preferred `prepare_changes` when one proposal creates or
+changes several related entity types. `prepare_mixed_changes` is a compatible
+alias with the same strict `operations[]` schema:
 
 ```text
 prepare_account_changes        prepare_tag_changes
 prepare_merchant_changes       prepare_reminder_changes
 prepare_reminder_marker_changes
 prepare_transaction_changes    prepare_budget_changes
-prepare_mixed_changes
+prepare_changes                 prepare_mixed_changes (compatible alias)
+prepare_recurring_payment
 get_change_proposal            apply_changes
 ```
 
@@ -86,10 +88,13 @@ preview without writing to ZenMoney. After reviewing it, pass only its
 `proposal_id` to `apply_changes`; `get_change_proposal` reports state and results.
 
 Preparation requires a successful full sync so that untouched ZenMoney fields
-can be preserved. Apply rejects the whole proposal before writing if any source
-entity changed since preparation. Related creates are submitted in dependency
-layers because the live API does not safely accept every dependency in one Diff
-request; a failed layer is never retried or rolled back automatically.
+can be preserved. Apply synchronizes and rejects the whole proposal before
+writing if any source entity changed since preparation. `{"ref": "..."}` links
+between creates are resolved while preparing, so one proposal is one mixed
+`/v8/diff/` write request. This is the atomicity boundary: after a send failure,
+the result is unknown, the proposal becomes `needs_review` with
+`write_result_unknown`, and it is never retried automatically. Applying any
+terminal proposal again does not send another write.
 
 Create and update are supported for all seven user entities. Safe delete archives
 an Account, marks a Transaction or ReminderMarker deleted, or clears a Budget.
@@ -114,6 +119,48 @@ and must add up exactly. Use one optional `remainder` part to avoid decimal drif
   }]
 }
 ```
+
+`prepare_recurring_payment` prepares one ordinary monthly expense and its first
+planned occurrence without writing. Its exact payload is:
+
+```json
+{
+  "name": "T-Bank credit card",
+  "amount": 28060,
+  "account_id": "account-id",
+  "category_id": "category-id",
+  "frequency": "monthly",
+  "day_of_month": 18,
+  "start_date": "2026-09-18",
+  "end_date": null,
+  "notify": true
+}
+```
+
+Only positive amounts and `monthly` are supported. `start_date` must be an ISO
+date whose day equals `day_of_month`; an optional `end_date` cannot precede it.
+The account must be active and the category must belong to its owner. The result
+is the ordinary mixed proposal containing a `Reminder` (`interval="month"`,
+`step=1`, `points=[0]`) and its first planned `ReminderMarker` on `start_date`.
+Both use the same account/instrument, category, `notify`, payee, and one-sided
+expense (`income=0`, `outcome=amount`); only `apply_changes` can write them.
+
+`get_spending_baseline` uses 3–24 completed budget months. With
+`include_current_partial_month=true`, it appends the current period through the
+calculation date to canonical `monthly_series`; `monthly` remains a compatible
+alias. A partial row has `complete=false`, `days_elapsed`, and `days_total`, but
+is excluded from all statistics and pattern detection. `trimmed_mean` sorts the
+completed values and removes `floor(n * 10%)` from each tail before `fmean`.
+
+`expense_patterns` groups completed one-sided operating expenses by normalized
+merchant/payee and category, after conversion to the user currency. It reports
+`recurring_monthly` (at least 3 events, 25–35-day intervals),
+`likely_quarterly` (at least 2, 80–100), `likely_semiannual` (at least 2,
+170–195), `likely_annual` (at least 2, 350–380), `one_off` (one event), or
+`unknown`. Periodic classes also require amount spread no greater than 20% of
+their mean. This is historical heuristic output, not a prediction: the response
+includes class counts and totals, returns only the 100 largest groups, and marks
+truncation explicitly.
 
 Planning analytics are deliberately conservative:
 
