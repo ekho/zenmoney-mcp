@@ -44,16 +44,16 @@ position, cursor search и атомарный transaction split.
 
 ### Task 2: Добавить `get_financial_position`
 
-- [ ] Добавить RED-тест в `tests/test_planning.py` с loan, ccard, отрицательным
+- [x] Добавить RED-тест в `tests/test_planning.py` с loan, ccard, отрицательным
   checking installment и `inBalance=false`; проверить все конечные поля и
   `net_worth = assets - liabilities`.
-- [ ] Добавить RED contract test инструмента и overrides в
+- [x] Добавить RED contract test инструмента и overrides в
   `tests/test_planning_mcp.py`.
-- [ ] Реализовать функцию в `planning.py` через `_financial_obligations`,
+- [x] Реализовать функцию в `planning.py` через `_financial_obligations`,
   `convert` и три `_cash_flow_for_dates`; не вызывать старый `get_net_worth`.
-- [ ] Добавить tool schema/import/dispatch в `server.py`.
-- [ ] Запустить `uv run pytest -q tests/test_planning.py tests/test_planning_mcp.py`.
-- [ ] Commit: `feat: expose unified financial position`.
+- [x] Добавить tool schema/import/dispatch в `server.py`.
+- [x] Запустить `uv run pytest -q tests/test_planning.py tests/test_planning_mcp.py`.
+- [x] Commit: `feat: expose unified financial position`.
 
 ### Task 3: Сделать transaction search постраничным
 

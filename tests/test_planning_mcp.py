@@ -50,6 +50,7 @@ async def test_planning_tool_discovery_has_strict_schemas():
         "compare_periods",
         "get_emergency_fund_status",
         "get_debt_service",
+        "get_financial_position",
         "forecast_cash_flow",
     } <= tools.keys()
     cash = tools["get_cash_flow"]["properties"]
@@ -178,6 +179,37 @@ async def test_debt_service_dispatch_passes_obligation_overrides(planning_mcp_db
     assert obligation["classification"] == "installment"
     assert obligation["minimum_payment"]["source"] == "user_override"
     assert obligation["apr_pct"] == {"value": 19.9, "source": "user_override"}
+
+
+@pytest.mark.asyncio
+async def test_financial_position_dispatch_passes_obligation_overrides(planning_mcp_db):
+    planning_mcp_db.connect().execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('installment','Installment','checking',1,-1000,0,0,0,1,1)"
+    )
+    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
+    validate(
+        {
+            "obligation_overrides": {
+                "installment": {"classification": "installment"}
+            }
+        },
+        tools["get_financial_position"],
+    )
+
+    content = await server.call_tool(
+        "get_financial_position",
+        {
+            "obligation_overrides": {
+                "installment": {"classification": "installment"}
+            }
+        },
+    )
+
+    result = json.loads(content[0].text)
+    assert result["installments"] == 1000
+    assert result["total_liabilities"] == 1000
+    assert result["net_worth"] == 0
 
 
 @pytest.mark.asyncio

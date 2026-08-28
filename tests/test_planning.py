@@ -1076,6 +1076,66 @@ def test_financial_snapshot_reports_personal_debt_position(planning_db):
     assert result["debt_position"] == {"owed_to_you": 0, "you_owe": 500, "net": -500}
 
 
+def test_financial_position_unifies_assets_liabilities_and_monthly_flow(planning_db):
+    planning_db.connect().executemany(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES (?,?,?,?,?,?,0,0,1,1)",
+        [
+            ("installment", "Installment", "checking", 1, -300, 0),
+            ("personal", "Personal debt", "debt", 1, -200, 0),
+        ],
+    )
+    for month in (5, 6, 7):
+        add_transaction(
+            planning_db, f"income-{month}", f"2026-{month:02d}-10", income=1_000
+        )
+        add_transaction(
+            planning_db, f"expense-{month}", f"2026-{month:02d}-11", outcome=200
+        )
+        add_transaction(
+            planning_db,
+            f"debt-{month}",
+            f"2026-{month:02d}-12",
+            income=100,
+            outcome=100,
+            income_account="loan",
+            outcome_account="cash-rub",
+        )
+
+    result = planning.get_financial_position(
+        planning_db,
+        {"installment": {"classification": "installment"}},
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result == {
+        "as_of": "2026-08-23",
+        "currency": "RUB",
+        "liquid_assets": 26_000,
+        "restricted_assets": 20_000,
+        "total_assets": 46_000,
+        "loans": 6_000,
+        "credit_cards": 1_000,
+        "installments": 300,
+        "personal_debts": 200,
+        "total_liabilities": 7_500,
+        "net_worth": 38_500,
+        "operating_monthly_income": 1_000,
+        "operating_monthly_expenses": 200,
+        "monthly_debt_service": 100,
+        "free_cash_flow_after_debt_service": 700,
+        "monthly_basis": "trailing_3_complete_months_average",
+        "in_balance_semantics": "reported_by_zenmoney_but_not_used_for_economic_position",
+        "data_quality": {
+            "last_sync": None,
+            "staleness": "never_synced",
+            "complete_months_available": 3,
+            "missing_exchange_rates": [],
+            "warnings": [],
+        },
+    }
+
+
 def test_financial_snapshot_fails_explicitly_for_empty_cache():
     db = HardenedDatabase(":memory:")
     db.init_schema()

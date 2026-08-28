@@ -51,6 +51,7 @@ from .planning import (
     get_cash_flow,
     get_debt_service,
     get_emergency_fund_status,
+    get_financial_position,
     get_financial_snapshot,
     get_spending_baseline,
 )
@@ -409,6 +410,17 @@ def _planning_tools() -> list[Tool]:
         Tool(
             name="get_debt_service",
             description="Get every active financial obligation, cash debt service, and debt-service ratio without invented terms.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "obligation_overrides": _OBLIGATION_OVERRIDES_SCHEMA,
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_financial_position",
+            description="Get one economic view of all active assets, liabilities, net worth, and monthly cash flow after debt service.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1977,6 +1989,12 @@ async def _dispatch_tool(
 
     elif name == "get_debt_service":
         result = get_debt_service(db, arguments.get("obligation_overrides"))
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_financial_position":
+        result = get_financial_position(
+            db, arguments.get("obligation_overrides")
+        )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "forecast_cash_flow":

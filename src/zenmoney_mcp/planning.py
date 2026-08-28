@@ -696,6 +696,88 @@ def get_debt_service(
     }
 
 
+def get_financial_position(
+    db: Any,
+    obligation_overrides: dict[str, Any] | None = None,
+    *,
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    """Return one economic position using common obligation and flow rules."""
+    today = as_of or date.today()
+    currency = user_currency(db)
+    liquid_assets = restricted_assets = 0.0
+    rows = db.connect().execute(
+        """SELECT type,instrument,balance,savings
+           FROM accounts
+           WHERE COALESCE(archive,0)=0 AND balance>0"""
+    ).fetchall()
+    for row in rows:
+        balance = convert(db, row["balance"], row["instrument"], currency)
+        if row["type"] in {"cash", "checking", "emoney", "ccard"} or bool(
+            row["savings"]
+        ) and row["type"] != "deposit":
+            liquid_assets += balance
+        else:
+            restricted_assets += balance
+
+    obligations = _financial_obligations(
+        db, currency, obligation_overrides, as_of=today
+    )
+    liabilities = {
+        "loans": 0.0,
+        "credit_cards": 0.0,
+        "installments": 0.0,
+        "personal_debts": 0.0,
+    }
+    bucket_by_class = {
+        "loan": "loans",
+        "credit_card": "credit_cards",
+        "installment": "installments",
+        "personal_debt": "personal_debts",
+        "other": "personal_debts",
+    }
+    for obligation in obligations:
+        liabilities[bucket_by_class[obligation["classification"]]] += obligation[
+            "balance"
+        ]
+
+    flows = [
+        _cash_flow_for_dates(db, period.start, period.end)
+        for period in completed_periods(db, 3, today)
+    ]
+    income = statistics.fmean(item["income"] for item in flows)
+    expenses = statistics.fmean(item["operating_expenses"] for item in flows)
+    debt_service = statistics.fmean(
+        item["debt_service_cash_outflow"] for item in flows
+    )
+    total_assets = liquid_assets + restricted_assets
+    total_liabilities = sum(liabilities.values())
+    data_quality = _data_quality(db, today)
+    if any(item["flow_components"]["unknown"]["count"] for item in flows):
+        data_quality["warnings"].append("unknown_transaction_flows_excluded")
+    return {
+        "as_of": today.isoformat(),
+        "currency": currency.code,
+        "liquid_assets": round(liquid_assets, 2),
+        "restricted_assets": round(restricted_assets, 2),
+        "total_assets": round(total_assets, 2),
+        **{name: round(value, 2) for name, value in liabilities.items()},
+        "total_liabilities": round(total_liabilities, 2),
+        "net_worth": round(total_assets - total_liabilities, 2),
+        "operating_monthly_income": round(income, 2),
+        "operating_monthly_expenses": round(expenses, 2),
+        "monthly_debt_service": round(debt_service, 2),
+        "free_cash_flow_after_debt_service": round(
+            income - expenses - debt_service, 2
+        ),
+        "monthly_basis": "trailing_3_complete_months_average",
+        "in_balance_semantics": (
+            "reported_by_zenmoney_but_not_used_for_economic_position"
+        ),
+        "data_quality": data_quality,
+    }
+
+
 def _scheduled_flows(
     db: Any, horizon_days: int, as_of: date
 ) -> tuple[dict[str, float], set[str], int]:
