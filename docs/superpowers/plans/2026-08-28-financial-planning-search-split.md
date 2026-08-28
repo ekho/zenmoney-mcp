@@ -86,12 +86,12 @@ position, cursor search и атомарный transaction split.
 
 ### Task 5: Документация и полный Phase 2 gate
 
-- [ ] Обновить README EN/RU и planning semantics с точными примерами новых
+- [x] Обновить README EN/RU и planning semantics с точными примерами новых
   аргументов и экономической семантикой.
-- [ ] Запустить `uv run pytest -q` и `git diff --check` на чистом кандидате.
-- [ ] Проверить `tools/list`, четыре новых сценария локального MCP и отсутствие
+- [x] Запустить `uv run pytest -q` и `git diff --check` на чистом кандидате.
+- [x] Проверить `tools/list`, четыре новых сценария локального MCP и отсутствие
   финансовых значений в логах/артефактах.
-- [ ] Commit: `docs: document phase two financial tools`.
+- [x] Commit: `docs: document phase two financial tools`.
 - [ ] Push точного refspec, открыть PR, дождаться CI, review, merge.
 - [ ] Выпустить minor release `v0.7.0`; проверить GitHub release, tag и GHCR OCI revision.
 - [ ] Развернуть immutable `ghcr.io/ekho/zenmoney-mcp:0.7.0` в production по

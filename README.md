@@ -17,13 +17,13 @@ two-step write workflow.
 
 ## Complete tool catalog
 
-Both local and remote modes expose 56 tools. They share 54 tools and use two
+Both local and remote modes expose 57 tools. They share 55 tools and use two
 mode-specific tools for synchronization and category suggestions.
 
 | Area | Tools |
 |---|---|
 | Financial analytics | `get_net_worth`, `get_liquidity`, `analyze_spending`, `analyze_income`, `analyze_merchants`, `check_budget_health`, `get_upcoming_payments`, `analyze_trends`, `detect_recurring`, `get_account_flow`, `analyze_transfers`, `detect_anomalies`, `get_debts`, `convert_currency`, `get_exchange_rates`, `search_transactions` |
-| Planning analytics | `get_financial_snapshot`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
+| Planning analytics | `get_financial_snapshot`, `get_financial_position`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
 | Decision support | `plan_emergency_fund`, `plan_debt_payoff`, `compare_debt_strategies`, `plan_financial_goal`, `plan_multiple_goals`, `run_financial_scenario`, `build_financial_plan` |
 | Entity reads | `list_accounts`, `get_account`, `list_tags`, `get_tag`, `list_merchants`, `get_merchant`, `list_reminders`, `get_reminder`, `list_reminder_markers`, `get_reminder_marker`, `list_transactions`, `get_transaction`, `list_budgets`, `get_budget` |
 | Confirmed entity changes | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_mixed_changes`, `get_change_proposal`, `apply_changes` |
@@ -52,7 +52,8 @@ mode-specific tools for synchronization and category suggestions.
 | Find matching transactions | `search_transactions` |
 | What happened on this account? | `get_account_flow` |
 | Convert currencies | `convert_currency`, `get_exchange_rates` |
-| Overall financial position | `get_financial_snapshot` |
+| Economic assets, liabilities, net worth, and free cash flow | `get_financial_position` |
+| Legacy in-balance financial snapshot | `get_financial_snapshot` |
 | Monthly cash flow | `get_cash_flow` |
 | Normal spending level | `get_spending_baseline` |
 | Compare periods | `compare_periods` |
@@ -96,6 +97,24 @@ Tag, Merchant, and Reminder deletion and all physical purge operations are not
 exposed. Prepared proposals expire after 24 hours. Terminal proposals are retained
 for 30 days, and an uncertain write or verification result becomes `needs_review`.
 
+`prepare_transaction_changes` also supports a one-sided income or outcome split.
+The first part keeps the source transaction ID; the remaining parts receive new
+IDs. All parts are submitted in one Diff batch, preserve the source raw metadata,
+and must add up exactly. Use one optional `remainder` part to avoid decimal drift:
+
+```json
+{
+  "operations": [{
+    "operation": "split",
+    "transaction_id": "transaction-id",
+    "parts": [
+      {"amount": 730, "category_id": "groceries-category-id"},
+      {"amount": "remainder", "category_id": "household-category-id"}
+    ]
+  }]
+}
+```
+
 Planning analytics are deliberately conservative:
 
 - emergency-fund coverage requires explicit essential category IDs or a monthly
@@ -104,13 +123,33 @@ Planning analytics are deliberately conservative:
   debt service;
 - `get_debt_service` includes every active negative-balance account regardless
   of `inBalance`;
+- `get_financial_position` applies that same economic boundary to every positive
+  asset and negative liability, then reports three complete months of operating
+  cash flow and debt service;
 - unknown APR and payment terms remain `null` unless supplied explicitly;
 - recurring-payment detection is a historical heuristic and is labeled as such;
 - cash-flow forecasts are transparent scenarios, not prediction guarantees.
 
+`search_transactions` supports stable cursor pagination, date or converted-amount
+sorting, category/account arrays, and explicit category presence. To page through
+all uncategorized expenses for an arbitrary period from largest to smallest, reuse
+the returned `next_cursor` with the same filters:
+
+```json
+{
+  "start_date": "2026-01-01",
+  "end_date": "2026-08-31",
+  "type": "outcome",
+  "category_state": "uncategorized",
+  "sort_by": "amount",
+  "sort_order": "desc",
+  "limit": 50
+}
+```
+
 ## Financial Planning
 
-Phase 3 adds deterministic decision support on top of the factual analytics.
+The server adds deterministic decision support on top of the factual analytics.
 Every result exposes inputs, assumptions, constraints, reasons, alternatives,
 and measurable outcomes; it does not execute or write a financial decision.
 
@@ -146,6 +185,42 @@ Missing APR, minimum payments, or essential-spending configuration returns
 use zero investment return, Decimal money arithmetic, and future calendar
 month-end snapshots. Restricted deposits are excluded from emergency reserves
 unless explicitly enabled, and credit capacity is always excluded.
+
+Debt payoff supports four explicit models. Existing negative-balance accounts
+may use `fixed_loan`, `credit_card`, or `installment`; a liability absent from
+ZenMoney must use `arbitrary` with an explicit balance. For example:
+
+```json
+{
+  "strategy": "avalanche",
+  "monthly_extra_payment": 5000,
+  "debt_accounts": {
+    "loan-account-id": {
+      "liability_type": "fixed_loan",
+      "apr_pct": 19.9,
+      "fixed_payment": 15000
+    },
+    "card-account-id": {
+      "liability_type": "credit_card",
+      "apr_pct": 29.9,
+      "minimum_payment": 5000,
+      "statement_balance": 42000,
+      "grace_period_payment": 42000,
+      "grace_period_due_date": "2026-09-15"
+    },
+    "installment-account-id": {
+      "liability_type": "installment",
+      "payment_schedule": [{"date": "2026-09-30", "amount": 10000}]
+    },
+    "family-loan": {
+      "liability_type": "arbitrary",
+      "title": "Family loan",
+      "balance": 50000,
+      "minimum_payment": 5000
+    }
+  }
+}
+```
 
 See [`docs/planning-semantics.md`](docs/planning-semantics.md) for the priority
 policy, formulas, rounding, data-quality labels, and limitations.
