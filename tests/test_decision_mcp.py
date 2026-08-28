@@ -45,6 +45,15 @@ async def test_decision_tool_discovery_has_strict_bounded_schemas():
         "custom",
     ]
     assert debt["properties"]["debt_accounts"]["maxProperties"] == 50
+    liability = debt["properties"]["debt_accounts"]["additionalProperties"]
+    assert liability["properties"]["liability_type"]["enum"] == [
+        "fixed_loan",
+        "credit_card",
+        "installment",
+        "arbitrary",
+    ]
+    assert liability["properties"]["payment_schedule"]["maxItems"] == 120
+    assert "required" not in liability
     goal = tools["plan_financial_goal"]
     assert goal["properties"]["target_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
     assert goal["properties"]["annual_return_pct"]["const"] == 0

@@ -441,21 +441,75 @@ _DEBT_ACCOUNTS_SCHEMA = {
     "additionalProperties": {
         "type": "object",
         "properties": {
+            "liability_type": {
+                "type": "string",
+                "enum": [
+                    "fixed_loan",
+                    "credit_card",
+                    "installment",
+                    "arbitrary",
+                ],
+                "description": "Explicit payoff model; inferred from the obligation class when omitted",
+            },
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Display title, primarily for user-only arbitrary liabilities",
+            },
+            "balance": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Explicit scenario balance; required for a liability absent from ZenMoney",
+            },
             "apr_pct": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Nominal annual percentage rate; never inferred",
+                "description": "Nominal annual percentage rate; defaults to zero only for installment and arbitrary liabilities",
+            },
+            "fixed_payment": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Fixed loan payment; mutually exclusive with minimum_payment",
             },
             "minimum_payment": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Required monthly minimum payment",
+                "description": "Monthly minimum for credit cards and arbitrary liabilities; legacy fixed-loan payment",
+            },
+            "statement_balance": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Credit-card statement balance, tracked separately from total debt",
+            },
+            "grace_period_payment": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Credit-card grace payment due on grace_period_due_date",
+            },
+            "grace_period_due_date": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": "Future credit-card grace deadline",
+            },
+            "payment_schedule": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 120,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "pattern": _DATE_PATTERN},
+                        "amount": {"type": "number", "exclusiveMinimum": 0},
+                    },
+                    "required": ["date", "amount"],
+                    "additionalProperties": False,
+                },
+                "description": "Future dated payments for an installment",
             },
         },
-        "required": ["apr_pct", "minimum_payment"],
         "additionalProperties": False,
     },
-    "description": "Planning configuration keyed by ZenMoney debt account ID",
+    "description": "Payoff configuration keyed by obligation ID; arbitrary user-only IDs are supported with explicit balance",
 }
 
 _OBLIGATION_OVERRIDES_SCHEMA = {

@@ -31,16 +31,16 @@ position, cursor search и атомарный transaction split.
 
 ### Task 1: Расширить `plan_debt_payoff`
 
-- [ ] Добавить в `tests/test_decision.py` RED-проверки: credit card grace fields,
+- [x] Добавить в `tests/test_decision.py` RED-проверки: credit card grace fields,
   installment schedule, arbitrary liability, all negative account types,
   user-only liability и rollover после payoff.
-- [ ] Запустить только новые тесты и подтвердить ожидаемые failures старой модели.
-- [ ] Расширить конфигурацию и симуляцию в `decision/debt.py`, сохранив старые
+- [x] Запустить только новые тесты и подтвердить ожидаемые failures старой модели.
+- [x] Расширить конфигурацию и симуляцию в `decision/debt.py`, сохранив старые
   `apr_pct + minimum_payment` вызовы.
-- [ ] Расширить `_DEBT_ACCOUNTS_SCHEMA` в `server.py`; добавить schema/dispatch
+- [x] Расширить `_DEBT_ACCOUNTS_SCHEMA` в `server.py`; добавить schema/dispatch
   contract tests в `tests/test_decision_mcp.py`.
-- [ ] Запустить `uv run pytest -q tests/test_decision.py tests/test_decision_mcp.py`.
-- [ ] Commit: `feat: support real-world liability payoff models`.
+- [x] Запустить `uv run pytest -q tests/test_decision.py tests/test_decision_mcp.py`.
+- [x] Commit: `feat: support real-world liability payoff models`.
 
 ### Task 2: Добавить `get_financial_position`
 
