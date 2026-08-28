@@ -270,7 +270,7 @@ def harden_tool_schemas(tools: list[Tool]) -> list[Tool]:
                 value["pattern"] = _DATE_PATTERN
             elif name == "month":
                 value["pattern"] = _MONTH_PATTERN
-            elif name == "period":
+            elif name == "period" and "enum" not in value:
                 value["pattern"] = _PERIOD_PATTERN
             elif name == "z_threshold":
                 value["minimum"] = 1.5

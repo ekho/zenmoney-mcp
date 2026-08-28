@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from jsonschema import validate
 
 from zenmoney_mcp import server
 from zenmoney_mcp.hardened_database import HardenedDatabase
@@ -78,6 +79,26 @@ async def test_planning_tool_discovery_has_strict_schemas():
         60,
         90,
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "period",
+    [
+        "current_period",
+        "last_complete_month",
+        "last_30_days",
+        "trailing_3_complete_months",
+        "trailing_6_complete_months",
+        "trailing_12_complete_months",
+    ],
+)
+async def test_cash_flow_schema_accepts_every_documented_period(period):
+    tools = {tool.name: tool.input_schema for tool in await server.list_tools()}
+    schema = tools["get_cash_flow"]
+
+    validate({"period": period}, schema)
+    assert "pattern" not in schema["properties"]["period"]
 
 
 @pytest.mark.asyncio
