@@ -328,6 +328,14 @@ def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):
     add_transaction(planning_db, "income", "2026-08-01", income=1_000, tag="salary")
     add_transaction(planning_db, "expense", "2026-08-02", outcome=200, tag="food")
     add_transaction(planning_db, "transfer", "2026-08-03", income=300, outcome=300)
+    add_transaction(
+        planning_db,
+        "asset-transfer",
+        "2026-08-03",
+        income=400,
+        outcome=400,
+        income_account="savings",
+    )
     add_transaction(planning_db, "hold", "2026-08-04", outcome=50, hold=1)
     add_transaction(
         planning_db, "external", "2026-08-05", outcome=70, outcome_account="excluded"
@@ -341,10 +349,30 @@ def test_cash_flow_excludes_transfers_holds_and_external_accounts(planning_db):
     )
 
     assert result["income"] == 1_000
-    assert result["outcome"] == 200
-    assert result["net_cash_flow"] == 800
-    assert result["savings_rate_pct"] == 80
-    assert result["transaction_counts"] == {"income": 1, "outcome": 1}
+    assert result["operating_expenses"] == 200
+    assert result["operating_net_cash_flow"] == 800
+    assert result["financing_inflow"] == 0
+    assert result["debt_service_cash_outflow"] == 0
+    assert result["net_cash_flow_after_debt_service"] == 800
+    assert result["savings_rate_before_debt_service_pct"] == 80
+    assert result["savings_rate_after_debt_service_pct"] == 80
+    assert result["flow_components"]["income"] == {"amount": 1_000, "count": 1}
+    assert result["flow_components"]["operating_expense"] == {
+        "amount": 200,
+        "count": 1,
+    }
+    assert result["flow_components"]["internal_transfer"] == {
+        "amount": 300,
+        "count": 1,
+    }
+    assert result["flow_components"]["asset_transfer"] == {
+        "amount": 400,
+        "count": 1,
+    }
+    assert result["uncertain_transactions"] == []
+    assert "outcome" not in result
+    assert "net_cash_flow" not in result
+    assert "savings_rate_pct" not in result
 
 
 def test_cash_flow_converts_each_side_to_user_currency(planning_db):
@@ -370,7 +398,29 @@ def test_cash_flow_converts_each_side_to_user_currency(planning_db):
     )
 
     assert result["income"] == 900
-    assert result["outcome"] == 450
+    assert result["operating_expenses"] == 450
+
+
+def test_cash_flow_does_not_read_unrelated_reminder_rates(planning_db):
+    add_marker(
+        planning_db,
+        "future-usd-payment",
+        "9999-12-31",
+        income=1,
+        outcome=1,
+        income_instrument=2,
+        outcome_instrument=2,
+        income_account="loan",
+        outcome_account="cash-usd",
+    )
+    add_transaction(planning_db, "income", "2026-08-01", income=100)
+    planning_db.connect().execute("UPDATE instruments SET rate=NULL WHERE id=2")
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-08-01", end_date="2026-08-31"
+    )
+
+    assert result["income"] == 100
 
 
 def test_cash_flow_has_null_savings_rate_without_income(planning_db):
@@ -380,7 +430,8 @@ def test_cash_flow_has_null_savings_rate_without_income(planning_db):
         planning_db, start_date="2026-08-01", end_date="2026-08-31"
     )
 
-    assert result["savings_rate_pct"] is None
+    assert result["savings_rate_before_debt_service_pct"] is None
+    assert result["savings_rate_after_debt_service_pct"] is None
 
 
 def test_last_complete_month_respects_user_budget_month(planning_db):
@@ -398,7 +449,98 @@ def test_last_complete_month_respects_user_budget_month(planning_db):
         "end": "2026-08-07",
         "complete": True,
     }
-    assert result["outcome"] == 200
+    assert result["operating_expenses"] == 200
+
+
+def test_cash_flow_separates_debt_service_from_operating_expense(planning_db):
+    add_transaction(
+        planning_db,
+        "payment",
+        "2026-07-10",
+        income=100_000,
+        outcome=100_000,
+        income_account="loan",
+        outcome_account="cash-rub",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["operating_expenses"] == 0
+    assert result["debt_service_cash_outflow"] == 100_000
+    assert result["net_cash_flow_after_debt_service"] == -100_000
+    assert result["flow_components"]["debt_service_outflow"] == {
+        "amount": 100_000,
+        "count": 1,
+    }
+
+
+def test_cash_flow_does_not_count_borrowing_as_income(planning_db):
+    add_transaction(
+        planning_db,
+        "borrowing",
+        "2026-07-10",
+        income=300_000,
+        outcome=300_000,
+        income_account="cash-rub",
+        outcome_account="loan",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["income"] == 0
+    assert result["financing_inflow"] == 300_000
+    assert result["net_cash_flow_after_debt_service"] == 300_000
+
+
+def test_liability_funded_spending_has_equal_expense_and_financing(planning_db):
+    add_transaction(
+        planning_db,
+        "card-purchase",
+        "2026-07-10",
+        outcome=30_000,
+        outcome_account="credit",
+        tag="food",
+    )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["operating_expenses"] == 30_000
+    assert result["financing_inflow"] == 30_000
+    assert result["operating_net_cash_flow"] == -30_000
+    assert result["net_cash_flow_after_debt_service"] == 0
+
+
+def test_cash_flow_bounds_structurally_unknown_transactions(planning_db):
+    for index in range(51):
+        add_transaction(
+            planning_db,
+            f"unknown-{index}",
+            "2026-07-10",
+            income=10,
+            income_account="loan",
+        )
+
+    result = get_cash_flow(
+        planning_db, start_date="2026-07-01", end_date="2026-07-31"
+    )
+
+    assert result["flow_components"]["unknown"] == {"amount": 510, "count": 51}
+    assert len(result["uncertain_transactions"]) == 50
+    assert result["uncertain_transactions"][0] == {
+        "transaction_id": "unknown-0",
+        "classification": "unknown",
+        "classification_reason": "account_relationship_is_not_classifiable",
+        "confidence": "low",
+    }
+    assert "unknown_transaction_flows_excluded" in result["data_quality"][
+        "warnings"
+    ]
 
 
 @pytest.mark.parametrize("months", [3, 6, 12])
@@ -890,6 +1032,6 @@ def test_cash_flow_scans_50_000_transactions_without_truncation(planning_db):
         planning_db, start_date="2026-07-01", end_date="2026-07-31"
     )
 
-    assert result["outcome"] == 50_000
-    assert result["transaction_counts"]["outcome"] == 50_000
+    assert result["operating_expenses"] == 50_000
+    assert result["flow_components"]["operating_expense"]["count"] == 50_000
     assert result["data_quality"]["complete_months_available"] == 1

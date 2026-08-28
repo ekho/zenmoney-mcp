@@ -78,17 +78,10 @@ def _financial_obligations(
         raise InputValidationError(
             "obligation_overrides must be an object with at most 50 accounts"
         )
-    rows = db.connect().execute(
-        """SELECT id,title,type,instrument,balance,in_balance
-           FROM accounts
-           WHERE COALESCE(archive,0)=0
-           ORDER BY title,id"""
-    ).fetchall()
+    rows = _financial_obligation_accounts(db)
     obligations = []
     for row in rows:
         balance = convert(db, row["balance"], row["instrument"], currency)
-        if balance >= 0:
-            continue
         classification, confidence = _OBLIGATION_CLASSES.get(
             row["type"], ("other", "low")
         )
@@ -197,6 +190,15 @@ def _financial_obligations(
     return obligations
 
 
+def _financial_obligation_accounts(db: Any) -> list[Any]:
+    return db.connect().execute(
+        """SELECT id,title,type,instrument,balance,in_balance
+           FROM accounts
+           WHERE COALESCE(archive,0)=0 AND balance<0
+           ORDER BY title,id"""
+    ).fetchall()
+
+
 def _cash_flow_for_dates(
     db: Any,
     start: date,
@@ -204,10 +206,16 @@ def _cash_flow_for_dates(
     category_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     currency = user_currency(db)
+    obligation_ids = {row["id"] for row in _financial_obligation_accounts(db)}
     rows = db.connect().execute(
-        """SELECT t.income,t.outcome,t.income_instrument,t.outcome_instrument,
+        """SELECT t.id,t.income,t.outcome,
+                  t.income_instrument,t.outcome_instrument,
                   t.tag,tag.title AS category,
+                  ia.id AS income_account_id,ia.type AS income_account_type,
+                  ia.savings AS income_savings,
                   COALESCE(ia.archive,0) AS income_archive,ia.in_balance AS income_in_balance,
+                  oa.id AS outcome_account_id,oa.type AS outcome_account_type,
+                  oa.savings AS outcome_savings,
                   COALESCE(oa.archive,0) AS outcome_archive,oa.in_balance AS outcome_in_balance
            FROM transactions t
            LEFT JOIN accounts ia ON ia.id=t.income_account
@@ -215,12 +223,28 @@ def _cash_flow_for_dates(
            LEFT JOIN tags tag ON tag.id=json_extract(t.tag,'$[0]')
            WHERE COALESCE(t.deleted,0)=0 AND COALESCE(t.hold,0)=0
              AND t.date BETWEEN ? AND ?
-             AND ((t.income>0 AND t.outcome=0) OR (t.outcome>0 AND t.income=0))""",
+           ORDER BY t.date,t.id""",
         (start.isoformat(), end.isoformat()),
     ).fetchall()
-    income = outcome = 0.0
-    income_count = outcome_count = 0
+    components = {
+        name: {"amount": 0.0, "count": 0}
+        for name in (
+            "income",
+            "operating_expense",
+            "internal_transfer",
+            "financing_inflow",
+            "debt_service_outflow",
+            "asset_transfer",
+            "unknown",
+        )
+    }
     categories: dict[str, dict[str, Any]] = {}
+    uncertain: list[dict[str, Any]] = []
+
+    def add_component(name: str, amount: float) -> None:
+        components[name]["amount"] += amount
+        components[name]["count"] += 1
+
     for row in rows:
         try:
             tag_ids = json.loads(row["tag"] or "[]")
@@ -231,39 +255,123 @@ def _cash_flow_for_dates(
         )
         if category_ids is not None and category_id not in category_ids:
             continue
-        if row["income"] > 0:
-            if row["income_archive"] or row["income_in_balance"] == 0:
-                continue
-            amount = convert(db, row["income"], row["income_instrument"], currency)
-            income += amount
-            income_count += 1
-            side = "income"
-        else:
-            if row["outcome_archive"] or row["outcome_in_balance"] == 0:
-                continue
-            amount = convert(db, row["outcome"], row["outcome_instrument"], currency)
-            outcome += amount
-            outcome_count += 1
-            side = "outcome"
-        key = category_id or "uncategorized"
-        item = categories.setdefault(
-            key,
-            {
-                "category_id": category_id,
-                "category": row["category"] or "Uncategorized",
-                "income": 0.0,
-                "outcome": 0.0,
-            },
+
+        income = float(row["income"] or 0)
+        outcome = float(row["outcome"] or 0)
+        income_obligation = row["income_account_id"] in obligation_ids
+        outcome_obligation = row["outcome_account_id"] in obligation_ids
+        income_asset = bool(
+            row["income_account_id"]
+            and not income_obligation
+            and not row["income_archive"]
+            and row["income_in_balance"] != 0
         )
-        item[side] += amount
+        outcome_asset = bool(
+            row["outcome_account_id"]
+            and not outcome_obligation
+            and not row["outcome_archive"]
+            and row["outcome_in_balance"] != 0
+        )
+        income_relevant = income != 0 and (income_obligation or income_asset)
+        outcome_relevant = outcome != 0 and (outcome_obligation or outcome_asset)
+        if not (income_relevant or outcome_relevant):
+            continue
+
+        def add_category(side: str, amount: float) -> None:
+            key = category_id or "uncategorized"
+            item = categories.setdefault(
+                key,
+                {
+                    "category_id": category_id,
+                    "category": row["category"] or "Uncategorized",
+                    "income": 0.0,
+                    "outcome": 0.0,
+                },
+            )
+            item[side] += amount
+
+        if income > 0 and outcome == 0 and income_asset:
+            amount = convert(db, income, row["income_instrument"], currency)
+            add_component("income", amount)
+            add_category("income", amount)
+            continue
+
+        if outcome > 0 and income == 0 and (outcome_asset or outcome_obligation):
+            amount = convert(db, outcome, row["outcome_instrument"], currency)
+            add_component("operating_expense", amount)
+            add_category("outcome", amount)
+            if outcome_obligation:
+                add_component("financing_inflow", amount)
+            continue
+
+        if income > 0 and outcome > 0:
+            source_amount = convert(
+                db, outcome, row["outcome_instrument"], currency
+            )
+            if outcome_asset and income_obligation:
+                add_component("debt_service_outflow", source_amount)
+                continue
+            if outcome_obligation and income_asset:
+                add_component(
+                    "financing_inflow",
+                    convert(db, income, row["income_instrument"], currency),
+                )
+                continue
+            if outcome_obligation and income_obligation:
+                add_component("internal_transfer", source_amount)
+                continue
+            if outcome_asset and income_asset:
+                is_asset_transfer = (
+                    row["income_account_type"] == "deposit"
+                    or row["outcome_account_type"] == "deposit"
+                    or bool(row["income_savings"])
+                    or bool(row["outcome_savings"])
+                )
+                add_component(
+                    "asset_transfer" if is_asset_transfer else "internal_transfer",
+                    source_amount,
+                )
+                continue
+
+        unknown_amount = 0.0
+        if outcome > 0 and (outcome_asset or outcome_obligation):
+            unknown_amount = convert(
+                db, outcome, row["outcome_instrument"], currency
+            )
+        elif income > 0 and (income_asset or income_obligation):
+            unknown_amount = convert(db, income, row["income_instrument"], currency)
+        add_component("unknown", unknown_amount)
+        if len(uncertain) < 50:
+            uncertain.append(
+                {
+                    "transaction_id": row["id"],
+                    "classification": "unknown",
+                    "classification_reason": "account_relationship_is_not_classifiable",
+                    "confidence": "low",
+                }
+            )
+
     for item in categories.values():
         item["income"] = round(item["income"], 2)
         item["outcome"] = round(item["outcome"], 2)
+    income = components["income"]["amount"]
+    operating_expenses = components["operating_expense"]["amount"]
+    financing_inflow = components["financing_inflow"]["amount"]
+    debt_service = components["debt_service_outflow"]["amount"]
+    for component in components.values():
+        component["amount"] = round(component["amount"], 2)
     return {
         "currency": currency.code,
         "income": round(income, 2),
-        "outcome": round(outcome, 2),
-        "transaction_counts": {"income": income_count, "outcome": outcome_count},
+        "operating_expenses": round(operating_expenses, 2),
+        "operating_net_cash_flow": round(income - operating_expenses, 2),
+        "financing_inflow": round(financing_inflow, 2),
+        "debt_service_cash_outflow": round(debt_service, 2),
+        "net_cash_flow_after_debt_service": round(
+            income - operating_expenses + financing_inflow - debt_service, 2
+        ),
+        "flow_components": components,
+        "uncertain_transactions": uncertain,
         "categories": categories,
     }
 
@@ -278,7 +386,12 @@ def get_cash_flow(
 ) -> dict[str, Any]:
     selected = resolve_period(db, period, start_date, end_date, as_of)
     totals = _cash_flow_for_dates(db, selected.start, selected.end)
-    income, outcome = totals["income"], totals["outcome"]
+    income = totals["income"]
+    operating_net = totals["operating_net_cash_flow"]
+    net_after_debt = totals["net_cash_flow_after_debt_service"]
+    data_quality = _data_quality(db, as_of)
+    if totals["flow_components"]["unknown"]["count"]:
+        data_quality["warnings"].append("unknown_transaction_flows_excluded")
     return {
         "period": {
             "preset": selected.label,
@@ -288,13 +401,20 @@ def get_cash_flow(
         },
         "currency": totals["currency"],
         "income": income,
-        "outcome": outcome,
-        "net_cash_flow": round(income - outcome, 2),
-        "savings_rate_pct": (
-            round((income - outcome) / income * 100, 2) if income > 0 else None
+        "operating_expenses": totals["operating_expenses"],
+        "operating_net_cash_flow": operating_net,
+        "financing_inflow": totals["financing_inflow"],
+        "debt_service_cash_outflow": totals["debt_service_cash_outflow"],
+        "net_cash_flow_after_debt_service": net_after_debt,
+        "savings_rate_before_debt_service_pct": (
+            round(operating_net / income * 100, 2) if income > 0 else None
         ),
-        "transaction_counts": totals["transaction_counts"],
-        "data_quality": _data_quality(db, as_of),
+        "savings_rate_after_debt_service_pct": (
+            round(net_after_debt / income * 100, 2) if income > 0 else None
+        ),
+        "flow_components": totals["flow_components"],
+        "uncertain_transactions": totals["uncertain_transactions"],
+        "data_quality": data_quality,
     }
 
 
@@ -325,7 +445,7 @@ def get_spending_baseline(
     for period in selected:
         outcome = _cash_flow_for_dates(
             db, period.start, period.end, category_ids
-        )["outcome"]
+        )["operating_expenses"]
         values.append(outcome)
         monthly.append(
             {
@@ -432,9 +552,9 @@ def compare_periods(
         "period_a": _period_payload(first),
         "period_b": _period_payload(second),
         "income": _delta(a["income"], b["income"]),
-        "outcome": _delta(a["outcome"], b["outcome"]),
+        "outcome": _delta(a["operating_expenses"], b["operating_expenses"]),
         "net_cash_flow": _delta(
-            a["income"] - a["outcome"], b["income"] - b["outcome"]
+            a["operating_net_cash_flow"], b["operating_net_cash_flow"]
         ),
         "category_deltas": category_deltas,
         "data_quality": _data_quality(db, as_of),
@@ -481,7 +601,9 @@ def get_emergency_fund_status(
         for item in essential_category_ids:
             category_ids.update(_descendant_category_ids(db, item))
         values = [
-            _cash_flow_for_dates(db, period.start, period.end, category_ids)["outcome"]
+            _cash_flow_for_dates(db, period.start, period.end, category_ids)[
+                "operating_expenses"
+            ]
             for period in completed_periods(db, baseline_months, as_of)
         ]
         monthly = float(statistics.median(values))
@@ -795,7 +917,7 @@ def _average_cash_flow(db: Any, count: int, as_of: date) -> dict[str, float]:
         for period in completed_periods(db, count, as_of)
     ]
     income = statistics.fmean(item["income"] for item in values)
-    outcome = statistics.fmean(item["outcome"] for item in values)
+    outcome = statistics.fmean(item["operating_expenses"] for item in values)
     return {
         "income": round(income, 2),
         "outcome": round(outcome, 2),
@@ -828,7 +950,9 @@ def get_financial_snapshot(db: Any, *, as_of: date | None = None) -> dict[str, A
         },
         "cash_flow": {
             "last_complete_month": {
-                key: last[key] for key in ("income", "outcome", "net_cash_flow")
+                "income": last["income"],
+                "outcome": last["operating_expenses"],
+                "net_cash_flow": last["operating_net_cash_flow"],
             },
             "trailing_3_months_average": _average_cash_flow(db, 3, today),
             "trailing_12_months_average": _average_cash_flow(db, 12, today),
