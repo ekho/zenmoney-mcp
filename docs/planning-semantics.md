@@ -72,8 +72,8 @@ operating net cash flow = income - operating expenses
 net cash flow after debt service = operating net cash flow
                                    + financing inflow
                                    - debt-service cash outflow
-savings rate before debt service = operating net cash flow / income
-savings rate after debt service = net cash flow after debt service / income
+savings rate before debt service = operating net cash flow / income * 100
+savings rate after debt service = net cash flow after debt service / income * 100
 ```
 
 Both rates are `null` when income is zero. Spending baselines, category
