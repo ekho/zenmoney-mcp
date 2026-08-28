@@ -37,7 +37,7 @@ def decision_db() -> HardenedDatabase:
             ("cash", "Cash", "checking", 1, 120_000, None, 1, 0, 0),
             ("savings", "Savings", "checking", 1, 180_000, None, 1, 1, 0),
             ("deposit", "Deposit", "deposit", 1, 500_000, None, 1, 1, 0),
-            ("credit", "Credit", "ccard", 1, -10_000, 100_000, 1, 0, 0),
+            ("credit", "Credit", "ccard", 1, 0, 100_000, 1, 0, 0),
             ("loan", "Loan", "loan", 1, -1_000, None, 1, 0, 0),
         ],
     )
@@ -222,6 +222,253 @@ def test_debt_payoff_applies_monthly_interest_before_payment(decision_db):
         "ending_balance": 910,
     }
     assert first["payment"] == first["interest"] + first["principal"]
+
+
+def test_debt_payoff_supports_credit_card_grace_payment(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+    decision_db.connect().execute("UPDATE accounts SET balance=-1000 WHERE id='credit'")
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={
+            "credit": {
+                "liability_type": "credit_card",
+                "apr_pct": 0,
+                "minimum_payment": 100,
+                "statement_balance": 600,
+                "grace_period_payment": 600,
+                "grace_period_due_date": "2026-09-15",
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result["starting_debt"] == 1000
+    assert result["schedule"][0]["accounts"][0]["payment"] == 600
+    assert result["schedule"][1]["accounts"][0]["payment"] == 100
+    assert result["accounts"][0]["liability_type"] == "credit_card"
+    assert result["accounts"][0]["statement_balance"] == 600
+    assert result["accounts"][0]["grace_period_due_date"] == "2026-09-15"
+
+
+def test_debt_payoff_places_current_month_grace_payment_in_current_month(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+    decision_db.connect().execute("UPDATE accounts SET balance=-1000 WHERE id='credit'")
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={
+            "credit": {
+                "liability_type": "credit_card",
+                "apr_pct": 0,
+                "minimum_payment": 100,
+                "grace_period_payment": 600,
+                "grace_period_due_date": "2026-08-30",
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result["schedule"][0]["date"] == "2026-08-31"
+    assert result["schedule"][0]["accounts"][0]["payment"] == 600
+
+
+def test_debt_payoff_supports_installment_schedule_out_of_balance(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+    decision_db.connect().execute(
+        """INSERT INTO accounts(
+               id,title,type,instrument,balance,in_balance,savings,archive,user,changed
+           ) VALUES ('installment','Installment','checking',1,-300,0,0,0,1,1)"""
+    )
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={
+            "installment": {
+                "liability_type": "installment",
+                "payment_schedule": [
+                    {"date": "2026-09-30", "amount": 100},
+                    {"date": "2026-10-31", "amount": 200},
+                ],
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result["starting_debt"] == 300
+    assert result["estimated_payoff_months"] == 2
+    assert [month["total_payment"] for month in result["schedule"]] == [100, 200]
+    assert result["accounts"][0]["liability_type"] == "installment"
+
+
+def test_debt_payoff_keeps_current_and_next_month_installments_separate(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+    decision_db.connect().execute(
+        """INSERT INTO accounts(
+               id,title,type,instrument,balance,in_balance,savings,archive,user,changed
+           ) VALUES ('installment','Installment','checking',1,-300,0,0,0,1,1)"""
+    )
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={
+            "installment": {
+                "liability_type": "installment",
+                "payment_schedule": [
+                    {"date": "2026-08-30", "amount": 100},
+                    {"date": "2026-09-30", "amount": 200},
+                ],
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    assert [row["date"] for row in result["schedule"]] == [
+        "2026-08-31",
+        "2026-09-30",
+    ]
+    assert [row["total_payment"] for row in result["schedule"]] == [100, 200]
+
+
+def test_current_month_event_does_not_start_unrelated_recurring_debt_early(
+    decision_db,
+):
+    decision_db.connect().execute("UPDATE accounts SET balance=-1000 WHERE id='loan'")
+    decision_db.connect().execute(
+        """INSERT INTO accounts(
+               id,title,type,instrument,balance,in_balance,savings,archive,user,changed
+           ) VALUES ('installment','Installment','checking',1,-50,0,0,0,1,1)"""
+    )
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="avalanche",
+        monthly_extra_payment=50,
+        debt_accounts={
+            "loan": {"apr_pct": 12, "fixed_payment": 100},
+            "installment": {
+                "liability_type": "installment",
+                "payment_schedule": [
+                    {"date": "2026-08-30", "amount": 100},
+                ],
+            },
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    current = {row["account_id"]: row for row in result["schedule"][0]["accounts"]}
+    following = {row["account_id"]: row for row in result["schedule"][1]["accounts"]}
+    assert result["schedule"][0]["date"] == "2026-08-31"
+    assert (current["loan"]["interest"], current["loan"]["payment"]) == (0, 0)
+    assert current["installment"]["payment"] == 50
+    assert result["schedule"][1]["date"] == "2026-09-30"
+    assert (following["loan"]["interest"], following["loan"]["payment"]) == (10, 150)
+
+
+def test_debt_payoff_supports_user_only_arbitrary_liability(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="minimum_only",
+        debt_accounts={
+            "medical": {
+                "liability_type": "arbitrary",
+                "title": "Medical debt",
+                "balance": 250,
+                "minimum_payment": 100,
+            }
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    assert result["starting_debt"] == 250
+    assert result["estimated_payoff_months"] == 3
+    assert result["accounts"][0]["account_id"] == "medical"
+    assert result["accounts"][0]["title"] == "Medical debt"
+    assert result["accounts"][0]["apr_pct"] == 0
+
+
+def test_debt_payoff_rolls_freed_payment_budget_to_next_liability(decision_db):
+    decision_db.connect().execute("UPDATE accounts SET balance=-100 WHERE id='loan'")
+    add_debt(decision_db, "second", 300)
+
+    result = plan_debt_payoff(
+        decision_db,
+        strategy="avalanche",
+        debt_accounts={
+            "loan": {"apr_pct": 20, "minimum_payment": 60},
+            "second": {"apr_pct": 10, "minimum_payment": 60},
+        },
+        as_of=date(2026, 8, 23),
+    )
+
+    second_month = {
+        item["account_id"]: item for item in result["schedule"][1]["accounts"]
+    }
+    assert second_month["loan"]["ending_balance"] == 0
+    assert second_month["second"]["payment"] > 60
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        {
+            "liability_type": "credit_card",
+            "apr_pct": 0,
+            "minimum_payment": 100,
+            "grace_period_payment": 500,
+        },
+        {
+            "liability_type": "installment",
+            "payment_schedule": [
+                {"date": "2026-08-01", "amount": 100},
+            ],
+        },
+        {
+            "liability_type": "arbitrary",
+            "balance": 100,
+        },
+    ],
+)
+def test_debt_payoff_rejects_incomplete_liability_models(decision_db, configuration):
+    decision_db.connect().execute("UPDATE accounts SET balance=0 WHERE id='loan'")
+
+    with pytest.raises(InputValidationError):
+        plan_debt_payoff(
+            decision_db,
+            strategy="minimum_only",
+            debt_accounts={"custom": configuration},
+            as_of=date(2026, 8, 23),
+        )
+
+
+def test_debt_payoff_rejects_fields_from_another_liability_model(decision_db):
+    with pytest.raises(InputValidationError):
+        plan_debt_payoff(
+            decision_db,
+            strategy="minimum_only",
+            debt_accounts={
+                "loan": {
+                    "liability_type": "fixed_loan",
+                    "apr_pct": 0,
+                    "minimum_payment": 100,
+                    "payment_schedule": [
+                        {"date": "2026-09-30", "amount": 100},
+                    ],
+                }
+            },
+            as_of=date(2026, 8, 23),
+        )
+
+
+def test_debt_payoff_rejects_non_object_configuration(decision_db):
+    with pytest.raises(InputValidationError):
+        plan_debt_payoff(decision_db, debt_accounts=[])
 
 
 def test_avalanche_targets_highest_apr_after_minimums(decision_db):

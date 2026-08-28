@@ -3,12 +3,12 @@
 ## Boundary and data flow
 
 The planning layer is deterministic decision support, not an autonomous
-financial adviser. It reads the synchronized local cache through the Phase 2
+financial adviser. It reads the synchronized local cache through the factual
 financial snapshot, cash-flow, spending-baseline, emergency-fund, debt-service,
 and forecast primitives. It does not rescan transaction history, synchronize,
 call a remote API, or write to ZenMoney.
 
-The seven planning tools return structured inputs, assumptions, constraints,
+The eight planning tools return structured inputs, assumptions, constraints,
 reasons, alternatives, and outcomes. Missing personal inputs produce
 `configuration_required` with field-level reasons. No confidence score is
 calculated; planning outputs use the categorical `high`, `medium`, or `low`
@@ -38,10 +38,28 @@ actually supplied. The nearest future planned transfer into an obligation may
 provide a medium-confidence payment estimate with source `reminder`. It is not
 presented as a contractual bank minimum.
 
-The existing amortization tools intentionally continue to model only negative
-`loan` and `debt` accounts. Credit-card, installment, and arbitrary-liability
-payoff schedules require their richer product-specific contract and are not
-silently forced into the older fixed-payment model.
+Debt payoff includes every active negative-balance obligation. The caller must
+provide its product terms explicitly; the server never infers APR or payment
+rules from a name, category, merchant, or transaction history. A user-only
+liability absent from ZenMoney is accepted only as `arbitrary` with an explicit
+positive balance.
+
+## Unified financial position
+
+`get_financial_position` deliberately ignores `inBalance` as an economic
+boundary. It includes every positive balance on an active account as an asset
+and every negative balance as a liability. Cash, checking, electronic money,
+credit-card positive balances, and accessible non-deposit savings are liquid;
+the remaining positive balances are restricted assets. Negative balances are
+reported as loans, credit cards, installments, or personal debts; the `other`
+classification is included in personal debts so the liability total stays
+complete.
+
+Net worth is `total_assets - total_liabilities`. Operating income, operating
+expenses, cash debt service, and free cash flow after debt service are arithmetic
+means over the three most recent complete ZenMoney budget periods. The output states
+this basis explicitly and returns the same data-quality warnings used by the
+cash-flow primitives.
 
 ## Cash-flow components
 
@@ -101,9 +119,9 @@ remaining amount is described as free cash flow. The remaining capacity is then
 allocated once, sequentially. Liquidity-buffer contributions also reduce the
 emergency-fund gap, preventing the same money from being allocated twice.
 
-The policy is a visible constant in the planning layer. Phase 3 does not expose
-a policy override; a later profile layer can replace it without changing the
-calculation engines.
+The policy is a visible constant in the planning layer. The current API does not
+expose a policy override; a later profile layer can replace it without changing
+the calculation engines.
 
 ## Money and dates
 
@@ -118,7 +136,7 @@ on 23 August treats 30 September as the first future contribution date; four
 future contributions complete on 31 December. Dates earlier than that first
 future month end cannot use deadline mode.
 
-Investment return is zero throughout Phase 3. The optional
+Investment return is zero in the current decision-support model. The optional
 `annual_return_pct` goal field accepts only `0`.
 
 ## Emergency fund
@@ -143,9 +161,22 @@ has no estimated completion date.
 
 ## Debt amortization
 
-APR and minimum payment are required for every active `loan` or `debt` account
-used by the amortization tools. They are never inferred from transactions. For
-each calendar month and account:
+Every active negative-balance obligation requires a matching `debt_accounts`
+entry. Four explicit models are supported:
+
+| Model | Required terms | Optional terms |
+|---|---|---|
+| `fixed_loan` | `apr_pct` and exactly one of `fixed_payment` or legacy `minimum_payment` | title or scenario balance for an existing obligation |
+| `credit_card` | `apr_pct`, `minimum_payment` | `statement_balance`; paired grace payment and future due date |
+| `installment` | one to 120 unique future dated payments | `apr_pct`, defaulting to zero |
+| `arbitrary` | `minimum_payment`; also `balance` when absent from ZenMoney | title and `apr_pct`, defaulting to zero |
+
+Product-specific fields are rejected on incompatible models. Statement balance
+cannot exceed total card debt. Grace payment and due date are supplied together,
+and a scheduled or grace date must be in the future and within the 120-month
+horizon.
+
+For each calendar month and liability:
 
 ```text
 monthly rate = APR / 100 / 12
@@ -156,12 +187,20 @@ principal = payment - interest
 ending balance = max(0, opening balance + interest - payment)
 ```
 
-`minimum_only` pays only each active minimum. `avalanche` applies the remaining
-fixed monthly budget to highest APR, breaking ties by smaller balance and then
-account ID. `snowball` applies it to smallest balance, breaking ties by higher
-APR and then account ID. `custom` requires every active account exactly once in
-`custom_order`. Avalanche and snowball roll released payments into the remaining
-fixed budget.
+A grace or installment payment due later in the current calendar month creates
+a leading partial-month row dated at that month end. That row contains only the
+explicitly dated payments: recurring minimums on unrelated liabilities, monthly
+extra payment, and the next monthly interest charge begin in the following full
+month. This leading partial row is outside the 120-full-month planning horizon,
+so a result may contain at most 121 rows and counts that partial row in
+`estimated_payoff_months`.
+
+`minimum_only` pays only the model's fixed, minimum, grace, or scheduled amount.
+`avalanche` applies the remaining monthly budget to highest APR, breaking ties by
+smaller balance and then account ID. `snowball` applies it to smallest balance,
+breaking ties by higher APR and then account ID. `custom` requires every active
+liability exactly once in `custom_order`. Avalanche, snowball, and custom retain
+released payments in the shared budget after a liability is repaid.
 
 Exact final payments are capped at the remaining amount due. If payment does not
 exceed interest and no account makes positive principal progress, the result
@@ -169,6 +208,32 @@ reports `negative_amortization` and no payoff date. Strategy comparison names
 separate winners for lowest interest and shortest duration; it never declares a
 strategy universally best. Schedules stop after 120 months and report
 `payoff_horizon_exceeded` instead of returning an unbounded payload.
+
+## Transaction search and split
+
+`search_transactions` accepts an arbitrary ISO date range, single or array
+category/account filters, `categorized` or `uncategorized` state, and stable
+sorting by date or converted amount in either direction. Results are bounded to
+1–200 rows. `next_cursor` is an opaque, versioned keyset cursor tied to the chosen
+sort field and direction; callers must reuse all filters and must not inspect or
+modify the cursor. `total_matching` counts the complete filtered set, not the
+remaining rows after the cursor. Uncategorized means `tag IS NULL` or an empty
+JSON category array.
+
+Transaction split is a confirmed write, never a direct client-side sequence.
+`prepare_transaction_changes` or `prepare_mixed_changes` expands one `split`
+operation into an update of the source transaction and creates for the remaining
+parts. Only a full, posted, undeleted one-sided income or outcome can be split;
+transfers and holds are rejected. There must be 2–100 positive parts whose amounts
+match the source exactly, with at most one positive `remainder`.
+
+The source ID stays on the first part. New parts receive UUIDs and preserve the
+source raw metadata, including creation time, bank IDs, original payee, MCC,
+reminder marker, and unknown sync fields. Native and operation-currency amounts
+are divided with `Decimal`; cumulative half-up rounding keeps each operation
+amount non-negative and puts the exact residual into the last part. All split
+items are sent in one Diff batch. A changed source rejects the proposal before
+write, and applying a terminal proposal again does not resend it.
 
 ## Goals
 
@@ -208,13 +273,13 @@ than silently clamped to zero.
 
 The scenario does not reforecast debt interest without a complete amortization
 configuration; that limitation is returned whenever extra principal is modeled.
-Phase 2 scheduled forecasts cover only their supported short horizons, so the
+Scheduled forecasts cover only their supported short horizons, so the
 scenario does not invent long-range reminders.
 
 ## Integrated plan and recommendations
 
 The integrated plan composes the financial snapshot, 30-day forecast,
-emergency-fund status, debt service, configured goals, and the Phase 3 engines.
+emergency-fund status, debt service, configured goals, and the decision engines.
 Its `recommended_action` is always accompanied by `reason`, `tradeoffs`,
 `assumptions`, and `alternatives`. Recommendations describe the first unresolved
 priority under the default policy; they do not execute anything.
@@ -224,9 +289,10 @@ personal classifications are assumptions even when historical facts are
 complete. Limitations identify manually supplied essential categories, APR,
 minimum payments, goal deadlines, and deterministic scenario changes.
 
-## Phase 3 limitations
+## Decision-support limitations
 
-Phase 3 does not provide investment selection or optimization, retirement,
-tax, insurance, Monte Carlo, a dashboard, remote deployment, notifications,
-automatic execution, or any ZenMoney write operation. Persistent planning
-profiles are also out of scope; configuration is supplied in tool arguments.
+The current decision-support layer does not provide investment selection or
+optimization, retirement, tax, insurance, Monte Carlo, a dashboard, remote
+deployment, notifications, automatic execution, or any ZenMoney write operation.
+Persistent planning profiles are also out of scope; configuration is supplied in
+tool arguments.

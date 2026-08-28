@@ -50,6 +50,61 @@ async def test_call_tool_requires_and_accepts_hardened_database():
 
 
 @pytest.mark.asyncio
+async def test_search_dispatch_passes_pagination_arguments():
+    db = HardenedDatabase(":memory:")
+    db.init_schema()
+    conn = db.connect()
+    conn.execute(
+        "INSERT INTO instruments(id,title,short_title,symbol,rate,changed) "
+        "VALUES (1,'Ruble','RUB','₽',1,1)"
+    )
+    conn.execute(
+        "INSERT INTO users(id,login,currency,parent,month_start_day,changed) "
+        "VALUES (1,'u',1,NULL,1,1)"
+    )
+    conn.execute(
+        "INSERT INTO accounts(id,title,type,instrument,balance,in_balance,savings,archive,user,changed) "
+        "VALUES ('cash','Cash','checking',1,1000,1,0,0,1,1)"
+    )
+    conn.executemany(
+        """INSERT INTO transactions(
+               id,date,user,deleted,hold,income,income_instrument,income_account,
+               outcome,outcome_instrument,outcome_account,tag,changed
+           ) VALUES (?,'2026-01-15',1,0,0,0,1,'cash',?,1,'cash',NULL,1)""",
+        [('small', 10), ('large', 20)],
+    )
+    try:
+        first = await server.call_tool(
+            "search_transactions",
+            {
+                "category_state": "uncategorized",
+                "sort_by": "amount",
+                "sort_order": "desc",
+                "limit": 1,
+            },
+            db=db,
+        )
+        first_result = json.loads(first[0].text)
+        second = await server.call_tool(
+            "search_transactions",
+            {
+                "category_state": "uncategorized",
+                "sort_by": "amount",
+                "sort_order": "desc",
+                "limit": 1,
+                "cursor": first_result["next_cursor"],
+            },
+            db=db,
+        )
+        assert [item["id"] for item in first_result["transactions"]] == ["large"]
+        assert [
+            item["id"] for item in json.loads(second[0].text)["transactions"]
+        ] == ["small"]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_tool_discovery_applies_hardening_without_registration_patch():
     descriptors = {tool.name: tool for tool in await server.list_tools()}
     tools = {name: tool.input_schema for name, tool in descriptors.items()}
@@ -59,6 +114,18 @@ async def test_tool_discovery_applies_hardening_without_registration_patch():
     assert spending["top_n"]["minimum"] == 1
     assert spending["top_n"]["maximum"] == 100
     assert spending["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
+    search = tools["search_transactions"]["properties"]
+    assert search["sort_by"]["enum"] == ["date", "amount"]
+    assert search["sort_order"]["enum"] == ["asc", "desc"]
+    assert search["category_state"]["enum"] == [
+        "any",
+        "categorized",
+        "uncategorized",
+    ]
+    assert search["category_ids"]["maxItems"] == 100
+    assert search["account_ids"]["maxItems"] == 100
+    assert search["cursor"]["maxLength"] == 2048
+    assert tools["search_transactions"]["additionalProperties"] is False
     assert not ({"force_sync", "get_sync_status"} & set(tools))
     assert {
         *server.PREPARE_TOOL_ENTITIES,
@@ -129,6 +196,29 @@ async def test_change_tool_schemas_are_bounded_strict_and_entity_specific():
         *server.PREPARE_TOOL_ENTITIES.values()
     }
     assert tools["apply_changes"].input_schema["required"] == ["proposal_id"]
+    transaction_operations = tools["prepare_transaction_changes"].input_schema[
+        "properties"
+    ]["operations"]["items"]["oneOf"]
+    split = next(
+        branch
+        for branch in transaction_operations
+        if branch["properties"]["operation"].get("const") == "split"
+    )
+    assert split["required"] == ["operation", "transaction_id", "parts"]
+    assert split["properties"]["parts"]["minItems"] == 2
+    assert split["properties"]["parts"]["maxItems"] == 100
+    mixed_split = next(
+        branch
+        for branch in mixed
+        if branch["properties"]["entity"]["const"] == "transaction"
+        and branch["properties"]["operation"].get("const") == "split"
+    )
+    assert mixed_split["required"] == [
+        "entity",
+        "operation",
+        "transaction_id",
+        "parts",
+    ]
 
 
 @pytest.mark.asyncio

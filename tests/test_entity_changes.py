@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import math
 import uuid
 
@@ -198,6 +199,147 @@ def test_mixed_create_resolves_typed_refs_and_owner(financial_db):
     assert items[1]["resolved"]["tag"] == [items[0]["entity_id"]]
     assert items[1]["resolved"]["user"] == 1
     assert items[1]["resolved"]["created"] == 100
+
+
+def test_split_normalizes_exact_parts_and_preserves_bank_metadata(financial_db):
+    financial_db.upsert_tags(
+        [{"id": "other", "title": "Other", "showIncome": False,
+          "showOutcome": True, "budgetIncome": False, "budgetOutcome": True,
+          "user": 1, "changed": 1}]
+    )
+    raw = financial_db.get_transaction_raw("transaction")
+    financial_db.upsert_transactions(
+        [{
+            **raw,
+            "outcome": 100,
+            "opOutcome": 1,
+            "opOutcomeInstrument": 1,
+            "outcomeBankID": "bank-operation",
+            "originalPayee": "Original shop",
+            "future": {"kept": True},
+            "created": 2,
+            "changed": 10,
+        }]
+    )
+
+    items = normalize_operations(
+        financial_db,
+        [{
+            "operation": "split",
+            "transaction_id": "transaction",
+            "parts": [
+                {"amount": 25, "category_id": "food"},
+                {"amount": "remainder", "category_id": "other"},
+            ],
+        }],
+        entity_type="transaction",
+        now=100,
+    )
+
+    assert [item["operation"] for item in items] == ["update", "create"]
+    assert items[0]["entity_id"] == "transaction"
+    assert items[0]["expected_changed"] == 10
+    assert items[0]["after"] == {
+        "outcome": 25.0,
+        "opOutcome": 0.25,
+        "tag": ["food"],
+    }
+    created = items[1]["after"]
+    assert uuid.UUID(created["id"]).version == 4
+    assert created["outcome"] == 75
+    assert created["opOutcome"] == 0.75
+    assert created["tag"] == ["other"]
+    assert created["outcomeBankID"] == "bank-operation"
+    assert created["originalPayee"] == "Original shop"
+    assert created["future"] == {"kept": True}
+    assert created["created"] == 2
+    assert sum(item["after"]["outcome"] for item in items) == 100
+    assert sum(item["after"]["opOutcome"] for item in items) == 1
+
+
+def test_split_keeps_rounded_operation_amounts_non_negative(financial_db):
+    raw = financial_db.get_transaction_raw("transaction")
+    financial_db.upsert_transactions(
+        [{**raw, "outcome": 1, "opOutcome": 0.5, "opOutcomeInstrument": 1}]
+    )
+
+    items = normalize_operations(
+        financial_db,
+        [{
+            "operation": "split",
+            "transaction_id": "transaction",
+            "parts": [
+                *[{"amount": 0.01, "category_id": "food"} for _ in range(99)],
+                {"amount": "remainder", "category_id": "food"},
+            ],
+        }],
+        entity_type="transaction",
+    )
+
+    operation_amounts = [item["after"]["opOutcome"] for item in items]
+    assert min(operation_amounts) >= 0
+    assert sum(Decimal(str(amount)) for amount in operation_amounts) == Decimal("0.5")
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [
+            {"amount": 30, "category_id": "food"},
+            {"amount": 60, "category_id": "food"},
+        ],
+        [
+            {"amount": "remainder", "category_id": "food"},
+            {"amount": "remainder", "category_id": "food"},
+        ],
+        [
+            {"amount": 100, "category_id": "food"},
+            {"amount": "remainder", "category_id": "food"},
+        ],
+        [{"amount": 100, "category_id": "food"}],
+    ],
+)
+def test_split_rejects_invalid_part_totals(financial_db, parts):
+    raw = financial_db.get_transaction_raw("transaction")
+    financial_db.upsert_transactions([{**raw, "outcome": 100, "changed": 10}])
+
+    with pytest.raises(MutationValidationError):
+        normalize_operations(
+            financial_db,
+            [{
+                "operation": "split",
+                "transaction_id": "transaction",
+                "parts": parts,
+            }],
+            entity_type="transaction",
+        )
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"income": 100, "outcome": 100},
+        {"hold": True, "outcome": 100},
+        {"deleted": True, "outcome": 100},
+    ],
+)
+def test_split_rejects_transfer_hold_and_deleted_source(financial_db, patch):
+    raw = financial_db.get_transaction_raw("transaction")
+    financial_db.upsert_transactions([{**raw, **patch, "changed": 10}])
+
+    with pytest.raises(MutationValidationError):
+        normalize_operations(
+            financial_db,
+            [{
+                "entity": "transaction",
+                "operation": "split",
+                "transaction_id": "transaction",
+                "parts": [
+                    {"amount": 1, "category_id": "food"},
+                    {"amount": "remainder", "category_id": "food"},
+                ],
+            }],
+        )
 
 
 def test_mixed_create_supports_all_seven_user_entity_types(financial_db):

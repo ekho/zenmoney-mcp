@@ -51,6 +51,7 @@ from .planning import (
     get_cash_flow,
     get_debt_service,
     get_emergency_fund_status,
+    get_financial_position,
     get_financial_snapshot,
     get_spending_baseline,
 )
@@ -418,6 +419,17 @@ def _planning_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_financial_position",
+            description="Get one economic view of all active assets, liabilities, net worth, and monthly cash flow after debt service.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "obligation_overrides": _OBLIGATION_OVERRIDES_SCHEMA,
+                },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
             name="forecast_cash_flow",
             description="Get transparent 30/60/90-day scheduled, recurring, and baseline cash-flow scenarios.",
             inputSchema={
@@ -441,21 +453,75 @@ _DEBT_ACCOUNTS_SCHEMA = {
     "additionalProperties": {
         "type": "object",
         "properties": {
+            "liability_type": {
+                "type": "string",
+                "enum": [
+                    "fixed_loan",
+                    "credit_card",
+                    "installment",
+                    "arbitrary",
+                ],
+                "description": "Explicit payoff model; inferred from the obligation class when omitted",
+            },
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Display title, primarily for user-only arbitrary liabilities",
+            },
+            "balance": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Explicit scenario balance; required for a liability absent from ZenMoney",
+            },
             "apr_pct": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Nominal annual percentage rate; never inferred",
+                "description": "Nominal annual percentage rate; defaults to zero only for installment and arbitrary liabilities",
+            },
+            "fixed_payment": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Fixed loan payment; mutually exclusive with minimum_payment",
             },
             "minimum_payment": {
                 "type": "number",
                 "minimum": 0,
-                "description": "Required monthly minimum payment",
+                "description": "Monthly minimum for credit cards and arbitrary liabilities; legacy fixed-loan payment",
+            },
+            "statement_balance": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Credit-card statement balance, tracked separately from total debt",
+            },
+            "grace_period_payment": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Credit-card grace payment due on grace_period_due_date",
+            },
+            "grace_period_due_date": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": "Future credit-card grace deadline",
+            },
+            "payment_schedule": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 120,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "pattern": _DATE_PATTERN},
+                        "amount": {"type": "number", "exclusiveMinimum": 0},
+                    },
+                    "required": ["date", "amount"],
+                    "additionalProperties": False,
+                },
+                "description": "Future dated payments for an installment",
             },
         },
-        "required": ["apr_pct", "minimum_payment"],
         "additionalProperties": False,
     },
-    "description": "Planning configuration keyed by ZenMoney debt account ID",
+    "description": "Payoff configuration keyed by obligation ID; arbitrary user-only IDs are supported with explicit balance",
 }
 
 _OBLIGATION_OVERRIDES_SCHEMA = {
@@ -928,6 +994,46 @@ def _mutation_tools() -> list[Tool]:
                 "additionalProperties": False,
             },
         ]
+        if entity_type == "transaction":
+            operations.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        **common,
+                        "operation": {"const": "split"},
+                        "transaction_id": string,
+                        "parts": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 100,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "amount": {
+                                        "oneOf": [
+                                            {
+                                                "type": "number",
+                                                "exclusiveMinimum": 0,
+                                            },
+                                            {"const": "remainder"},
+                                        ]
+                                    },
+                                    "category_id": ref,
+                                },
+                                "required": ["amount", "category_id"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": [
+                        *required_common,
+                        "operation",
+                        "transaction_id",
+                        "parts",
+                    ],
+                    "additionalProperties": False,
+                }
+            )
         if entity_type in SAFE_DELETE:
             operations.append(
                 {
@@ -1460,6 +1566,26 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "type": "string",
                         "description": "Account UUID",
                     },
+                    "category_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Category IDs; descendants are included",
+                    },
+                    "account_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                        "uniqueItems": True,
+                        "description": "Account IDs matched on either transaction side",
+                    },
+                    "category_state": {
+                        "type": "string",
+                        "enum": ["any", "categorized", "uncategorized"],
+                        "default": "any",
+                        "description": "Filter transactions by category presence",
+                    },
                     "merchant_id": {
                         "type": "string",
                         "description": "Merchant UUID",
@@ -1486,7 +1612,23 @@ async def list_tools(remote: bool = False) -> list[Tool]:
                         "description": "Maximum results",
                         "default": 50,
                     },
+                    "cursor": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "description": "Opaque cursor from the previous page",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["date", "amount"],
+                        "default": "date",
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "default": "desc",
+                    },
                 },
+                "additionalProperties": False,
             },
         ),
     ] + _planning_tools() + _decision_tools() + _entity_read_tools()
@@ -1878,6 +2020,12 @@ async def _dispatch_tool(
             limit=arguments.get("limit", 50),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
+            cursor=arguments.get("cursor"),
+            sort_by=arguments.get("sort_by", "date"),
+            sort_order=arguments.get("sort_order", "desc"),
+            category_state=arguments.get("category_state", "any"),
+            category_ids=arguments.get("category_ids"),
+            account_ids=arguments.get("account_ids"),
         )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
@@ -1923,6 +2071,12 @@ async def _dispatch_tool(
 
     elif name == "get_debt_service":
         result = get_debt_service(db, arguments.get("obligation_overrides"))
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    elif name == "get_financial_position":
+        result = get_financial_position(
+            db, arguments.get("obligation_overrides")
+        )
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "forecast_cash_flow":

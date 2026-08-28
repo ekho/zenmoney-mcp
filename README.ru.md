@@ -16,13 +16,13 @@ MCP-сервер для надёжной аналитики личных фин�
 
 ## Полный каталог инструментов
 
-Локальный и удалённый режимы открывают по 56 инструментов. Из них 54 общие,
+Локальный и удалённый режимы открывают по 57 инструментов. Из них 55 общие,
 ещё по два отвечают за синхронизацию и подбор категорий в конкретном режиме.
 
 | Область | Инструменты |
 |---|---|
 | Финансовая аналитика | `get_net_worth`, `get_liquidity`, `analyze_spending`, `analyze_income`, `analyze_merchants`, `check_budget_health`, `get_upcoming_payments`, `analyze_trends`, `detect_recurring`, `get_account_flow`, `analyze_transfers`, `detect_anomalies`, `get_debts`, `convert_currency`, `get_exchange_rates`, `search_transactions` |
-| Аналитика для планирования | `get_financial_snapshot`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
+| Аналитика для планирования | `get_financial_snapshot`, `get_financial_position`, `get_cash_flow`, `get_spending_baseline`, `compare_periods`, `get_emergency_fund_status`, `get_debt_service`, `forecast_cash_flow` |
 | Поддержка решений | `plan_emergency_fund`, `plan_debt_payoff`, `compare_debt_strategies`, `plan_financial_goal`, `plan_multiple_goals`, `run_financial_scenario`, `build_financial_plan` |
 | Чтение сущностей | `list_accounts`, `get_account`, `list_tags`, `get_tag`, `list_merchants`, `get_merchant`, `list_reminders`, `get_reminder`, `list_reminder_markers`, `get_reminder_marker`, `list_transactions`, `get_transaction`, `list_budgets`, `get_budget` |
 | Подтверждённые изменения сущностей | `prepare_account_changes`, `prepare_tag_changes`, `prepare_merchant_changes`, `prepare_reminder_changes`, `prepare_reminder_marker_changes`, `prepare_transaction_changes`, `prepare_budget_changes`, `prepare_mixed_changes`, `get_change_proposal`, `apply_changes` |
@@ -51,7 +51,8 @@ MCP-сервер для надёжной аналитики личных фин�
 | Найти подходящие транзакции | `search_transactions` |
 | Что происходило на этом счёте? | `get_account_flow` |
 | Конвертировать валюты | `convert_currency`, `get_exchange_rates` |
-| Общая финансовая картина | `get_financial_snapshot` |
+| Активы, обязательства, чистый капитал и свободный денежный поток | `get_financial_position` |
+| Старый финансовый снимок с учётом `inBalance` | `get_financial_snapshot` |
 | Денежный поток за месяц | `get_cash_flow` |
 | Обычный уровень расходов | `get_spending_baseline` |
 | Сравнить периоды | `compare_periods` |
@@ -98,6 +99,25 @@ ZenMoney, которых изменение не касается. Если по
 предложение живёт 24 часа, завершённое хранится 30 дней. Если результат записи
 или проверки неясен, предложение переходит в состояние `needs_review`.
 
+`prepare_transaction_changes` также умеет делить односторонний доход или расход.
+Первая часть сохраняет ID исходной транзакции, остальные получают новые ID. Все
+части уходят одним Diff-запросом, сохраняют исходные raw-поля и в сумме должны
+точно совпасть с исходной операцией. Одна часть может быть `remainder`, чтобы не
+ловить расхождения из-за десятичных дробей:
+
+```json
+{
+  "operations": [{
+    "operation": "split",
+    "transaction_id": "transaction-id",
+    "parts": [
+      {"amount": 730, "category_id": "groceries-category-id"},
+      {"amount": "remainder", "category_id": "household-category-id"}
+    ]
+  }]
+}
+```
+
 Аналитика для планирования намеренно осторожна:
 
 - для расчёта финансовой подушки нужны явные идентификаторы обязательных
@@ -106,14 +126,35 @@ ZenMoney, которых изменение не касается. Если по
   денежные платежи по обязательствам;
 - `get_debt_service` включает каждый активный счёт с отрицательным балансом
   независимо от `inBalance`;
+- `get_financial_position` по той же экономической границе учитывает все
+  положительные активы и отрицательные обязательства, а также показывает средние
+  операционные потоки и платежи по долгам за три полных месяца;
 - неизвестные APR и условия платежей остаются `null`, пока пользователь не
   задаст их явно;
 - поиск регулярных платежей опирается на историю и прямо помечен как эвристика;
 - прогнозы денежного потока показывают понятные сценарии, а не гарантируют будущее.
 
+`search_transactions` поддерживает стабильную постраничную выдачу через cursor,
+сортировку по дате или сумме в валюте пользователя, массивы категорий и счетов,
+а также явный фильтр наличия категории. Чтобы получить все расходы без категории
+за произвольный период от крупных к мелким, передавайте полученный `next_cursor`
+в следующий вызов с теми же фильтрами:
+
+```json
+{
+  "start_date": "2026-01-01",
+  "end_date": "2026-08-31",
+  "type": "outcome",
+  "category_state": "uncategorized",
+  "sort_by": "amount",
+  "sort_order": "desc",
+  "limit": 50
+}
+```
+
 ## Финансовое планирование
 
-Фаза 3 добавляет детерминированную поддержку решений поверх фактической
+Сервер добавляет детерминированную поддержку решений поверх фактической
 аналитики. Каждый результат показывает исходные данные, допущения, ограничения,
 причины, альтернативы и измеримые последствия. Само финансовое решение сервер
 не исполняет и не записывает.
@@ -151,6 +192,42 @@ ZenMoney, которых изменение не касается. Если по
 и будущие снимки на конец календарного месяца. Депозиты с ограничениями не
 попадают в резерв подушки, пока вы явно их не включите. Кредитный лимит не
 учитывается никогда.
+
+План погашения поддерживает четыре явные модели. Для существующего счёта с
+отрицательным балансом можно задать `fixed_loan`, `credit_card` или `installment`.
+Обязательство, которого нет в ZenMoney, задаётся как `arbitrary` с явным балансом:
+
+```json
+{
+  "strategy": "avalanche",
+  "monthly_extra_payment": 5000,
+  "debt_accounts": {
+    "loan-account-id": {
+      "liability_type": "fixed_loan",
+      "apr_pct": 19.9,
+      "fixed_payment": 15000
+    },
+    "card-account-id": {
+      "liability_type": "credit_card",
+      "apr_pct": 29.9,
+      "minimum_payment": 5000,
+      "statement_balance": 42000,
+      "grace_period_payment": 42000,
+      "grace_period_due_date": "2026-09-15"
+    },
+    "installment-account-id": {
+      "liability_type": "installment",
+      "payment_schedule": [{"date": "2026-09-30", "amount": 10000}]
+    },
+    "family-loan": {
+      "liability_type": "arbitrary",
+      "title": "Семейный долг",
+      "balance": 50000,
+      "minimum_payment": 5000
+    }
+  }
+}
+```
 
 Политика приоритетов, формулы, округление, метки качества данных и ограничения
 описаны в [`docs/planning-semantics.md`](docs/planning-semantics.md).

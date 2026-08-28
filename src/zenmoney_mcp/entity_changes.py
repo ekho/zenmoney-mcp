@@ -6,6 +6,7 @@ import math
 import time
 import uuid
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from .hardened_database import HardenedDatabase, USER_ENTITY_TABLES, entity_key
@@ -542,6 +543,153 @@ def _raw_for_operation(
     return key, raw
 
 
+def _split_amount(value: Any, field: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MutationValidationError(f"{field} must be a positive number")
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount <= 0:
+        raise MutationValidationError(f"{field} must be a positive number")
+    return amount
+
+
+def _proportional_amounts(
+    total: Decimal, parts: list[Decimal], source_total: Decimal
+) -> list[Decimal]:
+    if total == 0:
+        return [Decimal(0) for _ in parts]
+    quantum = Decimal("0.01")
+    allocated: list[Decimal] = []
+    cumulative = previous = Decimal(0)
+    for part in parts[:-1]:
+        cumulative += part
+        rounded = (total * cumulative / source_total).quantize(
+            quantum, rounding=ROUND_HALF_UP
+        )
+        allocated.append(rounded - previous)
+        previous = rounded
+    return [*allocated, total - previous]
+
+
+def _normalize_split(
+    db: HardenedDatabase,
+    body: dict[str, Any],
+    refs: dict[str, dict[str, Any]],
+    timestamp: int,
+) -> list[dict[str, Any]]:
+    if set(body) != {"operation", "transaction_id", "parts"}:
+        raise MutationValidationError("split operation fields are invalid")
+    transaction_id = _string(body["transaction_id"], "transaction_id")
+    key = entity_key("transaction", {"id": transaction_id})
+    raw = db.get_entity_raw("transaction", key)
+    if raw is None:
+        raise MutationValidationError("transaction does not exist in the full snapshot")
+    if raw.get("deleted") or raw.get("hold"):
+        raise MutationValidationError("deleted or hold transaction cannot be split")
+    owner = _integer(raw.get("user"), "user")
+    changed = _integer(raw.get("changed"), "changed")
+    income = Decimal(str(_number(raw.get("income"), "income")))
+    outcome = Decimal(str(_number(raw.get("outcome"), "outcome")))
+    if (income > 0) == (outcome > 0):
+        raise MutationValidationError("only one-sided income or outcome can be split")
+    amount_field = "income" if income > 0 else "outcome"
+    operation_field = "opIncome" if income > 0 else "opOutcome"
+    total = income if income > 0 else outcome
+
+    parts = body["parts"]
+    if not isinstance(parts, list) or not 2 <= len(parts) <= 100:
+        raise MutationValidationError("split parts must contain 2 to 100 items")
+    amounts: list[Decimal | None] = []
+    categories: list[str] = []
+    remainder_index: int | None = None
+    numeric_total = Decimal(0)
+    for position, part in enumerate(parts):
+        path = f"parts.{position}"
+        if not isinstance(part, dict) or set(part) != {"amount", "category_id"}:
+            raise MutationValidationError(
+                f"{path} must contain amount and category_id"
+            )
+        if part["amount"] == "remainder":
+            if remainder_index is not None:
+                raise MutationValidationError("split supports exactly one remainder")
+            remainder_index = position
+            amounts.append(None)
+        else:
+            amount = _split_amount(part["amount"], f"{path}.amount")
+            numeric_total += amount
+            amounts.append(amount)
+        categories.append(
+            _resolve_reference(
+                db,
+                part["category_id"],
+                "tag",
+                owner,
+                refs,
+                f"{path}.category_id",
+            )
+        )
+    if remainder_index is None:
+        if numeric_total != total:
+            raise MutationValidationError("split parts must sum exactly to the source amount")
+    else:
+        remainder = total - numeric_total
+        if remainder <= 0:
+            raise MutationValidationError("split remainder must be positive")
+        amounts[remainder_index] = remainder
+    resolved_amounts = [amount for amount in amounts if amount is not None]
+    assert len(resolved_amounts) == len(parts)
+
+    operation_amounts: list[Decimal] | None = None
+    if raw.get(operation_field) is not None:
+        operation_total = Decimal(
+            str(_number(raw[operation_field], f"source {operation_field}"))
+        )
+        operation_amounts = _proportional_amounts(
+            operation_total, resolved_amounts, total
+        )
+
+    items: list[dict[str, Any]] = []
+    for position, (amount, category_id) in enumerate(
+        zip(resolved_amounts, categories, strict=True)
+    ):
+        patch = {amount_field: float(amount), "tag": [category_id]}
+        if operation_amounts is not None:
+            patch[operation_field] = float(operation_amounts[position])
+        if position == 0:
+            after = patch
+            item = {
+                "entity_type": "transaction",
+                "entity_key": key,
+                "entity_id": transaction_id,
+                "operation": "update",
+                "expected_changed": changed,
+                "before": {field: raw.get(field) for field in patch},
+                "after": after,
+                "resolved": after,
+            }
+        else:
+            entity_id = str(uuid.uuid4())
+            after = {
+                **raw,
+                **patch,
+                "id": entity_id,
+                "changed": timestamp,
+            }
+            _validate_entity(db, "transaction", after, creating=True)
+            item = {
+                "entity_type": "transaction",
+                "entity_key": entity_key("transaction", after),
+                "entity_id": entity_id,
+                "operation": "create",
+                "expected_changed": None,
+                "before": None,
+                "after": after,
+                "resolved": after,
+            }
+        items.append(item)
+    _validate_entity(db, "transaction", {**raw, **items[0]["after"]}, creating=False)
+    return items
+
+
 def normalize_operations(
     db: HardenedDatabase,
     operations: Any,
@@ -574,8 +722,26 @@ def normalize_operations(
             body = dict(operation)
 
         action = body.get("operation")
-        if action not in {"create", "update", "delete"}:
-            raise MutationValidationError("operation must be create, update, or delete")
+        if action not in {"create", "update", "delete", "split"}:
+            raise MutationValidationError(
+                "operation must be create, update, delete, or split"
+            )
+
+        if action == "split":
+            if current_type != "transaction":
+                raise MutationValidationError("split is supported only for transactions")
+            split_items = _normalize_split(db, body, refs, timestamp)
+            if len(normalized) + len(split_items) > 100:
+                raise MutationValidationError(
+                    "normalized proposal must contain at most 100 items"
+                )
+            for item in split_items:
+                identity = (current_type, item["entity_key"])
+                if identity in identities:
+                    raise MutationValidationError("duplicate entity identity")
+                identities.add(identity)
+                normalized.append(item)
+            continue
 
         if action == "create":
             allowed = {"operation", "value", "ref", "owner_user_id"}

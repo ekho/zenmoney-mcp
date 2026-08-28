@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 
@@ -37,15 +38,26 @@ def user_currency(db: Any) -> CurrencyContext:
     )
 
 
+def convert_decimal(
+    db: Any,
+    amount: float | int | Decimal | None,
+    instrument_id: int | None,
+    target: CurrencyContext,
+) -> Decimal:
+    """Convert without losing precision or rounding before aggregation."""
+    numeric = Decimal(str(amount or 0))
+    if numeric == 0:
+        return Decimal(0)
+    if instrument_id is None:
+        raise FinancialDataError("currency instrument is missing for a non-zero amount")
+    rate = Decimal(str(db.require_instrument_rate(int(instrument_id))))
+    return numeric * rate / Decimal(str(target.rate))
+
+
 def convert(
     db: Any,
-    amount: float | int | None,
+    amount: float | int | Decimal | None,
     instrument_id: int | None,
     target: CurrencyContext,
 ) -> float:
-    numeric = float(amount or 0)
-    if numeric == 0:
-        return 0.0
-    if instrument_id is None:
-        raise FinancialDataError("currency instrument is missing for a non-zero amount")
-    return numeric * db.require_instrument_rate(int(instrument_id)) / target.rate
+    return float(convert_decimal(db, amount, instrument_id, target))
