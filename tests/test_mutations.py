@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import zenmoney_mcp.mutations as mutations
 from zenmoney_mcp.hardened_database import HardenedDatabase, entity_key
 from zenmoney_mcp.mutations import (
     MutationStateError,
@@ -151,6 +152,51 @@ def test_prepare_recurring_payment_rejects_invalid_references_or_dates(
 
     with pytest.raises(MutationValidationError):
         prepare_recurring_payment(
+            financial_db, ProposalStore(tmp_path / "proposals.db"), payment
+        )
+
+
+@pytest.mark.parametrize("field", ["user", "instrument"])
+def test_prepare_recurring_payment_rejects_incomplete_account_before_compile(
+    financial_db, tmp_path, monkeypatch, field
+):
+    account = financial_db.get_entity_raw(
+        "account", entity_key("account", {"id": "cash"})
+    )
+    financial_db.upsert_accounts([{**account, field: None}])
+    if field == "user":
+        tag = financial_db.get_entity_raw("tag", entity_key("tag", {"id": "food"}))
+        financial_db.upsert_tags([{**tag, "user": None}])
+
+    monkeypatch.setattr(
+        mutations,
+        "prepare_changes",
+        lambda *args, **kwargs: pytest.fail("invalid account reached compiler"),
+    )
+
+    with pytest.raises(MutationValidationError):
+        mutations.prepare_recurring_payment(
+            financial_db, ProposalStore(tmp_path / "proposals.db"), recurring_payment()
+        )
+
+
+@pytest.mark.parametrize(
+    "amount", [float("nan"), float("inf"), float("-inf"), True],
+    ids=["nan", "positive_infinity", "negative_infinity", "bool"],
+)
+def test_prepare_recurring_payment_rejects_nonfinite_or_bool_amount_before_compile(
+    financial_db, tmp_path, monkeypatch, amount
+):
+    payment = recurring_payment()
+    payment["amount"] = amount
+    monkeypatch.setattr(
+        mutations,
+        "prepare_changes",
+        lambda *args, **kwargs: pytest.fail("invalid amount reached compiler"),
+    )
+
+    with pytest.raises(MutationValidationError):
+        mutations.prepare_recurring_payment(
             financial_db, ProposalStore(tmp_path / "proposals.db"), payment
         )
 

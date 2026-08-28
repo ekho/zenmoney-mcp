@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
@@ -432,6 +433,7 @@ def prepare_recurring_payment(
         or not name
         or isinstance(amount, bool)
         or not isinstance(amount, (int, float))
+        or not math.isfinite(amount)
         or amount <= 0
         or not isinstance(account_id, str)
         or not account_id
@@ -462,6 +464,13 @@ def prepare_recurring_payment(
         raise MutationValidationError("account is unavailable")
     owner = account.get("user")
     instrument = account.get("instrument")
+    if (
+        isinstance(owner, bool)
+        or not isinstance(owner, int)
+        or isinstance(instrument, bool)
+        or not isinstance(instrument, int)
+    ):
+        raise MutationValidationError("account is unavailable")
     category = db.get_entity_raw("tag", entity_key("tag", {"id": category_id}))
     if category is None or category.get("user") != owner:
         raise MutationValidationError("category is unavailable")
