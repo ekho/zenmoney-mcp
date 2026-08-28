@@ -2298,7 +2298,8 @@ def detect_anomalies(
     same_merchant_amount_close_timestamp_count = 0
     near_duplicates_count = 0
     for index, first in enumerate(selected_records):
-        for second in selected_records[index + 1:]:
+        for second_index in range(index + 1, len(selected_records)):
+            second = selected_records[second_index]
             if (second["date"] - first["date"]).days > 2:
                 break
             if (
