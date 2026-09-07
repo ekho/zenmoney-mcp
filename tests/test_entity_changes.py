@@ -759,6 +759,26 @@ def test_reminder_marker_delete_verifies_missing_entity(financial_db):
     assert verify_after(item, None)
 
 
+def test_created_transaction_accepts_generated_original_payee_only(financial_db):
+    item = normalize_operations(financial_db, [{
+        "entity": "transaction", "operation": "create", "value": {
+            "date": "2026-09-07", "income": 0, "outcome": 10,
+            "incomeAccount": "cash", "outcomeAccount": "cash",
+            "incomeInstrument": 1, "outcomeInstrument": 1,
+            "payee": "Fixture merchant", "comment": "Keep this",
+        },
+    }])[0]
+    actual = {**item["after"], "originalPayee": "Fixture merchant"}
+
+    assert verify_after(item, actual)
+    for field, wrong in {
+        "outcome": 11, "income": 1, "outcomeAccount": "other",
+        "outcomeInstrument": 2, "date": "2026-09-08", "tag": ["food"],
+        "comment": "Different", "payee": "Different", "originalPayee": "Different",
+    }.items():
+        assert not verify_after(item, {**actual, field: wrong}), field
+
+
 @pytest.mark.parametrize(
     ("entity", "raw", "expected"),
     [

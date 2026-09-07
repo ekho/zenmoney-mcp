@@ -887,6 +887,13 @@ def verify_after(item: dict[str, Any], raw: dict[str, Any] | None) -> bool:
     ignored = {"changed"}
     if item["entity_type"] == "account" and item["operation"] == "create":
         ignored.add("balance")
+    if (
+        item["entity_type"] == "transaction"
+        and item["operation"] == "create"
+        and expected.get("originalPayee") is None
+        and raw.get("originalPayee") == expected.get("payee")
+    ):
+        ignored.add("originalPayee")
     return all(
         key in ignored or raw.get(key) == value
         for key, value in expected.items()
