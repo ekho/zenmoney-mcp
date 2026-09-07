@@ -570,6 +570,85 @@ async def test_write_transport_failure_is_not_retried(financial_db, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("http", {"phase": "http_response", "http_status": 400,
+                  "api_code": "validationError"}),
+        ("timeout", {"phase": "transport", "exception_type": "ReadTimeout"}),
+        ("decode", {"phase": "decode_response", "http_status": 200}),
+        ("apply", {"phase": "apply_response", "http_status": 200}),
+        ("api_error", {"phase": "http_response", "http_status": 200,
+                       "api_code": "validationError"}),
+        ("unknown_code", {"phase": "http_response", "http_status": 400,
+                          "api_code": "unknown"}),
+        ("html", {"phase": "http_response", "http_status": 503}),
+    ],
+)
+async def test_write_diagnostics_are_persisted_and_safe(
+    financial_db, tmp_path, monkeypatch, caplog, mode, expected
+):
+    import httpx
+    from zenmoney_mcp.hardened_sync import HardenedSyncEngine
+
+    clock = {"wall": 100, "elapsed": 1.0}
+    monkeypatch.setattr(mutations.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(mutations.time, "monotonic", lambda: clock["elapsed"])
+    store_path = tmp_path / "proposals.db"
+    store = ProposalStore(store_path)
+    prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
+    calls = []
+    real_client = httpx.AsyncClient
+
+    def handler(request):
+        calls.append(request)
+        clock.update(wall=104, elapsed=3.5)
+        if mode == "timeout":
+            raise httpx.ReadTimeout("sensitive response", request=request)
+        if mode in {"html", "decode"}:
+            return httpx.Response(503 if mode == "html" else 200,
+                                  text="sensitive response")
+        if mode == "apply":
+            return httpx.Response(200, json={"serverTimestamp": 105,
+                                          "tag": [{"title": "sensitive response"}]})
+        return httpx.Response(200 if mode == "api_error" else 400, json={
+            "error": {"code": "sensitive response" if mode == "unknown_code"
+                              else "validationError",
+                      "message": "sensitive response"}})
+
+    monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient",
+                        lambda: real_client(transport=httpx.MockTransport(handler)))
+
+    class TransportEngine(SuccessfulMixedEngine):
+        async def push_changes(self, changes):
+            return await HardenedSyncEngine(self.db, "sensitive token").push_changes(changes)
+
+    engine = TransportEngine(financial_db)
+    result = await execute_proposal(financial_db, engine, store, prepared["proposal_id"])
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "write_result_unknown"
+    assert [item["result"] for item in result["items"]] == ["unknown", "unknown"]
+    assert result["started_at"] == 100
+    assert result["finished_at"] == 104
+    assert result["diagnostics"]["duration_ms"] == 2500
+    for key, value in expected.items():
+        assert result["diagnostics"][key] == value
+    if mode == "timeout":
+        assert "http_status" not in result["diagnostics"]
+    assert "sensitive" not in str(result)
+    assert "sensitive" not in caplog.text
+    assert prepared["proposal_id"] in caplog.text
+    assert expected["phase"] in caplog.text
+    store.close()
+    reopened = ProposalStore(store_path)
+    assert reopened.get(prepared["proposal_id"]) == result
+    assert await execute_proposal(financial_db, engine, reopened,
+                                  prepared["proposal_id"]) == result
+    assert len(calls) == 1
+    reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_verification_requires_review(financial_db, tmp_path):
     store = ProposalStore(tmp_path / "proposals.db")
     prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
@@ -591,3 +670,26 @@ async def test_partial_verification_requires_review(financial_db, tmp_path):
     assert result["status"] == "needs_review"
     assert result["failure_code"] == "verification_mismatch"
     assert [item["result"] for item in result["items"]] == ["applied", "unknown"]
+    assert result["diagnostics"]["mismatches"] == [
+        {"position": 1, "entity": "transaction", "entity_exists": True,
+         "fields": ["comment", "tag"]}
+    ]
+
+
+def test_diagnostics_migration_preserves_existing_proposals(financial_db, tmp_path):
+    path = tmp_path / "proposals.db"
+    store = ProposalStore(path)
+    prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
+    store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE proposals DROP COLUMN diagnostics_json")
+    migrated = ProposalStore(path)
+    assert migrated.get(prepared["proposal_id"], now=100) == prepared
+    migrated.claim(prepared["proposal_id"], now=100)
+    result = migrated.finish(prepared["proposal_id"], "needs_review", {0: "unknown", 1: "unknown"},
+                             "write_result_unknown", now=102,
+                             diagnostics={"stage": "write", "http_status": 400})
+    migrated.close()
+    reopened = ProposalStore(path)
+    assert reopened.get(prepared["proposal_id"], now=103) == result
+    reopened.close()

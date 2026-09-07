@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -19,10 +20,12 @@ from .entity_changes import (
     MutationValidationError,
     normalize_operations,
     rebuild_after,
-    verify_after,
+    verification_mismatches,
 )
 from .hardened_database import HardenedDatabase, entity_key
+from .hardened_sync import SyncError
 
+LOGGER = logging.getLogger(__name__)
 DEFAULT_MUTATION_PATH = Path("/sync-control/mutation-proposals.db")
 MAX_PROPOSAL_ITEMS = 100
 PREPARED_TTL_SECONDS = 24 * 60 * 60
@@ -139,6 +142,10 @@ class ProposalStore:
             """
         )
         conn.commit()
+        with self._write() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(proposals)")}
+            if "diagnostics_json" not in columns:
+                conn.execute("ALTER TABLE proposals ADD COLUMN diagnostics_json TEXT")
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -246,6 +253,8 @@ class ProposalStore:
             "finished_at": row["finished_at"],
             "failure_code": row["failure_code"],
             "items": items,
+            **({"diagnostics": _decode(row["diagnostics_json"])}
+               if row["diagnostics_json"] is not None else {}),
         }
 
     def get(self, proposal_id: str, now: int | None = None) -> dict[str, Any] | None:
@@ -339,6 +348,8 @@ class ProposalStore:
         item_results: dict[int, str],
         failure_code: str | None,
         now: int | None = None,
+        *,
+        diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_STATUSES - {"expired"}:
             raise MutationStateError("invalid terminal status")
@@ -352,8 +363,10 @@ class ProposalStore:
             if row is None or row["status"] != "running":
                 raise MutationStateError("proposal is not running")
             conn.execute(
-                "UPDATE proposals SET status=?,finished_at=?,failure_code=? WHERE id=?",
-                (status, timestamp, failure_code, proposal_id),
+                "UPDATE proposals SET status=?,finished_at=?,failure_code=?,"
+                "diagnostics_json=? WHERE id=?",
+                (status, timestamp, failure_code,
+                 _json(diagnostics) if diagnostics is not None else None, proposal_id),
             )
             conn.executemany(
                 "UPDATE proposal_items SET result=? WHERE proposal_id=? AND position=?",
@@ -560,16 +573,32 @@ async def execute_proposal(
         return current
     items = store.execution_items(proposal_id)
     unchanged = _results(items, "unchanged")
+    started = time.monotonic()
+
+    def finish(status, item_results, failure_code, stage, *, error=None, **details):
+        diagnostics = {"stage": stage,
+                       "duration_ms": int((time.monotonic() - started) * 1000),
+                       **details}
+        if error is not None:
+            diagnostics["exception_type"] = type(error).__name__
+            if isinstance(error, SyncError):
+                diagnostics.update(error.diagnostics)
+        result = store.finish(proposal_id, status, item_results, failure_code,
+                              now=now, diagnostics=diagnostics)
+        LOGGER.warning(_json({"event": "mutation", "proposal_id": proposal_id,
+                              "item_count": len(items), "status": status,
+                              "failure_code": failure_code, **diagnostics}))
+        return result
 
     try:
         await engine.sync(force_full=False)
-    except Exception:
-        return store.finish(
-            proposal_id, "failed", unchanged, "preflight_sync_failed", timestamp
+    except Exception as exc:
+        return finish(
+            "failed", unchanged, "preflight_sync_failed", "preflight_sync", error=exc
         )
     if not db.user_entity_mutations_ready():
-        return store.finish(
-            proposal_id, "failed", unchanged, "mutation_not_ready", timestamp
+        return finish(
+            "failed", unchanged, "mutation_not_ready", "preflight_validation"
         )
 
     raw_objects: dict[int, dict[str, Any] | None] = {}
@@ -585,12 +614,11 @@ async def execute_proposal(
         elif raw is None or raw.get("changed") != item["expected_changed"]:
             conflicts[item["position"]] = "conflicted"
     if conflicts:
-        return store.finish(
-            proposal_id,
+        return finish(
             "conflicted",
             {**unchanged, **conflicts},
             "create_identity_exists" if collision else "entity_changed",
-            timestamp,
+            "preflight_validation",
         )
 
     outgoing: dict[str, list[dict[str, Any]]] = {}
@@ -599,37 +627,40 @@ async def execute_proposal(
             value = rebuild_after(db, item, raw_objects[item["position"]])
             value["changed"] = timestamp
             outgoing.setdefault(DIFF_FIELDS[item["entity_type"]], []).append(value)
-    except MutationValidationError:
-        return store.finish(
-            proposal_id, "failed", unchanged, "entity_invalid", timestamp
+    except MutationValidationError as exc:
+        return finish(
+            "failed", unchanged, "entity_invalid", "preflight_validation", error=exc
         )
 
     try:
         await engine.push_changes(outgoing)
-    except Exception:
-        return store.finish(
-            proposal_id,
+    except Exception as exc:
+        return finish(
             "needs_review",
             _results(items, "unknown"),
             "write_result_unknown",
-            timestamp,
+            "write", error=exc,
         )
 
     try:
         await engine.sync(force_full=True)
-    except Exception:
-        return store.finish(
-            proposal_id,
+    except Exception as exc:
+        return finish(
             "needs_review",
             _results(items, "unknown"),
             "verification_failed",
-            timestamp,
+            "verification_sync", error=exc,
         )
 
     results: dict[int, str] = {}
+    mismatches = []
     for item in items:
         raw = db.get_entity_raw(item["entity_type"], item["entity_key"])
-        if verify_after(item, raw):
+        fields = verification_mismatches(item, raw)
+        if fields:
+            mismatches.append({"position": item["position"], "entity": item["entity_type"],
+                               "entity_exists": raw is not None, "fields": fields})
+        if not fields:
             results[item["position"]] = "applied"
         elif (
             item["operation"] != "create"
@@ -641,11 +672,11 @@ async def execute_proposal(
             results[item["position"]] = "unknown"
 
     if all(result == "applied" for result in results.values()):
-        return store.finish(proposal_id, "applied", results, None, timestamp)
-    return store.finish(
-        proposal_id,
+        return finish("applied", results, None, "verification")
+    return finish(
         "needs_review",
         results,
         "verification_mismatch",
-        timestamp,
+        "verification",
+        mismatches=mismatches,
     )

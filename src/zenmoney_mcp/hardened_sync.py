@@ -28,6 +28,10 @@ ENTITY_MAPPING = {
 class SyncError(Exception):
     """Raised when synchronization cannot be validated or completed."""
 
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
 
 class HardenedSyncEngine:
     def __init__(self, db: HardenedDatabase, token: str):
@@ -212,9 +216,16 @@ class HardenedSyncEngine:
             **changes,
         }
         payload = await self._post_diff(request_body, 60.0, 1)
-        return self.apply_diff_data(
-            payload, force_full=False, last_sync_time=int(time.time())
-        )
+        try:
+            return self.apply_diff_data(
+                payload, force_full=False, last_sync_time=int(time.time())
+            )
+        except Exception as exc:
+            raise SyncError(
+                "Could not apply the write response to the local snapshot",
+                diagnostics={"phase": "apply_response", "http_status": 200,
+                             "exception_type": type(exc).__name__},
+            ) from exc
 
     async def _post_diff(
         self,
@@ -240,18 +251,38 @@ class HardenedSyncEngine:
                 except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
                     if attempt + 1 == attempts:
                         raise SyncError(
-                            f"HTTP error during sync after {attempts} attempts: {exc}"
+                            f"HTTP error during sync after {attempts} attempts",
+                            diagnostics={"phase": "transport",
+                                         "exception_type": type(exc).__name__},
                         ) from exc
                 except httpx.HTTPError as exc:
-                    raise SyncError(f"HTTP error during sync: {exc}") from exc
+                    raise SyncError(
+                        "HTTP error during sync",
+                        diagnostics={"phase": "transport",
+                                     "exception_type": type(exc).__name__},
+                    ) from exc
 
         assert response is not None
-        if response.status_code != 200:
-            raise SyncError(f"ZenMoney API returned status {response.status_code}")
+        diagnostics: dict[str, Any] = {"http_status": response.status_code}
         try:
             payload = response.json()
         except ValueError as exc:
-            raise SyncError(f"ZenMoney API returned invalid JSON: {exc}") from exc
+            phase = "decode_response" if response.status_code == 200 else "http_response"
+            raise SyncError(
+                f"ZenMoney API returned a non-JSON response (status {response.status_code})",
+                diagnostics={**diagnostics, "phase": phase,
+                             "exception_type": type(exc).__name__},
+            ) from exc
+        api_error = payload.get("error") if isinstance(payload, dict) else None
+        if response.status_code != 200 or api_error is not None:
+            if api_error is not None:
+                code = api_error.get("code") if isinstance(api_error, dict) else None
+                # API messages and unknown codes can contain financial data.
+                diagnostics["api_code"] = "validationError" if code == "validationError" else "unknown"
+            raise SyncError(
+                f"ZenMoney API returned an error (status {response.status_code})",
+                diagnostics={**diagnostics, "phase": "http_response"},
+            )
         return payload
 
 

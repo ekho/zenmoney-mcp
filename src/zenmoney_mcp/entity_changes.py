@@ -878,11 +878,17 @@ def rebuild_after(
 
 def verify_after(item: dict[str, Any], raw: dict[str, Any] | None) -> bool:
     """Compare stable expected fields after a verification sync."""
+    return not verification_mismatches(item, raw)
+
+
+def verification_mismatches(
+    item: dict[str, Any], raw: dict[str, Any] | None
+) -> list[str]:
+    """Return field names only; never put financial values in diagnostics."""
     if raw is None:
-        return (
-            item["entity_type"] == "reminderMarker"
-            and item["operation"] == "delete"
-        )
+        if item["entity_type"] == "reminderMarker" and item["operation"] == "delete":
+            return []
+        return ["$entity"]
     expected = item["after"]
     ignored = {"changed"}
     if item["entity_type"] == "account" and item["operation"] == "create":
@@ -894,7 +900,8 @@ def verify_after(item: dict[str, Any], raw: dict[str, Any] | None) -> bool:
         and raw.get("originalPayee") == expected.get("payee")
     ):
         ignored.add("originalPayee")
-    return all(
-        key in ignored or raw.get(key) == value
+    return sorted(
+        key
         for key, value in expected.items()
+        if key not in ignored and raw.get(key) != value
     )
