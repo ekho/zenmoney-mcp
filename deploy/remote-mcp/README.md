@@ -230,6 +230,8 @@ about 50 MiB per role. This is a size limit, not a guaranteed number of days.
 Files are private (`0600`); a newly created log directory is `0700`. Container
 recreation preserves these files; deleting the volume does not. Without
 `ZENMONEY_LOG_FILE`, application events remain on stderr only.
+File-write or rotation failures emit `log_write_failed` to stderr with exception
+type and numeric OS `errno`, without dumping the active exception's message.
 
 Start with the incident time (UTC) and the `proposal_id` returned by prepare.
 The MCP completion event links its `request_id` to that proposal. Worker events

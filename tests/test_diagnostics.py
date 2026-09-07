@@ -116,3 +116,34 @@ async def test_concurrent_operations_keep_separate_trace_callbacks():
         return recorded
 
     assert await asyncio.gather(operation(1), operation(2)) == [[1], [2]]
+
+
+def test_log_disk_failure_never_prints_active_exception_messages(tmp_path, capsys):
+    import errno
+    from zenmoney_mcp.diagnostics import configure_logging, emit_event, exception_details
+
+    handler = configure_logging(tmp_path / "logs" / "worker.jsonl")
+    class FullDisk:
+        def write(self, value):
+            raise OSError(errno.ENOSPC, "sensitive filesystem message")
+        def flush(self):
+            pass
+    handler.stream.close()
+    handler.stream = FullDisk()
+    handler.maxBytes = 0
+    try:
+        try:
+            raise RuntimeError("synthetic-private-upstream-response")
+        except RuntimeError as exc:
+            emit_event(logging.getLogger("zenmoney_mcp.audit"), "sync",
+                       status="failed", **exception_details(exc))
+    finally:
+        logging.getLogger("zenmoney_mcp").removeHandler(handler)
+        handler.stream = None
+        handler.close()
+    rendered = capsys.readouterr().err
+    assert "synthetic-private" not in rendered and "sensitive filesystem" not in rendered
+    assert "Traceback" not in rendered
+    event = json.loads(rendered)
+    assert event["event"] == "log_write_failed"
+    assert event["exception_type"] == "OSError" and event["errno"] == errno.ENOSPC

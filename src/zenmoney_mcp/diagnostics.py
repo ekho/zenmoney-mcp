@@ -9,6 +9,7 @@ from contextvars import ContextVar
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import sys
 from pathlib import Path
 import traceback
 from datetime import datetime, timezone
@@ -77,6 +78,21 @@ def emit_event(logger: logging.Logger, event: str, **details: Any) -> None:
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
+    def handleError(self, record: logging.LogRecord) -> None:
+        # The stdlib fallback prints the active exception chain, including secrets.
+        error = sys.exception()
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(json.dumps({
+                    "event": "log_write_failed", "component": __name__,
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "version": __version__, "pid": os.getpid(),
+                    "exception_type": type(error).__name__,
+                    "errno": error.errno if isinstance(error, OSError) else None,
+                }) + "\n")
+        except (OSError, ValueError):
+            pass
+
     def _open(self):
         descriptor = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.fchmod(descriptor, 0o600)
