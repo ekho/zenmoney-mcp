@@ -127,6 +127,11 @@ _MARKER_DEFAULTS = {**_MONEY_DEFAULTS, "notify": False}
 class MutationValidationError(ValueError):
     """Raised when an operation cannot be made safe and deterministic."""
 
+    def __init__(self, message: str, *, reason: str = "invalid_operation", **details: Any):
+        # Messages must contain only fixed validation text and known field names.
+        super().__init__(message)
+        self.details = {"reason": reason, "message": message, **details}
+
 
 class MutationStateError(ValueError):
     """Raised when the local snapshot cannot support mutation preparation."""
@@ -690,6 +695,17 @@ def _normalize_split(
     return items
 
 
+def reminder_comment(
+    db: HardenedDatabase, reminder_id: str, reminders: dict[str, dict[str, Any]]
+) -> str | None:
+    """Resolve the parent comment, including changes in this same proposal."""
+    raw = db.get_entity_raw("reminder", entity_key("reminder", {"id": reminder_id}))
+    parent = {**(raw or {}), **reminders.get(reminder_id, {})}
+    if not parent:
+        raise MutationValidationError("parent reminder is missing")
+    return _string(parent.get("comment"), "comment", nullable=True)
+
+
 def normalize_operations(
     db: HardenedDatabase,
     operations: Any,
@@ -698,164 +714,194 @@ def normalize_operations(
 ) -> list[dict[str, Any]]:
     """Resolve and validate a frozen ordered change set."""
     if not isinstance(operations, list) or not 1 <= len(operations) <= 100:
-        raise MutationValidationError("operations must contain 1 to 100 items")
+        raise MutationValidationError("operations must contain 1 to 100 items",
+                                      reason="batch_size", max_items=100)
     if entity_type is not None and entity_type not in ENTITY_TYPES:
         raise MutationValidationError("unsupported entity type")
 
     timestamp = _timestamp(now)
     refs: dict[str, dict[str, Any]] = {}
-    identities: set[tuple[str, str]] = set()
+    identities: dict[tuple[str, str], int] = {}
     normalized: list[dict[str, Any]] = []
 
-    for operation in operations:
-        if not isinstance(operation, dict):
-            raise MutationValidationError("each operation must be an object")
-        if entity_type is None:
-            current_type = operation.get("entity")
-            if current_type not in ENTITY_TYPES:
-                raise MutationValidationError("entity is unsupported")
-            body = {key: value for key, value in operation.items() if key != "entity"}
-        else:
-            if "entity" in operation:
-                raise MutationValidationError("entity is not accepted by entity-specific tools")
-            current_type = entity_type
-            body = dict(operation)
-
-        action = body.get("operation")
-        if action not in {"create", "update", "delete", "split"}:
-            raise MutationValidationError(
-                "operation must be create, update, delete, or split"
-            )
-
-        if action == "split":
-            if current_type != "transaction":
-                raise MutationValidationError("split is supported only for transactions")
-            split_items = _normalize_split(db, body, refs, timestamp)
-            if len(normalized) + len(split_items) > 100:
-                raise MutationValidationError(
-                    "normalized proposal must contain at most 100 items"
-                )
-            for item in split_items:
-                identity = (current_type, item["entity_key"])
-                if identity in identities:
-                    raise MutationValidationError("duplicate entity identity")
-                identities.add(identity)
-                normalized.append(item)
-            continue
-
-        if action == "create":
-            allowed = {"operation", "value", "ref", "owner_user_id"}
-            if set(body) - allowed or "value" not in body:
-                raise MutationValidationError("create operation fields are invalid")
-            value = body["value"]
-            if not isinstance(value, dict):
-                raise MutationValidationError("value must be an object")
-            allowed_value = set(EDITABLE[current_type])
-            if current_type == "account":
-                allowed_value.add("startBalance")
-            elif current_type == "budget":
-                allowed_value.update({"date", "tag"})
-            forbidden = set(value) - allowed_value
-            if forbidden:
-                raise MutationValidationError(
-                    f"field {sorted(forbidden)[0]} is not editable"
-                )
-            owner = _owner_for_create(db, body.get("owner_user_id"))
-            resolved = {**_create_defaults(current_type), **value}
-            resolved = _resolve_fields(db, current_type, resolved, owner, refs)
-            resolved["user"] = owner
-            resolved["changed"] = timestamp
-            entity_id = None
-            if current_type in UUID_ENTITY_TYPES:
-                entity_id = str(uuid.uuid4())
-                resolved["id"] = entity_id
-            if current_type == "account":
-                resolved["balance"] = resolved["startBalance"]
-            if current_type == "transaction":
-                resolved["created"] = timestamp
-            _validate_entity(db, current_type, resolved, creating=True)
-            key = entity_key(current_type, resolved)
-            if db.get_entity_raw(current_type, key) is not None:
-                raise MutationValidationError("create identity already exists")
-            item = {
-                "entity_type": current_type,
-                "entity_key": key,
-                "entity_id": entity_id,
-                "operation": action,
-                "expected_changed": None,
-                "before": None,
-                "after": resolved,
-                "resolved": resolved,
-            }
-            ref = body.get("ref")
-            if ref is not None:
-                if current_type == "budget":
-                    raise MutationValidationError("budget create does not support ref")
-                if not isinstance(ref, str) or not ref:
-                    raise MutationValidationError("ref must be a non-empty string")
-                if ref in refs:
-                    raise MutationValidationError("duplicate ref")
-                refs[ref] = {
-                    "entity_type": current_type,
-                    "id": entity_id,
-                    "owner": owner,
-                    "parent": resolved.get("parent") if current_type == "tag" else None,
-                }
-        else:
-            if current_type == "budget":
-                allowed = {"operation", "key"}
+    for operation_index, operation in enumerate(operations):
+        try:
+            if not isinstance(operation, dict):
+                raise MutationValidationError("each operation must be an object")
+            if entity_type is None:
+                current_type = operation.get("entity")
+                if current_type not in ENTITY_TYPES:
+                    raise MutationValidationError("entity is unsupported")
+                body = {key: value for key, value in operation.items() if key != "entity"}
             else:
-                allowed = {"operation", "id"}
-            if action == "update":
-                allowed.add("set")
-            if set(body) != allowed:
-                raise MutationValidationError(f"{action} operation fields are invalid")
-            if action == "delete" and current_type not in SAFE_DELETE:
+                if "entity" in operation:
+                    raise MutationValidationError("entity is not accepted by entity-specific tools")
+                current_type = entity_type
+                body = dict(operation)
+
+            action = body.get("operation")
+            if action not in {"create", "update", "delete", "split"}:
                 raise MutationValidationError(
-                    f"safe delete is not supported for {current_type}"
+                    "operation must be create, update, delete, or split"
                 )
-            key, raw = _raw_for_operation(db, current_type, body)
-            owner = _integer(raw.get("user"), "user")
-            changed = raw.get("changed")
-            _integer(changed, "changed")
-            if action == "update":
-                patch = body["set"]
-                if not isinstance(patch, dict) or not patch:
-                    raise MutationValidationError("set must be a non-empty object")
-                forbidden = set(patch) - EDITABLE[current_type]
+
+            if action == "split":
+                if current_type != "transaction":
+                    raise MutationValidationError("split is supported only for transactions")
+                split_items = _normalize_split(db, body, refs, timestamp)
+                if len(normalized) + len(split_items) > 100:
+                    raise MutationValidationError(
+                        "normalized proposal must contain at most 100 items",
+                        reason="batch_size", max_items=100,
+                    )
+                for item in split_items:
+                    identity = (current_type, item["entity_key"])
+                    if identity in identities:
+                        raise MutationValidationError("duplicate entity identity")
+                    identities[identity] = operation_index
+                    normalized.append(item)
+                continue
+
+            if action == "create":
+                allowed = {"operation", "value", "ref", "owner_user_id"}
+                if set(body) - allowed or "value" not in body:
+                    raise MutationValidationError("create operation fields are invalid")
+                value = body["value"]
+                if not isinstance(value, dict):
+                    raise MutationValidationError("value must be an object")
+                allowed_value = set(EDITABLE[current_type])
+                if current_type == "account":
+                    allowed_value.add("startBalance")
+                elif current_type == "budget":
+                    allowed_value.update({"date", "tag"})
+                forbidden = set(value) - allowed_value
                 if forbidden:
                     raise MutationValidationError(
-                        f"field {sorted(forbidden)[0]} is not editable"
+                        "field is not editable", reason="field_not_editable"
                     )
-                patch = _resolve_fields(db, current_type, patch, owner, refs)
-                if current_type == "reminderMarker" and raw.get("state") == "deleted":
-                    raise MutationValidationError("deleted reminder marker cannot be restored")
-                if current_type == "reminderMarker" and patch.get("state") == "deleted":
-                    raise MutationValidationError("use delete operation for deleted state")
+                owner = _owner_for_create(db, body.get("owner_user_id"))
+                resolved = {**_create_defaults(current_type), **value}
+                resolved = _resolve_fields(db, current_type, resolved, owner, refs)
+                resolved["user"] = owner
+                resolved["changed"] = timestamp
+                entity_id = None
+                if current_type in UUID_ENTITY_TYPES:
+                    entity_id = str(uuid.uuid4())
+                    resolved["id"] = entity_id
+                if current_type == "account":
+                    resolved["balance"] = resolved["startBalance"]
+                if current_type == "transaction":
+                    resolved["created"] = timestamp
+                _validate_entity(db, current_type, resolved, creating=True)
+                key = entity_key(current_type, resolved)
+                if db.get_entity_raw(current_type, key) is not None:
+                    raise MutationValidationError("create identity already exists")
+                item = {
+                    "entity_type": current_type,
+                    "entity_key": key,
+                    "entity_id": entity_id,
+                    "operation": action,
+                    "expected_changed": None,
+                    "before": None,
+                    "after": resolved,
+                    "resolved": resolved,
+                }
+                ref = body.get("ref")
+                if ref is not None:
+                    if current_type == "budget":
+                        raise MutationValidationError("budget create does not support ref")
+                    if not isinstance(ref, str) or not ref:
+                        raise MutationValidationError("ref must be a non-empty string")
+                    if ref in refs:
+                        raise MutationValidationError("duplicate ref")
+                    refs[ref] = {
+                        "entity_type": current_type,
+                        "id": entity_id,
+                        "owner": owner,
+                        "parent": resolved.get("parent") if current_type == "tag" else None,
+                    }
             else:
-                patch = dict(SAFE_DELETE[current_type])
-            result = {**raw, **patch}
-            _validate_entity(db, current_type, result, creating=False)
-            before = {field: raw.get(field) for field in patch}
-            after = {field: result.get(field) for field in patch}
-            if before == after:
-                raise MutationValidationError("operation does not change the entity")
-            item = {
-                "entity_type": current_type,
-                "entity_key": key,
-                "entity_id": raw.get("id"),
-                "operation": action,
-                "expected_changed": changed,
-                "before": before,
-                "after": after,
-                "resolved": patch,
-            }
+                if current_type == "budget":
+                    allowed = {"operation", "key"}
+                else:
+                    allowed = {"operation", "id"}
+                if action == "update":
+                    allowed.add("set")
+                if set(body) != allowed:
+                    raise MutationValidationError(f"{action} operation fields are invalid")
+                if action == "delete" and current_type not in SAFE_DELETE:
+                    raise MutationValidationError(
+                        f"safe delete is not supported for {current_type}"
+                    )
+                key, raw = _raw_for_operation(db, current_type, body)
+                owner = _integer(raw.get("user"), "user")
+                changed = raw.get("changed")
+                _integer(changed, "changed")
+                if action == "update":
+                    patch = body["set"]
+                    if not isinstance(patch, dict) or not patch:
+                        raise MutationValidationError("set must be a non-empty object")
+                    forbidden = set(patch) - EDITABLE[current_type]
+                    if forbidden:
+                        raise MutationValidationError(
+                            "field is not editable", reason="field_not_editable"
+                        )
+                    patch = _resolve_fields(db, current_type, patch, owner, refs)
+                    if current_type == "reminderMarker" and raw.get("state") == "deleted":
+                        raise MutationValidationError("deleted reminder marker cannot be restored")
+                    if current_type == "reminderMarker" and patch.get("state") == "deleted":
+                        raise MutationValidationError("use delete operation for deleted state")
+                else:
+                    patch = dict(SAFE_DELETE[current_type])
+                result = {**raw, **patch}
+                _validate_entity(db, current_type, result, creating=False)
+                before = {field: raw.get(field) for field in patch}
+                after = {field: result.get(field) for field in patch}
+                if before == after:
+                    raise MutationValidationError("operation does not change the entity",
+                                                  reason="operation_no_change")
+                item = {
+                    "entity_type": current_type,
+                    "entity_key": key,
+                    "entity_id": raw.get("id"),
+                    "operation": action,
+                    "expected_changed": changed,
+                    "before": before,
+                    "after": after,
+                    "resolved": patch,
+                }
 
-        identity = (current_type, item["entity_key"])
-        if identity in identities:
-            raise MutationValidationError("duplicate entity identity")
-        identities.add(identity)
-        normalized.append(item)
+            identity = (current_type, item["entity_key"])
+            if identity in identities:
+                raise MutationValidationError("duplicate entity identity")
+            identities[identity] = operation_index
+            normalized.append(item)
+            if len(normalized) > 100:
+                raise MutationValidationError("normalized proposal must contain at most 100 items",
+                                              reason="batch_size", max_items=100)
+
+        except MutationValidationError as exc:
+            exc.details["operation_index"] = operation_index
+            raise
+
+    reminders = {item["entity_id"]: item["after"] for item in normalized
+                 if item["entity_type"] == "reminder"}
+    for item in normalized:
+        if item["entity_type"] != "reminderMarker" or item["operation"] != "create":
+            continue
+        index = identities[("reminderMarker", item["entity_key"])]
+        try:
+            comment = reminder_comment(db, item["after"]["reminder"], reminders)
+            if "comment" in operations[index]["value"] and item["after"]["comment"] != comment:
+                raise MutationValidationError(
+                    "new reminder markers inherit comment from their parent reminder; "
+                    "omit comment or use the parent's comment",
+                    reason="marker_comment_inherited", field="comment",
+                )
+            item["after"]["comment"] = comment
+        except MutationValidationError as exc:
+            exc.details["operation_index"] = index
+            raise
 
     return normalized
 

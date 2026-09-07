@@ -20,6 +20,7 @@ from .entity_changes import (
     MutationValidationError,
     normalize_operations,
     rebuild_after,
+    reminder_comment,
     verification_mismatches,
 )
 from .hardened_database import HardenedDatabase, entity_key
@@ -583,6 +584,8 @@ async def execute_proposal(
             diagnostics["exception_type"] = type(error).__name__
             if isinstance(error, SyncError):
                 diagnostics.update(error.diagnostics)
+            elif isinstance(error, MutationValidationError):
+                diagnostics["validation"] = error.details
         result = store.finish(proposal_id, status, item_results, failure_code,
                               now=now, diagnostics=diagnostics)
         LOGGER.warning(_json({"event": "mutation", "proposal_id": proposal_id,
@@ -627,6 +630,16 @@ async def execute_proposal(
             value = rebuild_after(db, item, raw_objects[item["position"]])
             value["changed"] = timestamp
             outgoing.setdefault(DIFF_FIELDS[item["entity_type"]], []).append(value)
+        reminders = {value["id"]: value for value in outgoing.get("reminder", [])}
+        for item in items:
+            if item["entity_type"] == "reminderMarker" and item["operation"] == "create":
+                comment = reminder_comment(db, item["after"]["reminder"], reminders)
+                if item["after"].get("comment") != comment:
+                    raise MutationValidationError(
+                        "parent reminder comment changed; prepare a new proposal",
+                        reason="marker_comment_changed", field="comment",
+                        position=item["position"],
+                    )
     except MutationValidationError as exc:
         return finish(
             "failed", unchanged, "entity_invalid", "preflight_validation", error=exc

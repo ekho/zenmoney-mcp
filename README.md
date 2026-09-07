@@ -116,6 +116,13 @@ Prepare validates 1–100 operations and returns an immutable field-by-field
 preview without writing to ZenMoney. After reviewing it, pass only its
 `proposal_id` to `apply_changes`; `get_change_proposal` reports state and results.
 
+The limit is 100 resulting items, including every split part. For larger requests,
+prepare separate reviewed proposals, keeping dependent operations together. An
+unchanged update rejects the whole preparation; remove it before trying again.
+`invalid_changes` includes safe `details.reason`, `details.message`, and the
+zero-based `details.operation_index` when an individual operation caused the
+rejection. Batch-size errors include `details.max_items`.
+
 Preparation requires a successful full sync so that untouched ZenMoney fields
 can be preserved. Apply synchronizes and rejects the whole proposal before
 writing if any source entity changed since preparation. `{"ref": "..."}` links
@@ -124,6 +131,25 @@ between creates are resolved while preparing, so one proposal is one mixed
 the result is unknown, the proposal becomes `needs_review` with
 `write_result_unknown`, and it is never retried automatically. Applying any
 terminal proposal again does not send another write.
+
+Completed proposals include `diagnostics` with the execution stage and monotonic
+`duration_ms`; `finished_at` records the actual completion time. Write errors
+distinguish transport, HTTP response, JSON decoding, and local response application.
+HTTP status and the allowlisted `validationError` API code are retained when
+available; other API codes become `unknown`. Response bodies and exception messages
+are not logged. HTTP errors still require review because the write outcome may be
+uncertain. Verification mismatches list item positions, entity types, whether the
+entity exists, and differing field names (`$entity` means missing), without values.
+The same safe diagnostics appear in server logs. Existing ledger rows remain
+unchanged; the diagnostic column is added automatically on startup.
+
+New ReminderMarkers inherit `comment` from their parent Reminder. Preparation
+includes that comment in the preview, including parent changes in the same
+proposal. Omit the marker comment or supply the same value; a different explicit
+comment is rejected. A parent comment change before apply stops the write and
+requires a new proposal. Comment verification remains strict. Transaction creates
+accept server-generated `originalPayee` only when it equals the requested `payee`;
+amounts and other requested fields are still checked.
 
 Create and update are supported for all seven user entities. Safe delete archives
 an Account, marks a Transaction or ReminderMarker deleted, or clears a Budget.

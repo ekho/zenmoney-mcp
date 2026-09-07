@@ -1094,10 +1094,17 @@ def _mutation_tools() -> list[Tool]:
         "required": ["proposal_id"],
         "additionalProperties": False,
     }
+    prepare_limits = (
+        " At most 100 resulting items, including split parts. For larger requests, "
+        "use separate reviewed proposals and keep dependent operations together. "
+        "Remove unchanged updates before preparing; rejection details identify the "
+        "zero-based operation_index. New reminder markers inherit their parent's "
+        "comment; omit comment or supply the same value."
+    )
     prepare_tools = [
         Tool(
             name=name,
-            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney.",
+            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney." + prepare_limits,
             inputSchema=prepare_schema(entity_type),
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
@@ -1128,7 +1135,7 @@ def _mutation_tools() -> list[Tool]:
     prepare_tools.extend(
         Tool(
             name=name,
-            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
+            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney." + prepare_limits,
             inputSchema=mixed_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
@@ -1925,8 +1932,10 @@ async def _dispatch_mutation_tool(
                 result = prepare_recurring_payment(db, store, arguments)
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
-            except MutationValidationError:
-                result = {"status": "rejected", "failure_code": "invalid_changes"}
+            except MutationValidationError as exc:
+                result = {"status": "rejected", "failure_code": "invalid_changes",
+                          "details": exc.details}
+                LOGGER.warning(json.dumps({"event": "mutation_prepare", **result}))
             return _text_result(result)
 
         if name in PREPARE_TOOL_ENTITIES or name in {
@@ -1943,11 +1952,13 @@ async def _dispatch_mutation_tool(
                 )
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
-            except MutationValidationError:
+            except MutationValidationError as exc:
                 result = {
                     "status": "rejected",
                     "failure_code": "invalid_changes",
+                    "details": exc.details,
                 }
+                LOGGER.warning(json.dumps({"event": "mutation_prepare", **result}))
             return _text_result(result)
 
         if set(arguments) != {"proposal_id"} or not isinstance(
