@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from mcp_types import (
 )
 
 from . import __version__
+from .diagnostics import configure_logging, emit_event, exception_details
 from . import analytics as legacy_analytics
 from .analytics import (
     get_categories_resource,
@@ -1094,10 +1097,17 @@ def _mutation_tools() -> list[Tool]:
         "required": ["proposal_id"],
         "additionalProperties": False,
     }
+    prepare_limits = (
+        " At most 100 resulting items, including split parts. For larger requests, "
+        "use separate reviewed proposals and keep dependent operations together. "
+        "Remove unchanged updates before preparing; rejection details identify the "
+        "zero-based operation_index. New reminder markers inherit their parent's "
+        "comment; omit comment or supply the same value."
+    )
     prepare_tools = [
         Tool(
             name=name,
-            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney.",
+            description=f"Prepare immutable {entity_type} changes for review without writing to ZenMoney." + prepare_limits,
             inputSchema=prepare_schema(entity_type),
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
@@ -1128,7 +1138,7 @@ def _mutation_tools() -> list[Tool]:
     prepare_tools.extend(
         Tool(
             name=name,
-            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney.",
+            description="Prepare one immutable cross-entity change set for review without writing to ZenMoney." + prepare_limits,
             inputSchema=mixed_schema,
             annotations=ToolAnnotations(
                 readOnlyHint=False, destructiveHint=False, openWorldHint=False
@@ -1925,8 +1935,10 @@ async def _dispatch_mutation_tool(
                 result = prepare_recurring_payment(db, store, arguments)
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
-            except MutationValidationError:
-                result = {"status": "rejected", "failure_code": "invalid_changes"}
+            except MutationValidationError as exc:
+                result = {"status": "rejected", "failure_code": "invalid_changes",
+                          "details": exc.details}
+                emit_event(LOGGER, "mutation_prepare", tool=name, **result)
             return _text_result(result)
 
         if name in PREPARE_TOOL_ENTITIES or name in {
@@ -1943,11 +1955,13 @@ async def _dispatch_mutation_tool(
                 )
             except MutationStateError:
                 result = {"status": "rejected", "failure_code": "mutation_not_ready"}
-            except MutationValidationError:
+            except MutationValidationError as exc:
                 result = {
                     "status": "rejected",
                     "failure_code": "invalid_changes",
+                    "details": exc.details,
                 }
+                emit_event(LOGGER, "mutation_prepare", tool=name, **result)
             return _text_result(result)
 
         if set(arguments) != {"proposal_id"} or not isinstance(
@@ -2542,6 +2556,12 @@ def create_server(
         return ListToolsResult(tools=await list_tools(remote=remote))
 
     async def _on_call_tool(context, params):
+        started = time.monotonic()
+        known_tools = {tool.name for tool in await list_tools(remote=remote)}
+        event = "remote_tool_call" if remote else "tool_call"
+        metadata = {"request_id": str(uuid.uuid4()),
+                    "tool": params.name if params.name in known_tools else "unknown"}
+        emit_event(LOGGER, event, status="started", **metadata)
         try:
             content = await call_tool(
                 params.name,
@@ -2556,22 +2576,28 @@ def create_server(
             structured_content = json.loads(content[0].text)
             if not isinstance(structured_content, dict):
                 raise ValueError("Tool result must be a JSON object")
-        except MCPError:
+        except MCPError as exc:
+            emit_event(LOGGER, event, status="rejected", **metadata, mcp_code=exc.code,
+                       duration_ms=int((time.monotonic() - started) * 1000))
             raise
         except Exception as exc:
+            emit_event(LOGGER, event, status="failed", **metadata,
+                       duration_ms=int((time.monotonic() - started) * 1000), **exception_details(exc))
             if not remote:
                 raise
-            LOGGER.warning(
-                json.dumps(
-                    {
-                        "event": "remote_tool_call",
-                        "tool": params.name,
-                        "status": "failed",
-                        "exception_class": type(exc).__name__,
-                    }
-                )
-            )
             raise MCPError(INTERNAL_ERROR, "Remote tool failed") from None
+        outcome = {}
+        if params.name in MUTATION_TOOLS:
+            outcome = {key: structured_content[key] for key in ("proposal_id", "failure_code")
+                       if key in structured_content}
+            outcome["result_status"] = structured_content.get("status")
+            if structured_content.get("failure_code") == "invalid_changes":
+                outcome["validation"] = structured_content.get("details")
+        elif params.name == "force_sync":
+            outcome["sync_request_id"] = structured_content.get("request_id")
+        emit_event(LOGGER, event, status="completed", **metadata, **outcome,
+                   duration_ms=int((time.monotonic() - started) * 1000),
+                   response_bytes=len(content[0].text.encode("utf-8")))
         return CallToolResult(
             content=content,
             structuredContent=structured_content,
@@ -2597,15 +2623,8 @@ def create_server(
         except Exception as exc:
             if not remote:
                 raise
-            LOGGER.warning(
-                json.dumps(
-                    {
-                        "event": "remote_resource_read",
-                        "status": "failed",
-                        "exception_class": type(exc).__name__,
-                    }
-                )
-            )
+            emit_event(LOGGER, "remote_resource_read", status="failed",
+                       request_id=str(uuid.uuid4()), **exception_details(exc))
             raise MCPError(INTERNAL_ERROR, "Remote resource failed") from None
         return ReadResourceResult(
             contents=[
@@ -2632,6 +2651,8 @@ def main() -> None:
     import asyncio
 
     from mcp.server.stdio import stdio_server
+
+    configure_logging()
 
     async def run():
         async with stdio_server() as (read_stream, write_stream):

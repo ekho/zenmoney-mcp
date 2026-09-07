@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -13,16 +14,19 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
+from .diagnostics import emit_event, exception_details, trace_events
 from .entity_changes import (
     DIFF_FIELDS,
     MutationStateError,
     MutationValidationError,
     normalize_operations,
     rebuild_after,
-    verify_after,
+    reminder_comment,
+    verification_mismatches,
 )
 from .hardened_database import HardenedDatabase, entity_key
 
+LOGGER = logging.getLogger(__name__)
 DEFAULT_MUTATION_PATH = Path("/sync-control/mutation-proposals.db")
 MAX_PROPOSAL_ITEMS = 100
 PREPARED_TTL_SECONDS = 24 * 60 * 60
@@ -139,6 +143,10 @@ class ProposalStore:
             """
         )
         conn.commit()
+        with self._write() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(proposals)")}
+            if "diagnostics_json" not in columns:
+                conn.execute("ALTER TABLE proposals ADD COLUMN diagnostics_json TEXT")
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -204,6 +212,8 @@ class ProposalStore:
                     for position, item in enumerate(items)
                 ],
             )
+        emit_event(LOGGER, "mutation", proposal_id=proposal_id, status="prepared",
+                   item_count=len(items))
         return proposal_id
 
     def _public(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
@@ -246,6 +256,8 @@ class ProposalStore:
             "finished_at": row["finished_at"],
             "failure_code": row["failure_code"],
             "items": items,
+            **({"diagnostics": _decode(row["diagnostics_json"])}
+               if row["diagnostics_json"] is not None else {}),
         }
 
     def get(self, proposal_id: str, now: int | None = None) -> dict[str, Any] | None:
@@ -332,6 +344,16 @@ class ProposalStore:
         ).fetchone()
         return None if row is None else str(row["id"])
 
+    def record_progress(self, proposal_id: str, diagnostics: dict[str, Any]) -> None:
+        """Commit a checkpoint before the next side effect can begin."""
+        with self._write() as conn:
+            updated = conn.execute(
+                "UPDATE proposals SET diagnostics_json=? WHERE id=? AND status='running'",
+                (_json(diagnostics), proposal_id),
+            )
+            if updated.rowcount != 1:
+                raise MutationStateError("proposal is not running")
+
     def finish(
         self,
         proposal_id: str,
@@ -339,6 +361,8 @@ class ProposalStore:
         item_results: dict[int, str],
         failure_code: str | None,
         now: int | None = None,
+        *,
+        diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_STATUSES - {"expired"}:
             raise MutationStateError("invalid terminal status")
@@ -352,8 +376,10 @@ class ProposalStore:
             if row is None or row["status"] != "running":
                 raise MutationStateError("proposal is not running")
             conn.execute(
-                "UPDATE proposals SET status=?,finished_at=?,failure_code=? WHERE id=?",
-                (status, timestamp, failure_code, proposal_id),
+                "UPDATE proposals SET status=?,finished_at=?,failure_code=?,"
+                "diagnostics_json=? WHERE id=?",
+                (status, timestamp, failure_code,
+                 _json(diagnostics) if diagnostics is not None else None, proposal_id),
             )
             conn.executemany(
                 "UPDATE proposal_items SET result=? WHERE proposal_id=? AND position=?",
@@ -369,25 +395,28 @@ class ProposalStore:
 
     def recover_running(self, now: int | None = None) -> int:
         timestamp = _now(now)
+        recovered = []
         with self._write() as conn:
-            ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM proposals WHERE status='running'"
-                ).fetchall()
-            ]
-            if not ids:
-                return 0
-            conn.executemany(
-                "UPDATE proposals SET status='needs_review',finished_at=?,"
-                "failure_code='worker_restarted' WHERE id=?",
-                [(timestamp, proposal_id) for proposal_id in ids],
-            )
+            rows = conn.execute(
+                "SELECT id,diagnostics_json FROM proposals WHERE status='running'"
+            ).fetchall()
+            for row in rows:
+                diagnostics = _decode(row["diagnostics_json"]) or {"stage": "unknown"}
+                diagnostics.update(interrupted=True, recovered_at=timestamp)
+                conn.execute(
+                    "UPDATE proposals SET status='needs_review',finished_at=?,"
+                    "failure_code='worker_restarted',diagnostics_json=? WHERE id=?",
+                    (timestamp, _json(diagnostics), row["id"]),
+                )
+                recovered.append((row["id"], diagnostics))
             conn.executemany(
                 "UPDATE proposal_items SET result='unknown' WHERE proposal_id=?",
-                [(proposal_id,) for proposal_id in ids],
+                [(row["id"],) for row in rows],
             )
-            return len(ids)
+        for proposal_id, diagnostics in recovered:
+            emit_event(LOGGER, "mutation", proposal_id=proposal_id, status="needs_review",
+                       failure_code="worker_restarted", **diagnostics)
+        return len(recovered)
 
 
 def prepare_changes(
@@ -560,16 +589,71 @@ async def execute_proposal(
         return current
     items = store.execution_items(proposal_id)
     unchanged = _results(items, "unchanged")
+    started = time.monotonic()
+    timeline = []
 
+    def correlate(details):
+        target = details.get("api_error")
+        if isinstance(target, dict) and isinstance(target.get("entity_index"), int):
+            matching = [item for item in items if item["entity_type"] == target.get("entity")]
+            if 0 <= target["entity_index"] < len(matching):
+                details["api_error"] = {**target, "position": matching[target["entity_index"]]["position"]}
+        return details
+
+    def checkpoint(stage, event="started", **details):
+        details = correlate(details)
+        elapsed = int((time.monotonic() - started) * 1000)
+        entry = {"stage": stage, "event": event, "at": _now(now),
+                 "elapsed_ms": elapsed, **details}
+        timeline.append(entry)
+        diagnostics = {"stage": stage, "last_event": event, "duration_ms": elapsed,
+                       "timeline": timeline, **details}
+        try:
+            store.record_progress(proposal_id, diagnostics)
+        except Exception as exc:
+            emit_event(LOGGER, "mutation_progress_failed", proposal_id=proposal_id,
+                       stage=stage, checkpoint=event, **exception_details(exc))
+            raise
+        emit_event(LOGGER, "mutation_progress", proposal_id=proposal_id,
+                   item_count=len(items), **{key: value for key, value in entry.items() if key != "event"},
+                   checkpoint=event)
+
+    def finish(status, item_results, failure_code, stage, *, error=None, **details):
+        diagnostics = {"stage": stage,
+                       "duration_ms": int((time.monotonic() - started) * 1000),
+                       "timeline": timeline, **details}
+        if error is not None:
+            diagnostics.update(exception_details(error))
+            if isinstance(error, MutationValidationError):
+                diagnostics["validation"] = error.details
+        correlate(diagnostics)
+        diagnostics["result_counts"] = {
+            value: list(item_results.values()).count(value) for value in sorted(set(item_results.values()))
+        }
+        try:
+            result = store.finish(proposal_id, status, item_results, failure_code,
+                                  now=now, diagnostics=diagnostics)
+        except Exception as exc:
+            emit_event(LOGGER, "mutation_finish_failed", proposal_id=proposal_id,
+                       stage=stage, intended_status=status, **exception_details(exc))
+            raise
+        emit_event(LOGGER, "mutation", proposal_id=proposal_id,
+                   item_count=len(items), status=status, failure_code=failure_code, **diagnostics)
+        return result
+
+    checkpoint("preflight_sync")
     try:
-        await engine.sync(force_full=False)
-    except Exception:
-        return store.finish(
-            proposal_id, "failed", unchanged, "preflight_sync_failed", timestamp
+        with trace_events(lambda event, details: checkpoint("preflight_sync", event, **details)):
+            await engine.sync(force_full=False)
+    except Exception as exc:
+        return finish(
+            "failed", unchanged, "preflight_sync_failed", "preflight_sync", error=exc
         )
+    checkpoint("preflight_sync", "completed")
+    checkpoint("preflight_validation")
     if not db.user_entity_mutations_ready():
-        return store.finish(
-            proposal_id, "failed", unchanged, "mutation_not_ready", timestamp
+        return finish(
+            "failed", unchanged, "mutation_not_ready", "preflight_validation"
         )
 
     raw_objects: dict[int, dict[str, Any] | None] = {}
@@ -585,12 +669,12 @@ async def execute_proposal(
         elif raw is None or raw.get("changed") != item["expected_changed"]:
             conflicts[item["position"]] = "conflicted"
     if conflicts:
-        return store.finish(
-            proposal_id,
+        return finish(
             "conflicted",
             {**unchanged, **conflicts},
             "create_identity_exists" if collision else "entity_changed",
-            timestamp,
+            "preflight_validation",
+            conflict_positions=sorted(conflicts),
         )
 
     outgoing: dict[str, list[dict[str, Any]]] = {}
@@ -599,37 +683,58 @@ async def execute_proposal(
             value = rebuild_after(db, item, raw_objects[item["position"]])
             value["changed"] = timestamp
             outgoing.setdefault(DIFF_FIELDS[item["entity_type"]], []).append(value)
-    except MutationValidationError:
-        return store.finish(
-            proposal_id, "failed", unchanged, "entity_invalid", timestamp
+        reminders = {value["id"]: value for value in outgoing.get("reminder", [])}
+        for item in items:
+            if item["entity_type"] == "reminderMarker" and item["operation"] == "create":
+                comment = reminder_comment(db, item["after"]["reminder"], reminders)
+                if item["after"].get("comment") != comment:
+                    raise MutationValidationError(
+                        "parent reminder comment changed; prepare a new proposal",
+                        reason="marker_comment_changed", field="comment",
+                        position=item["position"],
+                    )
+    except MutationValidationError as exc:
+        return finish(
+            "failed", unchanged, "entity_invalid", "preflight_validation", error=exc
         )
 
+    checkpoint("preflight_validation", "completed")
+    checkpoint("write", entity_counts={entity: len(values) for entity, values in outgoing.items()})
     try:
-        await engine.push_changes(outgoing)
-    except Exception:
-        return store.finish(
-            proposal_id,
+        with trace_events(lambda event, details: checkpoint("write", event, **details)):
+            await engine.push_changes(outgoing)
+    except Exception as exc:
+        return finish(
             "needs_review",
             _results(items, "unknown"),
             "write_result_unknown",
-            timestamp,
+            "write", error=exc,
         )
 
+    checkpoint("write", "completed")
+    checkpoint("verification_sync")
     try:
-        await engine.sync(force_full=True)
-    except Exception:
-        return store.finish(
-            proposal_id,
+        with trace_events(lambda event, details: checkpoint("verification_sync", event, **details)):
+            await engine.sync(force_full=True)
+    except Exception as exc:
+        return finish(
             "needs_review",
             _results(items, "unknown"),
             "verification_failed",
-            timestamp,
+            "verification_sync", error=exc,
         )
 
+    checkpoint("verification_sync", "completed")
+    checkpoint("verification")
     results: dict[int, str] = {}
+    mismatches = []
     for item in items:
         raw = db.get_entity_raw(item["entity_type"], item["entity_key"])
-        if verify_after(item, raw):
+        fields = verification_mismatches(item, raw)
+        if fields:
+            mismatches.append({"position": item["position"], "entity": item["entity_type"],
+                               "entity_exists": raw is not None, "fields": fields})
+        if not fields:
             results[item["position"]] = "applied"
         elif (
             item["operation"] != "create"
@@ -641,11 +746,11 @@ async def execute_proposal(
             results[item["position"]] = "unknown"
 
     if all(result == "applied" for result in results.values()):
-        return store.finish(proposal_id, "applied", results, None, timestamp)
-    return store.finish(
-        proposal_id,
+        return finish("applied", results, None, "verification")
+    return finish(
         "needs_review",
         results,
         "verification_mismatch",
-        timestamp,
+        "verification",
+        mismatches=mismatches,
     )

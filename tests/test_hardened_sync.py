@@ -282,6 +282,10 @@ async def test_http_error_does_not_expose_response_body(monkeypatch):
         status_code = 500
         text = "sensitive upstream response"
 
+        @staticmethod
+        def json():
+            raise ValueError("sensitive upstream response")
+
     class Client:
         async def __aenter__(self):
             return self

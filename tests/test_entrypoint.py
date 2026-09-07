@@ -364,7 +364,9 @@ async def test_recurring_payment_tool_has_strict_schema_and_dispatches(tmp_path)
         mutation_path=tmp_path / "proposals.db",
     )
     assert json.loads(invalid[0].text) == {
-        "status": "rejected", "failure_code": "invalid_changes"
+        "status": "rejected", "failure_code": "invalid_changes",
+        "details": {"reason": "invalid_operation",
+                    "message": "recurring payment values are invalid"},
     }
 
 

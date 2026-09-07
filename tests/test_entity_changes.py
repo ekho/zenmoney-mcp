@@ -451,7 +451,7 @@ def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_d
                 "operation": "create",
                 "value": {"title": "Bad", "type": "cash", "instrument": 1, "balance": 1},
             },
-            "balance",
+            "not editable",
         ),
         (
             {
@@ -460,7 +460,7 @@ def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_d
                 "id": "cash",
                 "set": {"startBalance": 2},
             },
-            "startBalance",
+            "not editable",
         ),
         (
             {
@@ -469,7 +469,7 @@ def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_d
                 "id": "cash",
                 "set": {"archive": False},
             },
-            "archive",
+            "not editable",
         ),
         (
             {
@@ -477,7 +477,7 @@ def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_d
                 "operation": "create",
                 "value": {"title": "Bad", "future": True},
             },
-            "future",
+            "not editable",
         ),
         (
             {
@@ -486,7 +486,7 @@ def test_entity_specific_operations_do_not_accept_mixed_entity_field(financial_d
                 "id": "transaction",
                 "set": {"deleted": False},
             },
-            "deleted",
+            "not editable",
         ),
         (
             {
@@ -759,6 +759,26 @@ def test_reminder_marker_delete_verifies_missing_entity(financial_db):
     assert verify_after(item, None)
 
 
+def test_created_transaction_accepts_generated_original_payee_only(financial_db):
+    item = normalize_operations(financial_db, [{
+        "entity": "transaction", "operation": "create", "value": {
+            "date": "2026-09-07", "income": 0, "outcome": 10,
+            "incomeAccount": "cash", "outcomeAccount": "cash",
+            "incomeInstrument": 1, "outcomeInstrument": 1,
+            "payee": "Fixture merchant", "comment": "Keep this",
+        },
+    }])[0]
+    actual = {**item["after"], "originalPayee": "Fixture merchant"}
+
+    assert verify_after(item, actual)
+    for field, wrong in {
+        "outcome": 11, "income": 1, "outcomeAccount": "other",
+        "outcomeInstrument": 2, "date": "2026-09-08", "tag": ["food"],
+        "comment": "Different", "payee": "Different", "originalPayee": "Different",
+    }.items():
+        assert not verify_after(item, {**actual, field: wrong}), field
+
+
 @pytest.mark.parametrize(
     ("entity", "raw", "expected"),
     [
@@ -826,3 +846,38 @@ def test_unsupported_safe_delete_is_rejected(financial_db, entity):
             financial_db,
             [{"entity": entity, "operation": "delete", "id": object_id}],
         )
+
+
+@pytest.mark.parametrize("parent_mode", ["existing", "create", "update_before", "update_after"])
+def test_marker_create_previews_inherited_comment(financial_db, parent_mode):
+    parent = financial_db.get_entity_raw("reminder", entity_key("reminder", {"id": "scheduled"}))
+    financial_db.upsert_reminders([{**parent, "comment": "Parent comment"}])
+    value = {"income": 0, "outcome": 1, "incomeAccount": "cash", "outcomeAccount": "cash",
+             "incomeInstrument": 1, "outcomeInstrument": 1, "date": "2026-09-07",
+             "state": "planned", "reminder": "scheduled"}
+    marker = {"entity": "reminderMarker", "operation": "create", "value": value}
+    operations = [marker]
+    if parent_mode == "create":
+        value["reminder"] = {"ref": "parent"}
+        operations.insert(0, {"entity": "reminder", "operation": "create", "ref": "parent",
+                              "value": {key: val for key, val in parent.items()
+                                        if key not in {"id", "user", "changed"}}})
+        operations[0]["value"]["comment"] = "New comment"
+    elif parent_mode.startswith("update"):
+        update = {"entity": "reminder", "operation": "update", "id": "scheduled",
+                  "set": {"comment": "New comment"}}
+        operations.insert(0 if parent_mode == "update_before" else 1, update)
+    expected_comment = "Parent comment" if parent_mode == "existing" else "New comment"
+    normalized = normalize_operations(financial_db, operations)
+    item = next(item for item in normalized if item["entity_type"] == "reminderMarker")
+    assert item["after"]["comment"] == expected_comment
+    assert verify_after(item, {**item["after"], "comment": expected_comment})
+    assert not verify_after(item, {**item["after"], "comment": "Unexpected comment"})
+    value["comment"] = expected_comment
+    assert normalize_operations(financial_db, operations)
+    for comment in (None, "Unsupported override"):
+        value["comment"] = comment
+        with pytest.raises(MutationValidationError) as error:
+            normalize_operations(financial_db, operations)
+        assert error.value.details["reason"] == "marker_comment_inherited"
+        assert error.value.details["operation_index"] == operations.index(marker)

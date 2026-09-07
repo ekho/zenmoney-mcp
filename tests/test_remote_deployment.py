@@ -77,6 +77,8 @@ def test_compose_keeps_mcp_private_and_separates_credentials():
     assert "ZENMONEY_TOKEN_FILE" not in tunnel_environment
     assert "CONTROL_PLANE_API_KEY" not in sync_environment
     assert sync_environment["ZENMONEY_TOKEN_FILE"] == "/run/secrets/zenmoney-token"
+    assert mcp_environment["ZENMONEY_LOG_FILE"] == "/sync-control/logs/mcp.jsonl"
+    assert sync_environment["ZENMONEY_LOG_FILE"] == "/sync-control/logs/worker.jsonl"
 
     assert "secrets" not in services["zenmoney-mcp"]
     assert services["zenmoney-sync"]["secrets"] == [

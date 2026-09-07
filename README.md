@@ -116,6 +116,13 @@ Prepare validates 1–100 operations and returns an immutable field-by-field
 preview without writing to ZenMoney. After reviewing it, pass only its
 `proposal_id` to `apply_changes`; `get_change_proposal` reports state and results.
 
+The limit is 100 resulting items, including every split part. For larger requests,
+prepare separate reviewed proposals, keeping dependent operations together. An
+unchanged update rejects the whole preparation; remove it before trying again.
+`invalid_changes` includes safe `details.reason`, `details.message`, and the
+zero-based `details.operation_index` when an individual operation caused the
+rejection. Batch-size errors include `details.max_items`.
+
 Preparation requires a successful full sync so that untouched ZenMoney fields
 can be preserved. Apply synchronizes and rejects the whole proposal before
 writing if any source entity changed since preparation. `{"ref": "..."}` links
@@ -124,6 +131,41 @@ between creates are resolved while preparing, so one proposal is one mixed
 the result is unknown, the proposal becomes `needs_review` with
 `write_result_unknown`, and it is never retried automatically. Applying any
 terminal proposal again does not send another write.
+
+Running and completed proposals include `diagnostics`: the execution stage,
+monotonic `duration_ms`, and a timeline committed to SQLite before each stage
+and HTTP request. Receipt of an HTTP response is recorded before decoding it or
+applying it to the local snapshot. Restart recovery preserves that timeline and
+adds `interrupted` and `recovered_at`; it never replays an ambiguous write.
+`finished_at` records completion or recovery time. Existing ledger rows remain
+compatible; the diagnostic column is added automatically on startup.
+
+Write errors distinguish transport, HTTP response, JSON decoding, and local
+response application. Diagnostics include HTTP status, attempt number, timeout,
+payload sizes, per-entity item counts, and bounded exception types and code
+locations. Recognized upstream validation errors retain the entity type, field,
+and zero-based proposal item `position` when the API object matches a submitted
+item. Unrecognized API codes become `unknown` with a stable fingerprint; unknown
+message formats are omitted. Verification mismatches list positions, entity
+types, whether the entity exists, and differing field names (`$entity` means
+missing), without values. HTTP errors still require review because the write
+outcome may be uncertain.
+
+Structured JSON logs correlate MCP calls (`request_id`), proposals (`proposal_id`),
+sync runs (`sync_run_id`), and individual HTTP attempts (`http_request_id`). They
+include UTC timestamps, package version, process ID, durations, and outcomes.
+Response bodies, tool arguments, exception messages, source text, and financial
+values are not logged. Compose retains separate rotating MCP and worker journals
+on its existing persistent control volume; see the
+[incident runbook](deploy/remote-mcp/README.md#incident-logs).
+
+New ReminderMarkers inherit `comment` from their parent Reminder. Preparation
+includes that comment in the preview, including parent changes in the same
+proposal. Omit the marker comment or supply the same value; a different explicit
+comment is rejected. A parent comment change before apply stops the write and
+requires a new proposal. Comment verification remains strict. Transaction creates
+accept server-generated `originalPayee` only when it equals the requested `payee`;
+amounts and other requested fields are still checked.
 
 Create and update are supported for all seven user entities. Safe delete archives
 an Account, marks a Transaction or ReminderMarker deleted, or clears a Budget.
