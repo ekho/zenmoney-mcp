@@ -132,16 +132,32 @@ the result is unknown, the proposal becomes `needs_review` with
 `write_result_unknown`, and it is never retried automatically. Applying any
 terminal proposal again does not send another write.
 
-Completed proposals include `diagnostics` with the execution stage and monotonic
-`duration_ms`; `finished_at` records the actual completion time. Write errors
-distinguish transport, HTTP response, JSON decoding, and local response application.
-HTTP status and the allowlisted `validationError` API code are retained when
-available; other API codes become `unknown`. Response bodies and exception messages
-are not logged. HTTP errors still require review because the write outcome may be
-uncertain. Verification mismatches list item positions, entity types, whether the
-entity exists, and differing field names (`$entity` means missing), without values.
-The same safe diagnostics appear in server logs. Existing ledger rows remain
-unchanged; the diagnostic column is added automatically on startup.
+Running and completed proposals include `diagnostics`: the execution stage,
+monotonic `duration_ms`, and a timeline committed to SQLite before each stage
+and HTTP request. Receipt of an HTTP response is recorded before decoding it or
+applying it to the local snapshot. Restart recovery preserves that timeline and
+adds `interrupted` and `recovered_at`; it never replays an ambiguous write.
+`finished_at` records completion or recovery time. Existing ledger rows remain
+compatible; the diagnostic column is added automatically on startup.
+
+Write errors distinguish transport, HTTP response, JSON decoding, and local
+response application. Diagnostics include HTTP status, attempt number, timeout,
+payload sizes, per-entity item counts, and bounded exception types and code
+locations. Recognized upstream validation errors retain the entity type, field,
+and zero-based proposal item `position` when the API object matches a submitted
+item. Unrecognized API codes become `unknown` with a stable fingerprint; unknown
+message formats are omitted. Verification mismatches list positions, entity
+types, whether the entity exists, and differing field names (`$entity` means
+missing), without values. HTTP errors still require review because the write
+outcome may be uncertain.
+
+Structured JSON logs correlate MCP calls (`request_id`), proposals (`proposal_id`),
+sync runs (`sync_run_id`), and individual HTTP attempts (`http_request_id`). They
+include UTC timestamps, package version, process ID, durations, and outcomes.
+Response bodies, tool arguments, exception messages, source text, and financial
+values are not logged. Compose retains separate rotating MCP and worker journals
+on its existing persistent control volume; see the
+[incident runbook](deploy/remote-mcp/README.md#incident-logs).
 
 New ReminderMarkers inherit `comment` from their parent Reminder. Preparation
 includes that comment in the preview, including parent changes in the same

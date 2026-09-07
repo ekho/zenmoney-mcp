@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import signal
-import sys
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from .hardened_database import HardenedDatabase
+from .diagnostics import configure_logging, emit_event, exception_details, trace_events
 from .hardened_sync import HardenedSyncEngine
 from .server import get_database_path
 from .sync_control import (
@@ -104,6 +105,26 @@ async def execute_next_mutation(
         database.close()
 
 
+async def _attempt_sync(
+    sync: Callable[[bool], Awaitable[Any]], force_full: bool, request_id: str | None = None,
+) -> bool:
+    context = {"sync_run_id": str(uuid.uuid4()), "request_id": request_id, "force_full": force_full}
+    started = time.monotonic()
+    emit_event(LOGGER, "sync", status="started", **context)
+    try:
+        with trace_events(lambda event, details: emit_event(
+            LOGGER, "sync_progress", checkpoint=event, **{**context, **details}
+        )):
+            await sync(force_full)
+    except Exception as exc:
+        emit_event(LOGGER, "sync", status="failed", **context,
+                   duration_ms=int((time.monotonic() - started) * 1000), **exception_details(exc))
+        return False
+    emit_event(LOGGER, "sync", status="synced", **context,
+               duration_ms=int((time.monotonic() - started) * 1000))
+    return True
+
+
 async def run_worker(
     sync: Callable[[bool], Awaitable[Any]],
     interval: int,
@@ -119,14 +140,7 @@ async def run_worker(
             loop.add_signal_handler(signum, stop.set)
 
     async def attempt(force_full: bool, request_id: str | None = None) -> None:
-        try:
-            await sync(force_full)
-        except Exception:
-            LOGGER.warning(json.dumps({"event": "sync", "status": "failed"}))
-            succeeded = False
-        else:
-            LOGGER.warning(json.dumps({"event": "sync", "status": "synced"}))
-            succeeded = True
+        succeeded = await _attempt_sync(sync, force_full, request_id)
         if request_id is not None:
             finish_sync_request(control_path, request_id, succeeded)
 
@@ -136,11 +150,9 @@ async def run_worker(
         nonlocal control_invalid
         try:
             request = claim_sync_request(control_path)
-        except InvalidSyncState:
+        except InvalidSyncState as exc:
             if not control_invalid:
-                LOGGER.warning(
-                    json.dumps({"event": "sync_control", "status": "invalid"})
-                )
+                emit_event(LOGGER, "sync_control", status="invalid", **exception_details(exc))
             control_invalid = True
             return None
         control_invalid = False
@@ -181,27 +193,29 @@ async def run_worker(
             )
 
 
-def _emit(status: str) -> None:
-    print(json.dumps({"event": "sync", "status": status}), file=sys.stderr)
-
-
 def sync_once_main() -> None:
     """Run one synchronization attempt."""
     try:
-        asyncio.run(sync_once())
-    except Exception:
-        _emit("failed")
+        configure_logging()
+        succeeded = asyncio.run(_attempt_sync(sync_once, False))
+    except Exception as exc:
+        emit_event(LOGGER, "worker", status="failed", stage="startup", **exception_details(exc))
         raise SystemExit(1) from None
-    _emit("synced")
+    if not succeeded:
+        raise SystemExit(1)
 
 
 def main() -> None:
     """Run the periodic synchronizer."""
     parser = argparse.ArgumentParser()
     parser.parse_args()
+    stage = "startup"
     try:
+        configure_logging()
         interval = parse_interval(os.environ.get("ZENMONEY_SYNC_INTERVAL_SECONDS"))
         read_secret("ZENMONEY_TOKEN")
+        emit_event(LOGGER, "worker", status="started", interval_seconds=interval)
+        stage = "worker_loop"
         asyncio.run(
             run_worker(
                 sync_once,
@@ -210,6 +224,7 @@ def main() -> None:
                 mutation_step=execute_next_mutation,
             )
         )
-    except ValueError:
-        _emit("failed")
+    except Exception as exc:
+        emit_event(LOGGER, "worker", status="failed", stage=stage, **exception_details(exc))
         raise SystemExit(1) from None
+    emit_event(LOGGER, "worker", status="stopped")

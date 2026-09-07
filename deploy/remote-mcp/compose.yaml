@@ -15,6 +15,7 @@ services:
       ZENMONEY_DB_PATH: /data/zenmoney.db
       ZENMONEY_HTTP_HOST: 0.0.0.0
       ZENMONEY_HTTP_PORT: "8000"
+      ZENMONEY_LOG_FILE: /sync-control/logs/mcp.jsonl
     expose: ["8000"]
     volumes:
       - zenmoney-data:/data:ro
@@ -28,6 +29,7 @@ services:
       ZENMONEY_DB_PATH: /data/zenmoney.db
       ZENMONEY_SYNC_INTERVAL_SECONDS: ${ZENMONEY_SYNC_INTERVAL_SECONDS:-900}
       ZENMONEY_TOKEN_FILE: /run/secrets/zenmoney-token
+      ZENMONEY_LOG_FILE: /sync-control/logs/worker.jsonl
     secrets: [zenmoney-token]
     volumes:
       - zenmoney-data:/data

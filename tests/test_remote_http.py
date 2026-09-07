@@ -165,7 +165,7 @@ async def test_remote_mcp_exposes_truthfully_annotated_surface(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_remote_mcp_returns_structured_payload_matching_json_fallback(tmp_path):
+async def test_remote_mcp_returns_structured_payload_matching_json_fallback(tmp_path, caplog):
     path = tmp_path / "snapshot.db"
     control_path = tmp_path / "sync-state.json"
     mutation_path = tmp_path / "proposals.db"
@@ -185,6 +185,15 @@ async def test_remote_mcp_returns_structured_payload_matching_json_fallback(tmp_
     for result in (analytics, control, proposal):
         assert isinstance(result.structured_content, dict)
         assert result.structured_content == json.loads(result.content[0].text)
+    calls = [json.loads(record.getMessage()) for record in caplog.records
+             if record.name == "zenmoney_mcp.server"]
+    assert len(calls) == 6
+    for started, completed in zip(calls[::2], calls[1::2]):
+        assert started["request_id"] == completed["request_id"]
+        assert started["status"] == "started" and completed["status"] == "completed"
+        assert completed["duration_ms"] >= 0 and completed["response_bytes"] > 0
+    assert calls[-1]["proposal_id"] == proposal.structured_content["proposal_id"]
+    assert calls[-1]["result_status"] == "prepared"
 
 
 @pytest.mark.asyncio
@@ -206,16 +215,16 @@ async def test_remote_structured_adapter_failure_is_sanitized(monkeypatch, tmp_p
     assert error.value.code == INTERNAL_ERROR
     assert error.value.message == "Remote tool failed"
     assert sentinel not in f"{error.value}\n{caplog.text}"
-    assert [
+    records = [
         json.loads(record.getMessage())
         for record in caplog.records
         if record.getMessage().startswith("{")
-    ] == [{
-        "event": "remote_tool_call",
-        "tool": "get_net_worth",
-        "status": "failed",
-        "exception_class": "ValueError",
-    }]
+    ]
+    assert [record["status"] for record in records] == ["started", "failed"]
+    assert records[0]["request_id"] == records[1]["request_id"]
+    assert records[1]["tool"] == "get_net_worth"
+    assert records[1]["exception_type"] == "ValueError"
+    assert records[1]["exceptions"][0]["frames"][-1]["function"] == "_on_call_tool"
 
 
 @pytest.mark.asyncio
@@ -566,7 +575,11 @@ async def test_remote_mcp_rejects_excluded_and_unknown_tools_before_db_open(
                 await client.call_tool(name, arguments)
             assert error.value.code == INVALID_PARAMS
             assert error.value.message == "Remote tool is unavailable"
-    assert caplog.records == []
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    assert len(records) == 6
+    assert all(record["tool"] == "unknown" for record in records)
+    assert [record["status"] for record in records] == ["started", "rejected"] * 3
+    assert all(record["mcp_code"] == INVALID_PARAMS for record in records[1::2])
 
 
 @pytest.mark.asyncio
@@ -613,14 +626,13 @@ async def test_remote_application_error_redacts_arguments_response_and_logs(
         for record in caplog.records
         if record.getMessage().startswith("{")
     ]
-    assert structured == [
-        {
-            "event": "remote_tool_call",
-            "tool": "get_account_flow",
-            "status": "failed",
-            "exception_class": "RuntimeError",
-        }
-    ]
+    assert [record["status"] for record in structured] == ["started", "failed"]
+    assert structured[0]["request_id"] == structured[1]["request_id"]
+    assert structured[1]["event"] == "remote_tool_call"
+    assert structured[1]["tool"] == "get_account_flow"
+    assert structured[1]["exception_type"] == "RuntimeError"
+    assert structured[1]["exceptions"][0]["frames"][-1]["function"] == "fail"
+    assert structured[1]["duration_ms"] >= 0
 
 
 @pytest.mark.asyncio
@@ -653,13 +665,12 @@ async def test_remote_resource_error_redacts_exception_response_and_logs(
         for record in caplog.records
         if record.getMessage().startswith("{")
     ]
-    assert structured == [
-        {
-            "event": "remote_resource_read",
-            "status": "failed",
-            "exception_class": "RuntimeError",
-        }
-    ]
+    assert len(structured) == 1
+    assert structured[0]["event"] == "remote_resource_read"
+    assert structured[0]["status"] == "failed"
+    assert structured[0]["exception_type"] == "RuntimeError"
+    assert structured[0]["exceptions"][0]["frames"][-1]["function"] == "fail"
+    assert structured[0]["timestamp"].endswith("Z")
 
 
 @pytest.mark.asyncio

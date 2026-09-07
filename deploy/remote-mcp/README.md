@@ -217,8 +217,63 @@ proposal for any remaining changes.
 Create and update cover Account, Tag, Merchant, Reminder, ReminderMarker,
 Transaction, and Budget. Safe delete is limited to Account archive, Transaction
 and ReminderMarker semantic deletion, and Budget clearing. Purge is unavailable.
-Related creates are sent in dependency layers; a failure after any layer leaves
-the whole proposal in `needs_review` and is never replayed automatically.
+Related creates are resolved into one mixed write request; an ambiguous send
+leaves the whole proposal in `needs_review` and is never replayed automatically.
+
+### Incident logs
+
+Both application processes emit structured JSON to stderr and to files on the
+existing `zenmoney-sync-control` volume. `ZENMONEY_LOG_FILE` selects the file:
+`/sync-control/logs/mcp.jsonl` for MCP and `/sync-control/logs/worker.jsonl` for the
+worker. Each file rotates at 10 MiB with four backups (`.1` is newest), retaining
+about 50 MiB per role. This is a size limit, not a guaranteed number of days.
+Files are private (`0600`); a newly created log directory is `0700`. Container
+recreation preserves these files; deleting the volume does not. Without
+`ZENMONEY_LOG_FILE`, application events remain on stderr only.
+
+Start with the incident time (UTC) and the `proposal_id` returned by prepare.
+The MCP completion event links its `request_id` to that proposal. Worker events
+use the same proposal ID throughout preflight sync, validation, write, verification
+sync, and verification. Each HTTP attempt has its own `http_request_id`, status,
+duration, timeout, request/response size, and item counts. `force_sync` completion
+logs link `sync_request_id` to the worker's `request_id`; background runs have a
+`sync_run_id` and a null request ID.
+
+Read all retained events for one proposal without copying the financial ledger:
+
+```bash
+docker compose --env-file deploy/remote-mcp/.env \
+  -f deploy/remote-mcp/compose.yaml exec -T zenmoney-sync python -c '
+import json, pathlib, sys
+for path in sorted(pathlib.Path("/sync-control/logs").glob("*.jsonl*")):
+    for line in path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("proposal_id") == sys.argv[1]:
+            print(json.dumps(event))
+' PROPOSAL_ID
+```
+
+Use timestamps to order events across rotations. The proposal's `diagnostics`
+also retains its timeline in SQLite, including after worker restart. A last
+`http_request_started` checkpoint proves that sending was about to begin; it
+does not prove whether ZenMoney accepted the request. A received HTTP response
+is recorded before local JSON decoding and snapshot application, so a later
+crash can be distinguished from an earlier one. `worker_restarted` preserves
+the last stage and marks the interruption. A legacy interrupted proposal with
+no checkpoint reports stage `unknown`. Inspect ZenMoney before preparing any
+replacement for `needs_review`; never replay a write to test logging.
+
+API validation logs expose only recognized entity/field names and matched item
+positions. Unknown message formats remain opaque. Exception traces retain up to
+three chained exceptions and eight code locations per exception, with no
+messages, local variables, or source lines. Logs omit tokens, request/response
+bodies, tool arguments, account identifiers, comments, and amounts. Keep the
+volume access-controlled and collect evidence before log rotation or the ledger's
+30-day terminal-record cleanup. Client/tunnel failures before an MCP tool reaches
+the application still require the corresponding client/tunnel logs.
 
 Create an online backup through SQLite’s backup API, not `cp` of a live WAL
 database. Backups contain sensitive financial data: keep them encrypted at

@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from .hardened_database import HardenedDatabase
+from .diagnostics import configure_logging
 from .server import create_server, get_database_path
 
 
@@ -60,6 +61,7 @@ def create_app(
 
 def main() -> None:
     """Run the remote MCP server."""
+    configure_logging()
     uvicorn.run(
         create_app(),
         host=os.environ.get("ZENMONEY_HTTP_HOST", "0.0.0.0"),

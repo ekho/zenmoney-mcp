@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import time
+import uuid
 from typing import Any
 
 import httpx
 
-from .entity_changes import DIFF_FIELDS
+from .diagnostics import SyncError, exception_details, trace_event
+from .entity_changes import DIFF_FIELDS, EDITABLE
 from .hardened_database import HardenedDatabase
 
 ZENMONEY_API_URL = "https://api.zenmoney.ru/v8/diff/"
@@ -25,12 +29,37 @@ ENTITY_MAPPING = {
 }
 
 
-class SyncError(Exception):
-    """Raised when synchronization cannot be validated or completed."""
+_ERROR_FIELDS = set().union(*EDITABLE.values()) | {
+    "id", "user", "changed", "created", "deleted", "originalPayee", "private",
+    "startBalance", "balance", "incomeBankID", "outcomeBankID",
+}
 
-    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
-        super().__init__(message)
-        self.diagnostics = diagnostics or {}
+
+def _api_error_details(error: Any, request_body: dict[str, Any]) -> dict[str, Any]:
+    code = error.get("code") if isinstance(error, dict) else None
+    details: dict[str, Any] = {"api_code": "validationError" if code == "validationError" else "unknown"}
+    if isinstance(code, str) and code != "validationError":
+        details["api_code_fingerprint"] = hashlib.sha256(code.encode()).hexdigest()[:16]
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str) or len(message) > 4096:
+        return details
+    # Upstream example: https://github.com/zenmoney/ZenPlugins/issues/794
+    match = re.fullmatch(
+        r'Invalid property "([A-Za-z][A-Za-z0-9]{0,63})" in object '
+        r'(Account|Tag|Merchant|Reminder|ReminderMarker|Transaction|Budget) '
+        r'([^\s.]{1,128})\. ?([^\r\n]*)', message,
+    )
+    if match is None or match[1] not in _ERROR_FIELDS:
+        return details
+    entity = match[2][0].lower() + match[2][1:]
+    reason = "wrong_value" if match[4].rstrip(".") == "Wrong value" else "invalid_property"
+    target: dict[str, Any] = {"entity": entity, "field": match[1], "reason": reason}
+    positions = [index for index, item in enumerate(request_body.get(entity, []))
+                 if isinstance(item, dict) and item.get("id") == match[3]]
+    if len(positions) == 1:
+        target["entity_index"] = positions[0]
+    details["api_error"] = target
+    return details
 
 
 class HardenedSyncEngine:
@@ -182,7 +211,7 @@ class HardenedSyncEngine:
             rollback.close()
 
     async def sync(self, force_full: bool = False) -> dict[str, Any]:
-        started = time.time()
+        started = time.monotonic()
         request_body = {
             "currentClientTimestamp": int(time.time()),
             "serverTimestamp": 0 if force_full else self.db.get_server_timestamp(),
@@ -191,12 +220,8 @@ class HardenedSyncEngine:
         attempts = 2 if force_full else 1
         payload = await self._post_diff(request_body, timeout, attempts)
 
-        result = self.apply_diff_data(
-            payload,
-            force_full=force_full,
-            last_sync_time=int(time.time()),
-        )
-        result["sync_duration_ms"] = int((time.time() - started) * 1000)
+        result = self._apply_response(payload, force_full=force_full)
+        result["sync_duration_ms"] = int((time.monotonic() - started) * 1000)
         return result
 
     async def push_changes(
@@ -216,16 +241,24 @@ class HardenedSyncEngine:
             **changes,
         }
         payload = await self._post_diff(request_body, 60.0, 1)
+        return self._apply_response(payload, force_full=False)
+
+    def _apply_response(self, payload: Any, *, force_full: bool) -> dict[str, Any]:
+        trace_event("apply_response_started", force_full=force_full)
         try:
-            return self.apply_diff_data(
-                payload, force_full=False, last_sync_time=int(time.time())
+            result = self.apply_diff_data(
+                payload, force_full=force_full, last_sync_time=int(time.time())
             )
         except Exception as exc:
             raise SyncError(
-                "Could not apply the write response to the local snapshot",
+                "Could not apply the response to the local snapshot",
                 diagnostics={"phase": "apply_response", "http_status": 200,
                              "exception_type": type(exc).__name__},
             ) from exc
+        trace_event("apply_response_completed", force_full=force_full,
+                    updated_count=sum(result.get("updated", {}).values()),
+                    deleted_count=sum(result.get("deleted", {}).values()))
+        return result
 
     async def _post_diff(
         self,
@@ -234,9 +267,17 @@ class HardenedSyncEngine:
         attempts: int,
     ) -> dict[str, Any]:
         response: httpx.Response | None = None
+        request_bytes = len(httpx.Request("POST", ZENMONEY_API_URL, json=request_body).content)
+        counts = {entity: len(items) for entity, items in request_body.items()
+                  if entity in DIFF_FIELDS and isinstance(items, list)}
 
         async with httpx.AsyncClient() as client:
             for attempt in range(attempts):
+                started = time.monotonic()
+                request_info = {"http_request_id": str(uuid.uuid4()), "attempt": attempt + 1,
+                                "max_attempts": attempts, "timeout_seconds": timeout,
+                                "request_bytes": request_bytes, "entity_counts": counts}
+                trace_event("http_request_started", **request_info)
                 try:
                     response = await client.post(
                         ZENMONEY_API_URL,
@@ -247,41 +288,53 @@ class HardenedSyncEngine:
                         },
                         timeout=timeout,
                     )
-                    break
                 except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                    details = {**request_info, "phase": "transport", **exception_details(exc),
+                               "http_duration_ms": int((time.monotonic() - started) * 1000)}
+                    trace_event("http_request_failed", **details)
                     if attempt + 1 == attempts:
                         raise SyncError(
                             f"HTTP error during sync after {attempts} attempts",
-                            diagnostics={"phase": "transport",
-                                         "exception_type": type(exc).__name__},
+                            diagnostics=details,
                         ) from exc
+                    continue
                 except httpx.HTTPError as exc:
+                    details = {**request_info, "phase": "transport", **exception_details(exc),
+                               "http_duration_ms": int((time.monotonic() - started) * 1000)}
+                    trace_event("http_request_failed", **details)
                     raise SyncError(
                         "HTTP error during sync",
-                        diagnostics={"phase": "transport",
-                                     "exception_type": type(exc).__name__},
+                        diagnostics=details,
                     ) from exc
+                response_info = {**request_info, "http_status": response.status_code,
+                                 "http_duration_ms": int((time.monotonic() - started) * 1000)}
+                content = getattr(response, "content", None)
+                if isinstance(content, bytes):
+                    response_info["response_bytes"] = len(content)
+                trace_event("http_response_received", **response_info)
+                break
 
         assert response is not None
-        diagnostics: dict[str, Any] = {"http_status": response.status_code}
+        diagnostics: dict[str, Any] = response_info
         try:
             payload = response.json()
         except ValueError as exc:
             phase = "decode_response" if response.status_code == 200 else "http_response"
+            diagnostics.update(phase=phase, exception_type=type(exc).__name__)
+            trace_event("http_response_failed", **diagnostics)
             raise SyncError(
                 f"ZenMoney API returned a non-JSON response (status {response.status_code})",
-                diagnostics={**diagnostics, "phase": phase,
-                             "exception_type": type(exc).__name__},
+                diagnostics=diagnostics,
             ) from exc
         api_error = payload.get("error") if isinstance(payload, dict) else None
         if response.status_code != 200 or api_error is not None:
             if api_error is not None:
-                code = api_error.get("code") if isinstance(api_error, dict) else None
-                # API messages and unknown codes can contain financial data.
-                diagnostics["api_code"] = "validationError" if code == "validationError" else "unknown"
+                diagnostics.update(_api_error_details(api_error, request_body))
+            diagnostics["phase"] = "http_response"
+            trace_event("http_response_failed", **diagnostics)
             raise SyncError(
                 f"ZenMoney API returned an error (status {response.status_code})",
-                diagnostics={**diagnostics, "phase": "http_response"},
+                diagnostics=diagnostics,
             )
         return payload
 

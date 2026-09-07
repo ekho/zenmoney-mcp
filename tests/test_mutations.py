@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import asyncio
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -773,4 +775,110 @@ async def test_marker_comment_is_checked_before_write(financial_db, tmp_path, pa
     else:
         assert result["status"] == "applied"
         assert len(engine.pushed) == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_write, expected_stage", [
+    (False, "preflight_sync"), (True, "verification_sync"),
+])
+async def test_interrupted_proposal_preserves_durable_progress(
+    financial_db, tmp_path, caplog, after_write, expected_stage
+):
+    path = tmp_path / "proposals.db"
+    store = ProposalStore(path)
+    prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
+    class Engine(SuccessfulMixedEngine):
+        async def sync(self, force_full=False):
+            if force_full == after_write:
+                raise asyncio.CancelledError()
+            return await super().sync(force_full=force_full)
+    engine = Engine(financial_db)
+    with pytest.raises(asyncio.CancelledError):
+        await execute_proposal(financial_db, engine, store, prepared["proposal_id"], now=100)
+    store.close()
+    recovered = ProposalStore(path)
+    assert recovered.recover_running(now=101) == 1
+    result = recovered.get(prepared["proposal_id"], now=101)
+    assert result["status"] == "needs_review"
+    assert result["failure_code"] == "worker_restarted"
+    assert result["diagnostics"]["stage"] == expected_stage
+    assert result["diagnostics"]["interrupted"] is True
+    timeline = result["diagnostics"]["timeline"]
+    assert timeline[-1]["stage"] == expected_stage
+    assert timeline[-1]["event"] == "started"
+    assert any(event["stage"] == "write" for event in timeline) == after_write
+    assert len(engine.pushed) == int(after_write)
+    assert await execute_proposal(financial_db, engine, recovered,
+                                  prepared["proposal_id"], now=102) == result
+    assert len(engine.pushed) == int(after_write)
+    assert "worker_restarted" in caplog.text
+    recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_received_response_is_durable_before_local_apply(financial_db, tmp_path, monkeypatch):
+    import httpx
+    from zenmoney_mcp.hardened_sync import HardenedSyncEngine
+
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient",
+                        lambda: real_client(transport=httpx.MockTransport(
+                            lambda request: httpx.Response(200, json={"serverTimestamp": 101}))))
+    class Engine(HardenedSyncEngine):
+        async def sync(self, force_full=False):
+            return {"status": "synced"}
+        def apply_diff_data(self, *args, **kwargs):
+            with sqlite3.connect(tmp_path / "proposals.db") as connection:
+                persisted = json.loads(connection.execute(
+                    "SELECT diagnostics_json FROM proposals WHERE id=?",
+                    (prepared["proposal_id"],),
+                ).fetchone()[0])
+            received = next(item for item in persisted["timeline"]
+                            if item["event"] == "http_response_received")
+            assert received["http_status"] == 200
+            assert received["http_request_id"]
+            raise asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await execute_proposal(financial_db, Engine(financial_db, "synthetic"),
+                               store, prepared["proposal_id"], now=100)
+    store.recover_running(now=101)
+    result = store.get(prepared["proposal_id"], now=101)
+    assert result["diagnostics"]["stage"] == "write"
+    assert result["diagnostics"]["last_event"] == "apply_response_started"
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["checkpoint", "finish"])
+async def test_ledger_failure_logs_proposal_and_never_replays_write(
+    financial_db, tmp_path, monkeypatch, caplog, failure_point
+):
+    store = ProposalStore(tmp_path / "proposals.db")
+    prepared = prepare_changes(financial_db, store, mixed_updates(), now=90)
+    engine = SuccessfulMixedEngine(financial_db)
+    original = store.record_progress
+    def checkpoint(proposal_id, diagnostics):
+        if diagnostics["stage"] == "write":
+            raise sqlite3.OperationalError("sensitive storage message")
+        original(proposal_id, diagnostics)
+    def finish(*args, **kwargs):
+        raise sqlite3.OperationalError("sensitive storage message")
+    monkeypatch.setattr(store, "record_progress" if failure_point == "checkpoint" else "finish",
+                        checkpoint if failure_point == "checkpoint" else finish)
+    with pytest.raises(sqlite3.OperationalError):
+        await execute_proposal(financial_db, engine, store, prepared["proposal_id"], now=100)
+    event_name = "mutation_progress_failed" if failure_point == "checkpoint" else "mutation_finish_failed"
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    event = next(record for record in records if record["event"] == event_name)
+    assert event["proposal_id"] == prepared["proposal_id"]
+    assert event["exception_type"] == "OperationalError"
+    assert "sensitive storage message" not in caplog.text
+    assert len(engine.pushed) == int(failure_point == "finish")
+    store.recover_running(now=101)
+    result = await execute_proposal(financial_db, engine, store, prepared["proposal_id"], now=102)
+    assert result["status"] == "needs_review"
+    assert len(engine.pushed) == int(failure_point == "finish")
     store.close()

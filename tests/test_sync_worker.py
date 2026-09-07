@@ -78,7 +78,7 @@ def test_worker_main_reads_interval_seconds_environment_variable(monkeypatch):
 
 
 def test_worker_main_rejects_invalid_interval_seconds_environment_variable(
-    monkeypatch, capsys
+    monkeypatch, caplog
 ):
     async def worker(*args):
         raise AssertionError("invalid configuration reached worker")
@@ -92,12 +92,14 @@ def test_worker_main_rejects_invalid_interval_seconds_environment_variable(
         sync_worker.main()
 
     assert error.value.code == 1
-    assert capsys.readouterr().err == '{"event": "sync", "status": "failed"}\n'
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record["event"] == "worker" and record["status"] == "failed"
+    assert record["stage"] == "startup" and record["exception_type"] == "ValueError"
 
 
 @pytest.mark.parametrize("token", [None, "", "   "])
 def test_worker_main_rejects_missing_or_blank_environment_token_without_secret_output(
-    monkeypatch, capsys, token
+    monkeypatch, caplog, token
 ):
     monkeypatch.delenv("ZENMONEY_TOKEN_FILE", raising=False)
     if token is None:
@@ -110,11 +112,14 @@ def test_worker_main_rejects_missing_or_blank_environment_token_without_secret_o
         sync_worker.main()
 
     assert error.value.code == 1
-    assert capsys.readouterr().err == '{"event": "sync", "status": "failed"}\n'
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record["stage"] == "startup" and record["status"] == "failed"
+    assert record["exception_type"] == "ValueError"
+    assert record["exceptions"][0]["frames"][-1]["function"] == "read_secret"
 
 
 def test_worker_main_rejects_blank_token_file_without_environment_secret_output(
-    monkeypatch, capsys, tmp_path
+    monkeypatch, caplog, tmp_path
 ):
     token_file = tmp_path / "token"
     token_file.write_text(" \n")
@@ -126,9 +131,11 @@ def test_worker_main_rejects_blank_token_file_without_environment_secret_output(
         sync_worker.main()
 
     assert error.value.code == 1
-    rendered = capsys.readouterr().err
+    rendered = caplog.records[-1].getMessage()
     assert "sentinel-token" not in rendered
-    assert rendered == '{"event": "sync", "status": "failed"}\n'
+    record = json.loads(rendered)
+    assert record["stage"] == "startup" and record["status"] == "failed"
+    assert record["exception_type"] == "ValueError"
 
 
 @pytest.mark.asyncio
@@ -201,6 +208,30 @@ async def test_worker_records_requested_sync_failure(tmp_path):
     await run_worker(sync, 0, asyncio.Event(), control)
 
     assert read_sync_state(control)["failure_code"] == "sync_failed"
+
+
+@pytest.mark.asyncio
+async def test_sync_failure_logs_correlation_transport_and_safe_trace(tmp_path, caplog):
+    from zenmoney_mcp.hardened_sync import SyncError
+
+    control = tmp_path / "sync-state.json"
+    requested = request_sync(control, force_full=True)
+    async def sync(force_full):
+        raise SyncError("sensitive response", diagnostics={
+            "phase": "http_response", "http_status": 503, "http_request_id": "fixture-http-id",
+        })
+    await run_worker(sync, 0, asyncio.Event(), control)
+    events = [json.loads(record.message) for record in caplog.records
+              if record.name == "zenmoney_mcp.sync_worker"]
+    started = next(event for event in events if event["status"] == "started")
+    failed = next(event for event in events if event["status"] == "failed")
+    assert started["sync_run_id"] == failed["sync_run_id"]
+    assert failed["request_id"] == requested["request_id"]
+    assert failed["force_full"] is True
+    assert failed["http_status"] == 503 and failed["phase"] == "http_response"
+    assert failed["exceptions"][0]["type"] == "SyncError"
+    assert failed["duration_ms"] >= 0 and failed["timestamp"].endswith("Z")
+    assert "sensitive response" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -401,6 +432,40 @@ async def test_worker_waits_before_retry_and_does_not_log_secrets_or_exception_t
     assert token not in rendered
     assert body not in rendered
     assert [json.loads(record.getMessage())["status"] for record in caplog.records] == [
+        "started",
         "failed",
+        "started",
         "synced",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force_full", [False, True])
+async def test_worker_correlates_real_sync_and_snapshot_events(monkeypatch, caplog, force_full):
+    import httpx
+    from zenmoney_mcp.hardened_sync import ENTITY_MAPPING, HardenedSyncEngine
+
+    real_client = httpx.AsyncClient
+    payload = {"serverTimestamp": 1, **{entity: [] for entity in ENTITY_MAPPING}}
+    monkeypatch.setattr("zenmoney_mcp.hardened_sync.httpx.AsyncClient", lambda: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    ))
+    db = sync_worker.HardenedDatabase(":memory:")
+    db.init_schema()
+    async def sync(full):
+        return await HardenedSyncEngine(db, "fixture-secret-token").sync(full)
+
+    try:
+        assert await sync_worker._attempt_sync(sync, force_full, "fixture-request") is True
+        records = [json.loads(record.getMessage()) for record in caplog.records]
+        assert len({record["sync_run_id"] for record in records}) == 1
+        assert all(record["request_id"] == "fixture-request" for record in records)
+        assert all(record["force_full"] is force_full for record in records)
+        assert [record["checkpoint"] for record in records if "checkpoint" in record] == [
+            "http_request_started", "http_response_received",
+            "apply_response_started", "apply_response_completed",
+        ]
+        assert records[-1]["status"] == "synced"
+        assert "fixture-secret-token" not in caplog.text
+    finally:
+        db.close()

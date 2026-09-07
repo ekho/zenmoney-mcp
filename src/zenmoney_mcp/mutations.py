@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 
+from .diagnostics import emit_event, exception_details, trace_events
 from .entity_changes import (
     DIFF_FIELDS,
     MutationStateError,
@@ -24,7 +25,6 @@ from .entity_changes import (
     verification_mismatches,
 )
 from .hardened_database import HardenedDatabase, entity_key
-from .hardened_sync import SyncError
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MUTATION_PATH = Path("/sync-control/mutation-proposals.db")
@@ -212,6 +212,8 @@ class ProposalStore:
                     for position, item in enumerate(items)
                 ],
             )
+        emit_event(LOGGER, "mutation", proposal_id=proposal_id, status="prepared",
+                   item_count=len(items))
         return proposal_id
 
     def _public(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
@@ -342,6 +344,16 @@ class ProposalStore:
         ).fetchone()
         return None if row is None else str(row["id"])
 
+    def record_progress(self, proposal_id: str, diagnostics: dict[str, Any]) -> None:
+        """Commit a checkpoint before the next side effect can begin."""
+        with self._write() as conn:
+            updated = conn.execute(
+                "UPDATE proposals SET diagnostics_json=? WHERE id=? AND status='running'",
+                (_json(diagnostics), proposal_id),
+            )
+            if updated.rowcount != 1:
+                raise MutationStateError("proposal is not running")
+
     def finish(
         self,
         proposal_id: str,
@@ -383,25 +395,28 @@ class ProposalStore:
 
     def recover_running(self, now: int | None = None) -> int:
         timestamp = _now(now)
+        recovered = []
         with self._write() as conn:
-            ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM proposals WHERE status='running'"
-                ).fetchall()
-            ]
-            if not ids:
-                return 0
-            conn.executemany(
-                "UPDATE proposals SET status='needs_review',finished_at=?,"
-                "failure_code='worker_restarted' WHERE id=?",
-                [(timestamp, proposal_id) for proposal_id in ids],
-            )
+            rows = conn.execute(
+                "SELECT id,diagnostics_json FROM proposals WHERE status='running'"
+            ).fetchall()
+            for row in rows:
+                diagnostics = _decode(row["diagnostics_json"]) or {"stage": "unknown"}
+                diagnostics.update(interrupted=True, recovered_at=timestamp)
+                conn.execute(
+                    "UPDATE proposals SET status='needs_review',finished_at=?,"
+                    "failure_code='worker_restarted',diagnostics_json=? WHERE id=?",
+                    (timestamp, _json(diagnostics), row["id"]),
+                )
+                recovered.append((row["id"], diagnostics))
             conn.executemany(
                 "UPDATE proposal_items SET result='unknown' WHERE proposal_id=?",
-                [(proposal_id,) for proposal_id in ids],
+                [(row["id"],) for row in rows],
             )
-            return len(ids)
+        for proposal_id, diagnostics in recovered:
+            emit_event(LOGGER, "mutation", proposal_id=proposal_id, status="needs_review",
+                       failure_code="worker_restarted", **diagnostics)
+        return len(recovered)
 
 
 def prepare_changes(
@@ -575,30 +590,67 @@ async def execute_proposal(
     items = store.execution_items(proposal_id)
     unchanged = _results(items, "unchanged")
     started = time.monotonic()
+    timeline = []
+
+    def correlate(details):
+        target = details.get("api_error")
+        if isinstance(target, dict) and isinstance(target.get("entity_index"), int):
+            matching = [item for item in items if item["entity_type"] == target.get("entity")]
+            if 0 <= target["entity_index"] < len(matching):
+                details["api_error"] = {**target, "position": matching[target["entity_index"]]["position"]}
+        return details
+
+    def checkpoint(stage, event="started", **details):
+        details = correlate(details)
+        elapsed = int((time.monotonic() - started) * 1000)
+        entry = {"stage": stage, "event": event, "at": _now(now),
+                 "elapsed_ms": elapsed, **details}
+        timeline.append(entry)
+        diagnostics = {"stage": stage, "last_event": event, "duration_ms": elapsed,
+                       "timeline": timeline, **details}
+        try:
+            store.record_progress(proposal_id, diagnostics)
+        except Exception as exc:
+            emit_event(LOGGER, "mutation_progress_failed", proposal_id=proposal_id,
+                       stage=stage, checkpoint=event, **exception_details(exc))
+            raise
+        emit_event(LOGGER, "mutation_progress", proposal_id=proposal_id,
+                   item_count=len(items), **{key: value for key, value in entry.items() if key != "event"},
+                   checkpoint=event)
 
     def finish(status, item_results, failure_code, stage, *, error=None, **details):
         diagnostics = {"stage": stage,
                        "duration_ms": int((time.monotonic() - started) * 1000),
-                       **details}
+                       "timeline": timeline, **details}
         if error is not None:
-            diagnostics["exception_type"] = type(error).__name__
-            if isinstance(error, SyncError):
-                diagnostics.update(error.diagnostics)
-            elif isinstance(error, MutationValidationError):
+            diagnostics.update(exception_details(error))
+            if isinstance(error, MutationValidationError):
                 diagnostics["validation"] = error.details
-        result = store.finish(proposal_id, status, item_results, failure_code,
-                              now=now, diagnostics=diagnostics)
-        LOGGER.warning(_json({"event": "mutation", "proposal_id": proposal_id,
-                              "item_count": len(items), "status": status,
-                              "failure_code": failure_code, **diagnostics}))
+        correlate(diagnostics)
+        diagnostics["result_counts"] = {
+            value: list(item_results.values()).count(value) for value in sorted(set(item_results.values()))
+        }
+        try:
+            result = store.finish(proposal_id, status, item_results, failure_code,
+                                  now=now, diagnostics=diagnostics)
+        except Exception as exc:
+            emit_event(LOGGER, "mutation_finish_failed", proposal_id=proposal_id,
+                       stage=stage, intended_status=status, **exception_details(exc))
+            raise
+        emit_event(LOGGER, "mutation", proposal_id=proposal_id,
+                   item_count=len(items), status=status, failure_code=failure_code, **diagnostics)
         return result
 
+    checkpoint("preflight_sync")
     try:
-        await engine.sync(force_full=False)
+        with trace_events(lambda event, details: checkpoint("preflight_sync", event, **details)):
+            await engine.sync(force_full=False)
     except Exception as exc:
         return finish(
             "failed", unchanged, "preflight_sync_failed", "preflight_sync", error=exc
         )
+    checkpoint("preflight_sync", "completed")
+    checkpoint("preflight_validation")
     if not db.user_entity_mutations_ready():
         return finish(
             "failed", unchanged, "mutation_not_ready", "preflight_validation"
@@ -622,6 +674,7 @@ async def execute_proposal(
             {**unchanged, **conflicts},
             "create_identity_exists" if collision else "entity_changed",
             "preflight_validation",
+            conflict_positions=sorted(conflicts),
         )
 
     outgoing: dict[str, list[dict[str, Any]]] = {}
@@ -645,8 +698,11 @@ async def execute_proposal(
             "failed", unchanged, "entity_invalid", "preflight_validation", error=exc
         )
 
+    checkpoint("preflight_validation", "completed")
+    checkpoint("write", entity_counts={entity: len(values) for entity, values in outgoing.items()})
     try:
-        await engine.push_changes(outgoing)
+        with trace_events(lambda event, details: checkpoint("write", event, **details)):
+            await engine.push_changes(outgoing)
     except Exception as exc:
         return finish(
             "needs_review",
@@ -655,8 +711,11 @@ async def execute_proposal(
             "write", error=exc,
         )
 
+    checkpoint("write", "completed")
+    checkpoint("verification_sync")
     try:
-        await engine.sync(force_full=True)
+        with trace_events(lambda event, details: checkpoint("verification_sync", event, **details)):
+            await engine.sync(force_full=True)
     except Exception as exc:
         return finish(
             "needs_review",
@@ -665,6 +724,8 @@ async def execute_proposal(
             "verification_sync", error=exc,
         )
 
+    checkpoint("verification_sync", "completed")
+    checkpoint("verification")
     results: dict[int, str] = {}
     mismatches = []
     for item in items:
